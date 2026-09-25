@@ -1,6 +1,8 @@
 #include "dsa_runtime.hpp"
 #include <iostream>
 #include <cassert>
+#include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <vector>
 
@@ -213,6 +215,77 @@ int main() {
         TQue<QuePosition::VECIN, 1> q1;
         p.InitBuffer(q1, 2, 64);
     });
+
+    // -------------------------------------------------------------------------
+    // Test 8: Timeline model. One core: a load lands DMA_LATENCY_CYCLES after it streamed at
+    // DMA_BYTES_PER_CYCLE; the add waits for it; the store follows the add and lands one
+    // latency later. Two tiles: the second load streams while the first tile computes.
+    // -------------------------------------------------------------------------
+    std::cout << "\n[Testing Timeline Model]...\n";
+    {
+        auto near = [](double a, double b) { return std::fabs(a - b) <= 1e-9 * (std::fabs(b) + 1.0); };
+        const double bw = DMA_BYTES_PER_CYCLE, L = DMA_LATENCY_CYCLES;
+        AlignedVector<float> src(1024, 1.0f), dst(1024, 0.0f);
+        {
+            TPipe p;
+            TQue<QuePosition::VECIN, 2> q;
+            p.InitBuffer(q, 2, 1024 * sizeof(float));
+            LocalTensor<float> t = q.AllocTensor<float>();
+            DataCopy(t, src.data(), 1024);  // 4 KB
+            Add(t, t, t, 1024);             // 16 repeats: 45 cycles
+            DataCopy(dst.data(), t, 1024);
+            const TimelineSummary s = g_timeline.Summary();
+            const double load = 4096 / bw, add = 2 * 16 + 13, expect = load + L + add + load + L;
+            ok &= near(s.finish, expect) && near(s.vectorBusy, add) && near(s.dmaBusy, 2 * load) && near(s.loadBusy, load);
+            ok &= near(s.finish, std::max(s.vectorBusy, s.dmaBusy) + s.fill + s.drain + s.barrier + s.mismatch);
+            ok &= s.finish >= s.LowerBound();
+            ok &= near(s.LatencyFloor(), expect);  // One chain, load -> add -> store: nothing to overlap
+            if (!ok) std::cerr << "FAIL: single-tile timeline " << s.finish << " (floor " << s.LatencyFloor() << ") != " << expect << "\n";
+            q.FreeTensor(t);
+        }
+        {
+            TPipe p;
+            TQue<QuePosition::VECIN, 2> q;
+            p.InitBuffer(q, 2, 1024 * sizeof(float));
+            LocalTensor<float> a = q.AllocTensor<float>(), b = q.AllocTensor<float>();
+            DataCopy(a, src.data(), 1024);
+            DataCopy(b, src.data(), 1024);  // Streams while tile a computes
+            Add(a, a, a, 1024);
+            Add(b, b, b, 1024);
+            const TimelineSummary s = g_timeline.Summary();
+            const double load = 4096 / bw, add = 45;
+            // Tile b lands one load after tile a; the vector waits for it only if a's add is shorter
+            const double expect = std::max(load + L + add, 2 * load + L) + add;
+            // Two buffers, no reuse: the floor is the run itself
+            const bool pass = near(s.finish, expect) && near(s.LatencyFloor(), expect);
+            ok &= pass;
+            if (!pass) std::cerr << "FAIL: double-buffered timeline " << s.finish << " != " << expect << "\n";
+        }
+        {
+            // SyncAll: every core leaves SYNC_ALL_CYCLES after the last arrival
+            double finish[4] = {}, floor[4] = {};
+            #pragma omp parallel num_threads(4)
+            {
+                TPipe p;
+                TBuf<QuePosition::VECCALC> buf;
+                p.InitBuffer(buf, 4096);
+                LocalTensor<float> t = buf.Get<float>();
+                const uint32_t c = GetCoreIdx();
+                for (uint32_t i = 0; i <= c; ++i) Muls(t, t, 2.0f, 1024);  // Core c: (c + 1) x 45 cycles
+                SyncAll();
+                finish[c] = g_timeline.Summary().finish;
+                floor[c] = g_timeline.Summary().LatencyFloor();
+            }
+            bool same = true;
+            for (int c = 0; c < 4; ++c) {
+                same &= std::fabs(finish[c] - (4 * 45.0 + SYNC_ALL_CYCLES)) < 1e-9;
+                same &= std::fabs(floor[c] - ((c + 1) * 45.0 + SYNC_ALL_CYCLES)) < 1e-9;  // Its own work, then the barrier
+            }
+            ok &= same;
+            if (!same) std::cerr << "FAIL: SyncAll release " << finish[0] << " / " << finish[3] << " floor " << floor[0] << "\n";
+        }
+        if (ok) std::cout << "PASS: load/compute/store latency, double-buffer overlap, SyncAll release, latency floor\n";
+    }
 
     if (!ok) return 1;
 
