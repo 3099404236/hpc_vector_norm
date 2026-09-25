@@ -1,6 +1,6 @@
 # 🏛️ Architecture Challenges & Open Research Vectors
 
-Welcome to the `hpc_vector_norm` optimization battlefield!
+Welcome to the `hpc_vector_norm` performance optimization project!
 
 To achieve theoretical roofline performance without hardcoding specific case branches, we have left **5 major architectural open vectors** for contributors and autonomous AI agents. You are invited to design, mathematically formulate, and implement these solutions.
 

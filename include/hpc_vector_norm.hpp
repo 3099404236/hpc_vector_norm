@@ -12,16 +12,16 @@ enum class DataType {
 };
 
 /**
- * FusedAddRmsNormBias
+ * FusedResidualNormalize
  * 
  * Mathematical definition:
  *   Z[i, j] = X1[i, j] + X2[i, j] + bias[j]
  *   sigma[i] = sqrt( (1 / D) * sum_{j=0}^{D-1} (Z[i, j]^2) + eps )
  *   Y[i, j] = (Z[i, j] / sigma[i]) * gamma[j]
  * 
- * Target hardware: Up to 40 symmetric cores with L1 scratchpad limits.
+ * Target architecture: Up to 40 symmetric CPU threads with L1 scratchpad limits.
  */
-void FusedAddRmsNormBias(
+void FusedResidualNormalize(
     const void* x1,
     const void* x2,
     const void* gamma,
@@ -32,5 +32,12 @@ void FusedAddRmsNormBias(
     DataType dtype,
     float eps = 1e-6f
 );
+
+// Backward-compatible alias
+inline void FusedAddRmsNormBias(
+    const void* x1, const void* x2, const void* gamma, const void* bias,
+    void* y, uint32_t rows, uint32_t cols, DataType dtype, float eps = 1e-6f) {
+    FusedResidualNormalize(x1, x2, gamma, bias, y, rows, cols, dtype, eps);
+}
 
 } // namespace hpc
