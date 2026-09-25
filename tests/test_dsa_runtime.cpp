@@ -14,7 +14,7 @@ public:
     TQue<QuePosition::VECIN, 2> inQueue;
     TQue<QuePosition::VECOUT, 2> outQueue;
 
-    void Process(const float* gm_in, float* gm_out, uint32_t totalElems) {
+    void Process(const float* src, float* dst, uint32_t totalElems) {
         // Tile size: 512 floats = 2048 bytes (strictly 32-byte aligned)
         uint32_t tileBytes = 512 * sizeof(float);
 
@@ -30,7 +30,7 @@ public:
         for (uint32_t t = 0; t < tiles; ++t) {
             // Stage 1: DMA Inbound
             LocalTensor<float> inTensor = inQueue.AllocTensor<float>();
-            DataCopy(inTensor, gm_in + t * 512, 512);
+            DataCopy(inTensor, src + t * 512, 512);
             inQueue.EnQue(inTensor);
 
             // Stage 2: SIMD Vector Compute
@@ -44,7 +44,7 @@ public:
 
             // Stage 3: DMA Outbound
             LocalTensor<float> writeTensor = outQueue.DeQue<float>();
-            DataCopy(gm_out + t * 512, writeTensor, 512);
+            DataCopy(dst + t * 512, writeTensor, 512);
             outQueue.FreeTensor(writeTensor);
         }
     }

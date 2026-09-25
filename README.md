@@ -25,13 +25,13 @@ Contributors and autonomous AI agents must distinguish between the **Target Hard
 | **Execution Concurrency** | 4-core Cascade Lake VM (used for CI & logic verification) | **40 Dedicated Symmetric Cores (`P = 40`)** with zero fork/join cost |
 | **DMA Memory Quantum** | 64-byte x86 Cache Line | **Strict 32-Byte DMA Block (`DMA_ALIGN_BYTES = 32`)** |
 | **Scratchpad Buffer** | 191 KB L1 resident Z scratchpad | **Strict 191 KB (195,584 B) Scratchpad (SPM)** per core |
-| **Memory Bandwidth** | ~40 GB/s DDR4 (host bus limitation) | **~850 GB/s HBM3 High-Bandwidth Channel** |
+| **Memory Bandwidth** | ~40 GB/s DDR4 (host bus limitation) | **Aggregated High-Throughput Memory Subsystem (~850 GB/s)** |
 | **SIMD Instruction Width** | AVX-512 (64B) / AVX2 (32B) | **256-Byte Repeat SIMD Vector Pipeline (2048-bit)** |
 
 > **⚠️ Directives for Tiler & Kernel Optimization**:
 > 1. **Do NOT overfit to the 4-core host!** While `AdaptiveTiler` should gracefully handle `threads <= 4` on the host to avoid OS thrashing during tests, the **mathematical planning model must be explicitly architected for 40 symmetric cores**.
 > 2. **Alignment must honor 32 bytes**: The hardware DMA engine transfers memory in 32-byte blocks. All dimension slicing in Split-D should support 32-byte granularity.
-> 3. **Latency Targets are HBM3 Roofline**: Target latencies (e.g. P13 $223\ \mu\text{s}$) assume 850 GB/s bandwidth. On the 4-core VM, reaching memory saturation (~40 GB/s) confirms the algorithm is optimal!
+> 3. **Latency Targets Reflect Peak Theoretical Memory Roofline**: Target latencies (e.g. P13 $223\ \mu\text{s}$) assume an aggregated ~850 GB/s memory subsystem roofline. On the 4-core VM, reaching host memory saturation (~40 GB/s) confirms the algorithm is optimal!
 
 ---
 
