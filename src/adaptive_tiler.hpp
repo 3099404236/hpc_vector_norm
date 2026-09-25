@@ -68,15 +68,22 @@ public:
                 cfg.tileD = D;
             } else {
                 // M > 1 and M < 32: divide columns among cores
-                // e.g., M = 8: 4 slices per row -> 32 threads
-                uint32_t slices = MAX_THREADS / M;
-                if (slices >= 4) slices = 4; // power of 2 aligned slice
-                else if (slices >= 2) slices = 2;
-                else slices = 1;
+                // Pure mathematical power-of-two slice derivation:
+                // Find maximum 2^k <= (MAX_THREADS / M) such that columns divide cleanly
+                uint32_t maxSlices = MAX_THREADS / M;
+                uint32_t slices = 1;
+                while ((slices << 1) <= maxSlices) {
+                    slices <<= 1;
+                }
 
                 cfg.slicesPerRow = slices;
                 cfg.activeThreads = M * slices;
                 cfg.sliceD = (D + slices - 1) / slices;
+                
+                // Align sliceD to 32-byte hardware boundary
+                uint32_t alignElem = ALIGN_BYTES / elemBytes;
+                cfg.sliceD = ((cfg.sliceD + alignElem - 1) / alignElem) * alignElem;
+
                 cfg.rowsPerThread = 1;
                 cfg.batchRows = 1;
                 cfg.tileD = cfg.sliceD;
