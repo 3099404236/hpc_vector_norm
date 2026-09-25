@@ -305,7 +305,7 @@ private:
 
 // =============================================================================
 // Target DAE pipeline: a HardwareModel::Target() plan executed the way the 40-core
-// accelerator runs it, through include/dsa_runtime.hpp. One OpenMP thread is one
+// target processor runs it, through include/dsa_runtime.hpp. One OpenMP thread is one
 // simulated core (GetCoreIdx). Every scratchpad buffer is claimed through TPipe
 // (191 KB trap); every system-memory transfer is a 32-byte DataCopy, or a counted
 // DataCopyPad where a transfer does not end on a DMA block. The scalar unit never

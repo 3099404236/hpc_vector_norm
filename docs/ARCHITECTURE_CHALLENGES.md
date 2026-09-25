@@ -192,6 +192,23 @@ Refactor the reduction tree and normalization pass to ensure:
 
 ---
 
+## 🎯 Challenge 6: Zero-Allocation Freestanding Worker & Coordinator Decoupling
+
+### The Dilemma
+In high-throughput, latency-critical multi-core execution (40 cores), worker threads running the computational pipeline must operate in a pure freestanding execution model:
+1. **Zero Dynamic Allocation**: Dynamic heap operations (`std::vector::resize`, `malloc`, `new`) in worker loops invoke global allocator locks (`ptmalloc`), inducing thread lock contention and OS scheduler jitter across 40 cores.
+2. **Zero Exception Overhead (`-fno-exceptions`)**: C++ exception unwinding tables pollute instruction cache and increase binary footprint. Worker threads must be freestanding with zero `throw` statements (using `DSA_ASSERT` or status flags).
+3. **Coordinator-Worker Orchestration**: Planning (`AdaptiveTiler::Plan`) must NOT be repeated by all 40 worker threads. A single Coordinator (`DaePipeline::Execute`) pre-evaluates the plan outside the OpenMP parallel region and provides a pre-allocated 64-byte aligned reduction workspace buffer (`float* workspace`), dispatching stateless worker routines across OpenMP threads.
+4. **Lightweight Value-Semantics**: `LocalTensor<T>` is a 16-byte view (similar to `std::span`). It must be passed by value or const-reference without double-pointer indirection (`LocalTensor*`).
+
+### The Objective
+Refactor the inner `Core` execution into a freestanding worker routine:
+1. Replace heap containers (`std::vector<float> sums`, `std::vector<Cols> cols`) with fixed-size stack arrays (e.g. `float sums[128]`, `Cols cols[32]`).
+2. Remove any `throw` statements from `Core`, replacing them with `DSA_ASSERT`.
+3. Accept the pre-allocated reduction workspace buffer passed down from the Coordinator.
+
+---
+
 ## 📏 Cost Model & Methodology
 
 `HardwareModel` (`src/adaptive_tiler.hpp`) holds every constant the planner uses. `Target()` and `Host(P)` are two instances of the same equations:
@@ -213,7 +230,7 @@ Refactor the reduction tree and normalization pass to ensure:
 | `syncNs` | 7500 cycles / clock = 5000 ns | `SyncAll`. P05 still splits: whole rows model at 28.1 µs, the column band at 12.3 µs |
 | `tileNs` | 800 ns | P01–P03 run one tile per core and exceed their streaming time $W$ by 1.45–1.96 µs, which is one fill plus one drain of 0.73–0.98 µs each. The tilings that Challenges 2 and 3 ask for bracket it independently. P04 in two tiles ($n^* = 2$, with $W$ = 1.45 µs of vector work) requires $465 < \text{tileNs} \le 1292$ ns. P08 in tiles of ≥ 24 rows ($n^* \le 11$) requires $\text{tileNs} > 561$ ns |
 
-The model ranks decompositions and tile sizes; it does not predict latency. The world-record targets imply 850–2070 GB/s effective, because L2 reuse across iterations helps, and a single `byteNs` cannot capture that. The clock and `tileNs` should be recalibrated on silicon.
+The model ranks decompositions and tile sizes; it does not predict latency. The world-record targets imply 850–2070 GB/s effective, because L2 reuse across iterations helps, and a single `byteNs` cannot capture that. The clock and `tileNs` should be recalibrated on physical target hardware.
 
 The runtime simulates the DAE machine's function and capacity: scratchpad budget, DMA alignment, queue lifecycle and instruction cycle counts. It does not simulate the timing of DMA/vector overlap or vector operand alignment. Timing comes only from the model above.
 

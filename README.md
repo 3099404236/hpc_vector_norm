@@ -32,6 +32,9 @@ Contributors and autonomous AI agents must distinguish between the **Target Hard
 > 1. **Do NOT overfit to the 4-core host!** While `AdaptiveTiler` should gracefully handle `threads <= 4` on the host to avoid OS thrashing during tests, the **mathematical planning model must be explicitly architected for 40 symmetric cores**.
 > 2. **Alignment must honor 32 bytes**: The hardware DMA engine transfers memory in 32-byte blocks. All dimension slicing in Split-D should support 32-byte granularity.
 > 3. **Latency Targets Reflect Peak Theoretical Memory Roofline**: Target latencies (e.g. P13 $223\ \mu\text{s}$) assume an aggregated ~850 GB/s memory subsystem roofline. On the 4-core VM, reaching host memory saturation (~40 GB/s) confirms the algorithm is optimal!
+> 4. **Coordinator-Worker Decoupling & Zero-Allocation Freestanding Execution**:
+>    - The Master Coordinator (`DaePipeline::Execute`) evaluates `TilingConfig` on the master CPU thread before the OpenMP region and manages a pre-allocated 64-byte aligned reduction workspace buffer (`float* workspace`) passed to worker threads.
+>    - Worker threads must be purely freestanding: **zero dynamic allocation** (`malloc`, `new`, `std::vector`), zero exception unwinding (`throw`), and pass `LocalTensor` by value.
 
 ---
 
@@ -139,7 +142,7 @@ costs (`DaeIsa`):
 The clock only converts cycles to time. For each of the 15 profiles, every clock from 1.0 to 4.0 GHz picks the same decomposition,
 and every clock from 1.5 to 2.5 GHz picks the identical plan.
 [`docs/ARCHITECTURE_CHALLENGES.md`](docs/ARCHITECTURE_CHALLENGES.md#-cost-model--methodology) derives every constant. The clock and
-`tileNs` should be recalibrated on silicon; the equations stay the same.
+`tileNs` should be recalibrated on physical target hardware; the equations stay the same.
 
 **1. Decomposition, balanced to one DMA block (Challenge 1).** The planner treats the `M·D` elements as one flattened stream and
 cuts it into units. Core `t` of `n` gets units `[⌊U·t/n⌋, ⌊U·(t+1)/n⌋)`, so any two cores differ by at most one unit for every

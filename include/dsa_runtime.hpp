@@ -36,7 +36,35 @@
 #include <immintrin.h>
 #endif
 
+// -----------------------------------------------------------------------------
+// Freestanding & Low-Latency Assert Guard (Zero Exception Overhead)
+// -----------------------------------------------------------------------------
+#ifndef DSA_ASSERT
+#define DSA_ASSERT(cond, msg) \
+    do { \
+        if (!(cond)) { \
+            std::cerr << "[DSA Hardware Trap]: " << (msg) << " (" << __FILE__ << ":" << __LINE__ << ")\n"; \
+            std::abort(); \
+        } \
+    } while (0)
+#endif
+
 namespace dsa {
+
+// -----------------------------------------------------------------------------
+// Freestanding Execution Guidelines: Master Coordinator vs. Worker Threads
+// -----------------------------------------------------------------------------
+// In zero-allocation, ultra-low-latency multi-core execution:
+// 1. Master Coordinator (DaePipeline::Execute / Master Thread):
+//    - Evaluates TilingConfig on the master CPU thread before the parallel region.
+//    - Manages shared pre-allocated reduction workspace buffer (64-byte aligned).
+//    - Dispatches the OpenMP worker team passing POD pointers and configurations.
+// 2. Worker Threads (Core::Execute / Worker Thread):
+//    - Strictly freestanding: NO dynamic memory allocation (no malloc, new, std::vector).
+//    - No C++ exception handling inside workers (use DSA_ASSERT / error traps).
+//    - Uses fixed-size stack arrays (e.g. float sums[128]) or caller-provided workspace.
+//    - LocalTensor passed by value or const-reference (never LocalTensor*).
+// -----------------------------------------------------------------------------
 
 // -----------------------------------------------------------------------------
 // Hardware Micro-Architecture Constants (Target Hardware Ground Truths)
@@ -146,7 +174,7 @@ inline uint32_t GetThreadNum() {
 }
 
 // -----------------------------------------------------------------------------
-// LocalTensor<T> Implementation for On-Chip Scratchpad
+// LocalTensor<T> Implementation for Core-Local Scratchpad
 // -----------------------------------------------------------------------------
 template <typename T>
 class LocalTensor {
@@ -219,7 +247,7 @@ public:
 
     // Slot lifecycle: FREE -AllocTensor-> ALLOCATED -EnQue-> ENQUEUED -DeQue-> DEQUEUED -FreeTensor-> FREE.
     // A slot is only handed out again after FreeTensor, so a prefetch into the next buffer can
-    // never overwrite a tile that is still in flight (pass_async_hazard).
+    // never overwrite a tile that is still in flight (async queue hazard guard).
     enum SlotState : uint8_t { FREE, ALLOCATED, ENQUEUED, DEQUEUED };
 
     std::array<std::vector<uint8_t>, depth> bufferPool;
@@ -334,7 +362,7 @@ public:
         
         // ---------------------------------------------------------------------
         // Hardware Guard: Scratchpad Budget
-        // Strictly inspect that total on-chip scratchpad buffer stays <= 191 KB!
+        // Strictly inspect that total core-local scratchpad buffer stays <= 191 KB!
         // ---------------------------------------------------------------------
         totalAllocatedBytes += totalBytesForQueue;
         if (totalAllocatedBytes > SCRATCHPAD_SAFE_WATERLINE) {
@@ -538,7 +566,7 @@ inline void BlockReduceSum(LocalTensor<T> dst, LocalTensor<T> src, uint32_t coun
 
 // -----------------------------------------------------------------------------
 // Pure Vector Binary Reduction Tree (VectorReduceSum)
-// Folds on-chip vector elements into 1 scalar without scalar loop bubbles
+// Folds local vector elements into 1 scalar without scalar loop bubbles
 // -----------------------------------------------------------------------------
 template <typename T>
 inline float VectorReduceSum(LocalTensor<T> src, uint32_t count) {
