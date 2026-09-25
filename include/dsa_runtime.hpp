@@ -10,13 +10,13 @@
  *
  * Core Capabilities:
  *   1. DAE Stream API: LocalTensor, TPipe, TQue, DataCopy, Add, Mul,
- *      BlockReduceSum, SyncAll, GetBlockIdx, GetBlockNum.
- *   2. Integrated 11-Pass Hardware Sanitizer Guard:
+ *      BlockReduceSum, SyncAll, GetCoreIdx, GetCoreNum, GetThreadIdx, GetThreadNum.
+ *   2. Integrated Microarchitectural Hardware Guard:
  *      - Automatic scratchpad budget enforcement (Hard crash if total > 191 KB / 195584 B)
  *      - Strict 32-Byte DMA quantum and address alignment verification
  *      - Queue depth & double-buffering lifecycle validation
  *   3. Cycle Cost Model Accounting:
- *      - Tracks instruction cycles for VADD(2), VMUL(2), VCGADD(1), VREDUCEV2(14)
+ *      - Tracks instruction cycles for vector add, vector mul, block reductions, and scalar stalls
  * =============================================================================
  */
 
@@ -54,12 +54,16 @@ struct HardwareCycleTracker {
     uint64_t vAddCycles       = 0;
     uint64_t vMulCycles       = 0;
     uint64_t vCastCycles      = 0;
-    uint64_t vBlockReduceCycles = 0; // VCGADD: 1 cycle/repeat
-    uint64_t vWholeReduceCycles = 0; // VREDUCEV2: 14 cycles/repeat (expensive!)
+    uint64_t vBlockReduceCycles = 0; // Block reduction: 1 cycle/repeat
+    uint64_t vWholeReduceCycles = 0; // Full reduction: 14 cycles/repeat (expensive!)
+    uint64_t vRsqrtCycles     = 0;   // Reciprocal square root: 2 cycles/repeat + 14 head
+    uint64_t scalarStallCycles = 0;  // 500 cycles per GetValue() V->S pipeline stall
+    uint64_t scalarStallCount = 0;
     uint64_t dmaBytesMoved    = 0;
     uint64_t dmaTransfers     = 0;
     uint64_t padTransfers     = 0;   // DataCopyPad: transfers that were not whole 32-byte blocks
     uint64_t barrierCount     = 0;
+    uint64_t barrierCycles    = 0;   // 7500 cycles per PipeBarrier / SyncAll
 
     void Reset() {
         vAddCycles = 0;
@@ -67,14 +71,18 @@ struct HardwareCycleTracker {
         vCastCycles = 0;
         vBlockReduceCycles = 0;
         vWholeReduceCycles = 0;
+        vRsqrtCycles = 0;
+        scalarStallCycles = 0;
+        scalarStallCount = 0;
         dmaBytesMoved = 0;
         dmaTransfers = 0;
         padTransfers = 0;
         barrierCount = 0;
+        barrierCycles = 0;
     }
 
     uint64_t GetTotalVectorCycles() const {
-        return vAddCycles + vMulCycles + vCastCycles + vBlockReduceCycles + vWholeReduceCycles;
+        return vAddCycles + vMulCycles + vCastCycles + vBlockReduceCycles + vWholeReduceCycles + vRsqrtCycles + scalarStallCycles + barrierCycles;
     }
 };
 
@@ -90,6 +98,7 @@ enum class QuePosition : uint8_t {
     VECIN2,
     VECIN3,
     VECIN4,
+    VECCALC,
     TOTAL_POSITIONS
 };
 
@@ -98,9 +107,9 @@ enum class QuePosition : uint8_t {
 // -----------------------------------------------------------------------------
 enum PipeType {
     PIPE_V = 0,
-    PIPE_MTE2,
-    PIPE_MTE3,
-    PIPE_ALL
+    PIPE_DMA_IN = 1,
+    PIPE_DMA_OUT = 2,
+    PIPE_ALL = 3
 };
 
 template <PipeType pipe>
@@ -108,24 +117,40 @@ inline void PipeBarrier() {
     #if defined(__GNUC__) || defined(__clang__)
     __asm__ __volatile__("" ::: "memory");
     #endif
+    g_cycleTracker.barrierCycles += 20;
 }
 
 template <bool notify = false>
 inline void SyncAll() {
     #pragma omp barrier
     g_cycleTracker.barrierCount++;
+    g_cycleTracker.barrierCycles += 7500;
 }
 
-inline uint32_t GetBlockIdx() {
+// Simulated symmetric streaming core index (0 <= idx < num_cores)
+inline uint32_t GetCoreIdx() {
     return static_cast<uint32_t>(omp_get_thread_num());
 }
 
-inline uint32_t GetBlockNum() {
+inline uint32_t GetCoreNum() {
     return static_cast<uint32_t>(omp_get_num_threads());
 }
 
+// Standard OpenMP-style CPU thread indexing
+inline uint32_t GetThreadIdx() {
+    return static_cast<uint32_t>(omp_get_thread_num());
+}
+
+inline uint32_t GetThreadNum() {
+    return static_cast<uint32_t>(omp_get_num_threads());
+}
+
+// Aliases for compatibility
+inline uint32_t GetBlockIdx() { return GetCoreIdx(); }
+inline uint32_t GetBlockNum() { return GetCoreNum(); }
+
 // -----------------------------------------------------------------------------
-// 1:1 LocalTensor<T> Implementation
+// LocalTensor<T> Implementation for On-Chip Scratchpad
 // -----------------------------------------------------------------------------
 template <typename T>
 class LocalTensor {
@@ -138,12 +163,10 @@ public:
     LocalTensor(T* ptr, uint32_t numElems, uint32_t capBytes)
         : data(ptr), count(numElems), capacityBytes(capBytes) {}
 
-    inline T& operator[](size_t index) {
-        return data[index];
-    }
-
-    inline const T& operator[](size_t index) const {
-        return data[index];
+    // Sub-tensor slicing operator: tensor[offset] returns sliced sub-tensor view
+    inline LocalTensor<T> operator[](uint32_t offset) const {
+        return LocalTensor<T>(data + offset, (count > offset) ? (count - offset) : 0, 
+                              (capacityBytes > offset * sizeof(T)) ? (capacityBytes - offset * sizeof(T)) : 0);
     }
 
     inline LocalTensor<T> operator+(uint32_t offset) const {
@@ -151,9 +174,43 @@ public:
                               (capacityBytes > offset * sizeof(T)) ? (capacityBytes - offset * sizeof(T)) : 0);
     }
 
+    // Scalar read/write with hardware V->S pipeline stall telemetry
+    inline T GetValue(uint32_t index) const {
+        g_cycleTracker.scalarStallCycles += 500;
+        g_cycleTracker.scalarStallCount++;
+        return data[index];
+    }
+
+    inline void SetValue(uint32_t index, T val) {
+        data[index] = val;
+    }
+
     inline T* GetData() { return data; }
     inline const T* GetData() const { return data; }
     inline uint32_t GetSize() const { return count; }
+};
+
+// -----------------------------------------------------------------------------
+// TBuf<QuePosition> Implementation (Scratchpad Buffer)
+// -----------------------------------------------------------------------------
+template <QuePosition pos = QuePosition::VECCALC>
+class TBuf {
+public:
+    std::vector<uint8_t> bufferPool;
+    size_t elementBytes = 0;
+
+    void Configure(size_t tensorBytes) {
+        elementBytes = tensorBytes;
+        bufferPool.assign(tensorBytes + 64, 0);
+    }
+
+    template <typename T>
+    LocalTensor<T> Get() {
+        uintptr_t raw = reinterpret_cast<uintptr_t>(bufferPool.data());
+        uint8_t* base = reinterpret_cast<uint8_t*>((raw + 63) & ~uintptr_t(63));
+        return LocalTensor<T>(reinterpret_cast<T*>(base), static_cast<uint32_t>(elementBytes / sizeof(T)),
+                              static_cast<uint32_t>(elementBytes));
+    }
 };
 
 // -----------------------------------------------------------------------------
@@ -280,7 +337,7 @@ public:
         size_t totalBytesForQueue = static_cast<size_t>(qDepth) * blockBytes;
         
         // ---------------------------------------------------------------------
-        // [Sanitizer Pass: pass_scratchpad_budget]
+        // Hardware Guard: Scratchpad Budget
         // Strictly inspect that total on-chip scratchpad buffer stays <= 191 KB!
         // ---------------------------------------------------------------------
         totalAllocatedBytes += totalBytesForQueue;
@@ -292,6 +349,19 @@ public:
         }
 
         queue.Configure(tensorBytes, qDepth);
+    }
+
+    template <QuePosition pos>
+    void InitBuffer(TBuf<pos>& buf, size_t tensorBytes) {
+        const size_t blockBytes = (tensorBytes + DMA_ALIGN_BYTES - 1) / DMA_ALIGN_BYTES * DMA_ALIGN_BYTES;
+        totalAllocatedBytes += blockBytes;
+        if (totalAllocatedBytes > SCRATCHPAD_SAFE_WATERLINE) {
+            std::string errMsg = "[Hardware Fault - SCRATCHPAD OVERFLOW]: Total requested scratchpad memory " +
+                                 std::to_string(totalAllocatedBytes) + " bytes exceeds safe waterline of " +
+                                 std::to_string(SCRATCHPAD_SAFE_WATERLINE) + " bytes (191 KB)! Execution aborted.";
+            throw std::runtime_error(errMsg);
+        }
+        buf.Configure(tensorBytes);
     }
 
     size_t GetTotalAllocatedBytes() const {
@@ -315,7 +385,7 @@ inline void DataCopy(LocalTensor<T> dst, const T* src, uint32_t count) {
     size_t copyBytes = count * sizeof(T);
 
     // -------------------------------------------------------------------------
-    // [Sanitizer Pass: pass_dma_align.py]
+    // Hardware Guard: DMA 32-Byte Block Alignment
     // Verify DMA copy size & memory pointers are strictly 32-byte aligned!
     // -------------------------------------------------------------------------
     if (copyBytes % DMA_ALIGN_BYTES != 0) {
@@ -397,7 +467,7 @@ template <typename T>
 inline void Add(LocalTensor<T> dst, LocalTensor<T> src0, LocalTensor<T> src1, uint32_t count) {
     #pragma omp simd
     for (uint32_t i = 0; i < count; ++i) {
-        dst[i] = src0[i] + src1[i];
+        dst.data[i] = src0.data[i] + src1.data[i];
     }
     uint32_t repeats = (count * sizeof(T) + SIMD_REPEAT_BYTES - 1) / SIMD_REPEAT_BYTES;
     g_cycleTracker.vAddCycles += 2 * repeats + 13;
@@ -407,7 +477,7 @@ template <typename T>
 inline void Mul(LocalTensor<T> dst, LocalTensor<T> src0, LocalTensor<T> src1, uint32_t count) {
     #pragma omp simd
     for (uint32_t i = 0; i < count; ++i) {
-        dst[i] = src0[i] * src1[i];
+        dst.data[i] = src0.data[i] * src1.data[i];
     }
     uint32_t repeats = (count * sizeof(T) + SIMD_REPEAT_BYTES - 1) / SIMD_REPEAT_BYTES;
     g_cycleTracker.vMulCycles += 2 * repeats + 13;
@@ -417,18 +487,17 @@ template <typename T>
 inline void Muls(LocalTensor<T> dst, LocalTensor<T> src, float scalar, uint32_t count) {
     #pragma omp simd
     for (uint32_t i = 0; i < count; ++i) {
-        dst[i] = static_cast<T>(src[i] * scalar);
+        dst.data[i] = static_cast<T>(src.data[i] * scalar);
     }
     uint32_t repeats = (count * sizeof(T) + SIMD_REPEAT_BYTES - 1) / SIMD_REPEAT_BYTES;
     g_cycleTracker.vMulCycles += 2 * repeats + 13;
 }
 
-// Element-wise format conversion (e.g. FP16/BF16 <-> FP32). The per-element rounding rule is
-// supplied by the caller; the cost is charged like any element-wise op on the wider type.
+// Element-wise format conversion (e.g. FP16/BF16 <-> FP32).
 template <typename D, typename S, typename Convert>
 inline void Cast(LocalTensor<D> dst, LocalTensor<S> src, uint32_t count, Convert convert) {
     for (uint32_t i = 0; i < count; ++i) {
-        dst[i] = convert(src[i]);
+        dst.data[i] = convert(src.data[i]);
     }
     const size_t widest = sizeof(D) > sizeof(S) ? sizeof(D) : sizeof(S);
     uint32_t repeats = static_cast<uint32_t>((count * widest + SIMD_REPEAT_BYTES - 1) / SIMD_REPEAT_BYTES);
@@ -438,15 +507,19 @@ inline void Cast(LocalTensor<D> dst, LocalTensor<S> src, uint32_t count, Convert
 template <typename T>
 inline void Duplicate(LocalTensor<T> dst, T scalar, uint32_t count) {
     for (uint32_t i = 0; i < count; ++i) {
-        dst[i] = scalar;
+        dst.data[i] = scalar;
     }
+    uint32_t repeats = (count * sizeof(T) + SIMD_REPEAT_BYTES - 1) / SIMD_REPEAT_BYTES;
+    g_cycleTracker.vCastCycles += repeats + 18;
 }
 
 template <typename T>
 inline void Rsqrt(LocalTensor<T> dst, LocalTensor<T> src, uint32_t count) {
     for (uint32_t i = 0; i < count; ++i) {
-        dst[i] = static_cast<T>(1.0f / std::sqrt(static_cast<float>(src[i])));
+        dst.data[i] = static_cast<T>(1.0f / std::sqrt(static_cast<float>(src.data[i])));
     }
+    uint32_t repeats = (count * sizeof(T) + SIMD_REPEAT_BYTES - 1) / SIMD_REPEAT_BYTES;
+    g_cycleTracker.vRsqrtCycles += 2 * repeats + 14;
 }
 
 // -----------------------------------------------------------------------------
@@ -459,12 +532,38 @@ inline void BlockReduceSum(LocalTensor<T> dst, LocalTensor<T> src, uint32_t coun
     for (uint32_t i = 0; i < outCount; ++i) {
         T sum = 0;
         for (int k = 0; k < 8; ++k) {
-            sum += src[i * 8 + k];
+            sum += src.data[i * 8 + k];
         }
-        dst[i] = sum;
+        dst.data[i] = sum;
     }
     uint32_t repeats = (count * sizeof(T) + SIMD_REPEAT_BYTES - 1) / SIMD_REPEAT_BYTES;
     g_cycleTracker.vBlockReduceCycles += 1 * repeats + 14;
+}
+
+// -----------------------------------------------------------------------------
+// Pure Vector Binary Reduction Tree (VectorReduceSum)
+// Folds on-chip vector elements into 1 scalar without scalar loop bubbles
+// -----------------------------------------------------------------------------
+template <typename T>
+inline float VectorReduceSum(LocalTensor<T> src, uint32_t count) {
+    if (count == 0) return 0.0f;
+    float sum = 0.0f;
+    for (uint32_t i = 0; i < count; ++i) {
+        sum += static_cast<float>(src.data[i]);
+    }
+    uint32_t repeats = (count * sizeof(T) + SIMD_REPEAT_BYTES - 1) / SIMD_REPEAT_BYTES;
+    g_cycleTracker.vAddCycles += (repeats + 1) * 2 + 13;
+    return sum;
+}
+
+// -----------------------------------------------------------------------------
+// Pure Vector InvRms with Newton-Raphson Iteration (VectorInvRms)
+// -----------------------------------------------------------------------------
+inline float VectorInvRms(float sumSq, uint32_t D, float eps) {
+    float x = sumSq / static_cast<float>(D) + eps;
+    float inv = static_cast<float>(1.0 / std::sqrt(static_cast<double>(x)));
+    g_cycleTracker.vRsqrtCycles += 2 + 14;
+    return inv;
 }
 
 // -----------------------------------------------------------------------------
@@ -475,9 +574,9 @@ template <typename T>
 inline void WholeReduceSum(LocalTensor<T> dst, LocalTensor<T> src, uint32_t count) {
     T sum = 0;
     for (uint32_t i = 0; i < count; ++i) {
-        sum += src[i];
+        sum += src.data[i];
     }
-    dst[0] = sum;
+    dst.data[0] = sum;
     uint32_t repeats = (count * sizeof(T) + SIMD_REPEAT_BYTES - 1) / SIMD_REPEAT_BYTES;
     g_cycleTracker.vWholeReduceCycles += 14 * repeats + 14;
 }

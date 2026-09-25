@@ -75,7 +75,7 @@ For Profile 8 ($10240 \times 512$), $D=512$:
   $$\text{MemoryModel}(B, D, s) = \underbrace{2 \cdot 2 \cdot BDs}_{\text{X1, X2 double-buffered}} + \underbrace{4BD\,[s < 4]}_{\text{FP32 Z tile}} + \underbrace{8D}_{\gamma,\ \beta\ \text{(FP32)}} + \underbrace{8192}_{\text{fold scratch}} + \underbrace{2048}_{\text{records}}$$
 - **20 B → 12 B per element.**
   - Y has no buffer of its own: the result is cast back into the X1 slot and sent from there.
-  - $Z^2$ has no buffer either: the squares pass through the 8 KB scratch chunk and `BlockReduceSum` (VCGADD) folds, 8 → 1 per fold while the length stays a multiple of 8. For $D = 512$ the folds go 512 → 64 → 8 → 1, which plays the role of the 64-element streaming reduction. Each fold costs 1 cycle per repeat, and the kernel never uses the 14-cycle `WholeReduceSum` (VREDUCEV2).
+  - $Z^2$ has no buffer either: the squares pass through the 8 KB scratch chunk and `BlockReduceSum` folds, 8 → 1 per fold while the length stays a multiple of 8. For $D = 512$ the folds go 512 → 64 → 8 → 1, which plays the role of the 64-element streaming reduction. Each fold costs 1 cycle per repeat, and the kernel never uses the 14-cycle `WholeReduceSum`.
   - What remains is the X1/X2 queues (4 B per element) plus the FP32 Z tile (4 B): 12 B for FP16/BF16. FP32 computes Z in place in the X1 slot, at 16 B.
 - **Closed form.** $B^*(D) = \lfloor (195{,}584 - 10{,}240 - 8D) / (bD) \rfloor$ with $b = 12$ for 16-bit dtypes and 16 for FP32, less the 32-byte rounding:
 

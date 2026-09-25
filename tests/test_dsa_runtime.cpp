@@ -6,19 +6,20 @@
 
 using namespace dsa;
 
-// Global-memory buffers on the 32-byte DMA block boundary (alignas on a std::vector
+// Cache-line aligned memory buffers on the 64-byte/32-byte DMA block boundary (alignas on a std::vector
 // object does not align its heap storage)
 template <typename T>
-struct GmAllocator {
+struct AlignedAllocator {
     using value_type = T;
-    GmAllocator() = default;
-    template <typename U> GmAllocator(const GmAllocator<U>&) {}
+    AlignedAllocator() = default;
+    template <typename U> AlignedAllocator(const AlignedAllocator<U>&) {}
     T* allocate(size_t n) { return static_cast<T*>(std::aligned_alloc(64, (n * sizeof(T) + 63) / 64 * 64)); }
     void deallocate(T* p, size_t) { std::free(p); }
-    template <typename U> bool operator==(const GmAllocator<U>&) const { return true; }
-    template <typename U> bool operator!=(const GmAllocator<U>&) const { return false; }
+    template <typename U> bool operator==(const AlignedAllocator<U>&) const { return true; }
+    template <typename U> bool operator!=(const AlignedAllocator<U>&) const { return false; }
 };
-template <typename T> using GmVector = std::vector<T, GmAllocator<T>>;
+template <typename T> using AlignedVector = std::vector<T, AlignedAllocator<T>>;
+template <typename T> using GmVector = AlignedVector<T>; // Backward-compatibility alias
 
 template <typename F>
 bool ExpectTrap(const char* what, F body) {
@@ -83,8 +84,8 @@ int main() {
     std::cout << "=================================================================\n";
 
     constexpr uint32_t ELEMS = 2048;
-    GmVector<float> input(ELEMS, 2.0f);
-    GmVector<float> output(ELEMS, 0.0f);
+    AlignedVector<float> input(ELEMS, 2.0f);
+    AlignedVector<float> output(ELEMS, 0.0f);
 
     SampleDaePipelineKernel kernel;
     kernel.Process(input.data(), output.data(), ELEMS);
@@ -137,7 +138,7 @@ int main() {
     // -------------------------------------------------------------------------
     std::cout << "\n[Testing Double-Buffer Slot Lifecycle]...\n";
     {
-        GmVector<float> a(8, 1.0f), b(8, 2.0f);
+        AlignedVector<float> a(8, 1.0f), b(8, 2.0f);
         TPipe dbPipe;
         TQue<QuePosition::VECIN, 2> dq;
         dbPipe.InitBuffer(dq, 2, 8 * sizeof(float));
@@ -149,7 +150,7 @@ int main() {
         dq.EnQue(t1);
         LocalTensor<float> c0 = dq.DeQue<float>();
         LocalTensor<float> c1 = dq.DeQue<float>();
-        if (t0.GetData() == t1.GetData() || c0[0] != 1.0f || c1[0] != 2.0f) {
+        if (t0.GetData() == t1.GetData() || c0.GetValue(0) != 1.0f || c1.GetValue(0) != 2.0f) {
             std::cerr << "FAIL: prefetched tile overwrote the tile in flight\n";
             return 1;
         }
@@ -198,7 +199,7 @@ int main() {
         LocalTensor<float> t = q1.AllocTensor<float>();
         const uint64_t pads = g_cycleTracker.padTransfers;
         DataCopyPad(t, input.data() + 3, 5);
-        if (t[4] != 2.0f || t[5] != 0.0f || t[7] != 0.0f || g_cycleTracker.padTransfers != pads + 1) {
+        if (t.GetValue(4) != 2.0f || t.GetValue(5) != 0.0f || t.GetValue(7) != 0.0f || g_cycleTracker.padTransfers != pads + 1) {
             std::cerr << "FAIL: DataCopyPad did not move/pad the tail\n";
             return 1;
         }

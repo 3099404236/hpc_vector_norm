@@ -45,7 +45,7 @@ To bridge the gap between high-level C++ and the target decoupled access-execute
   - `pass_dma_align`: Instantly aborts if DMA transfers are not aligned to **32 bytes**.
   - `pass_async_hazard`: Validates queue depth and double-buffering lifecycle.
 - **Hardware Virtual Cycle Tracker**:
-  - Automatically profiles instruction costs: `VADD`(2 cycles/repeat), `VMUL`(2 cycles/repeat), `VCGADD`(1 cycle/repeat), `VREDUCEV2`(14 cycles/repeat).
+  - Automatically profiles instruction costs: `Add`(2 cycles/repeat), `Mul`(2 cycles/repeat), `BlockReduceSum`(1 cycle/repeat), `WholeReduceSum`(14 cycles/repeat).
   - Run verification via `ctest -R dsa_runtime_sanitizer` or `./build/test_dsa_runtime`.
 
 ---
@@ -184,10 +184,10 @@ The full-size target plans are below. `./hpc_vector_norm_bench` prints them. `te
 Only P05 splits. Everywhere else, whole rows already balance to within one row, and one row costs less than a `SyncAll`.
 
 **DAE executor** (`DaePipeline<Codec>`, the target path at the end of `src/kernel_unified.hpp`). Each OpenMP thread is one
-simulated core (`GetBlockIdx`), and everything goes through `include/dsa_runtime.hpp`:
+simulated core (`GetCoreIdx`), and everything goes through `include/dsa_runtime.hpp`:
 
 - **Double buffering.** X1 and X2 use `TQue<VECIN, 2>`: tile k+1's `DataCopy` is issued before tile k is dequeued. Column tiles stream γ/β chunks through a third queue.
-- **Row tiles.** `Z = X1 + X2 + bias` in FP32, with `Cast` for 16-bit dtypes. Σz² per row uses `Mul` plus `BlockReduceSum` folds, which cost 1 cycle per repeat against 14 for `VREDUCEV2`, while the row length stays a multiple of 8. Then `Muls` by 1/σ, `Mul` by γ, `Cast` back into the X1 slot, and `DataCopy` out.
+- **Row tiles.** `Z = X1 + X2 + bias` in FP32, with `Cast` for 16-bit dtypes. Σz² per row uses `Mul` plus `BlockReduceSum` folds, which cost 1 cycle per repeat against 14 for `WholeReduceSum`, while the row length stays a multiple of 8. Then `Muls` by 1/σ, `Mul` by γ, `Cast` back into the X1 slot, and `DataCopy` out.
 - **Split-D.** Sweep 1 runs over the core's (at most two) row fragments with Z resident. Each core then writes one 32-byte record `{Σ₀, Σ₁, row₀, row₁}` to global memory. Every core reaches the single `SyncAll`, including a core whose sanitizer trapped, so the barrier never deadlocks. Each owner of a row then gathers that row's records in owner order and normalizes its resident Z. Because every owner sums in the same order, all owners compute an identical σ.
 - **DMA.** Every transfer is a 32-byte `DataCopy`. `DataCopyPad` is used only where a transfer does not end on a 32-byte block (`D·s % 32 ≠ 0`) or starts off the 32-byte grid.
 - **Results with `--target`.** On all 15 profiles the output matches the host kernel, with 0 padded transfers and at most 191 KB of scratchpad per core. DMA moves only compulsory traffic: X1, X2 and Y, plus γ/β once per core segment. For P13 that is 189.2 MB against 188.7 MB of tensors.

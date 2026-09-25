@@ -305,7 +305,7 @@ private:
 // =============================================================================
 // Target DAE pipeline: a HardwareModel::Target() plan executed the way the 40-core
 // accelerator runs it, through include/dsa_runtime.hpp. One OpenMP thread is one
-// simulated core (GetBlockIdx). Every scratchpad buffer is claimed through TPipe
+// simulated core (GetCoreIdx). Every scratchpad buffer is claimed through TPipe
 // (191 KB trap); every global-memory transfer is a 32-byte DataCopy, or a counted
 // DataCopyPad where a row does not end on a DMA block.
 // =============================================================================
@@ -336,10 +336,10 @@ public:
         std::string error;
         #pragma omp parallel num_threads(blocks)
         {
-            const uint32_t b = dsa::GetBlockIdx(), nb = dsa::GetBlockNum();
+            const uint32_t coreId = dsa::GetCoreIdx(), numCores = dsa::GetCoreNum();
             dsa::g_cycleTracker.Reset();
-            Core core(x1, x2, gamma, bias, y, M, D, eps, plan, workspace, b);
-            const CoreRange range = AdaptiveTiler::Range(plan, M, D, b, nb);
+            Core core(x1, x2, gamma, bias, y, M, D, eps, plan, workspace, coreId);
+            const CoreRange range = AdaptiveTiler::Range(plan, M, D, coreId, numCores);
             const bool split = plan.mode == TilingMode::SPLIT_D;
             std::string err;
             try {
@@ -351,13 +351,13 @@ public:
             if (split) dsa::SyncAll();  // Reached by every core, failed or not: no deadlock
             if (split && err.empty()) {
                 try {
-                    core.Phase2(range, nb);
+                    core.Phase2(range, numCores);
                 } catch (const std::exception& e) {
                     err = e.what();
                 }
             }
-            trackers[b] = dsa::g_cycleTracker;
-            spm[b] = core.pipe.GetTotalAllocatedBytes();
+            trackers[coreId] = dsa::g_cycleTracker;
+            spm[coreId] = core.pipe.GetTotalAllocatedBytes();
             if (!err.empty()) {
                 #pragma omp critical(hpc_dae_error)
                 if (error.empty()) error = err;
@@ -422,7 +422,7 @@ private:
 
         dsa::TPipe pipe;
         dsa::TQue<dsa::QuePosition::VECIN, 2> qX1, qX2, qP;          // Double-buffered tiles
-        dsa::TQue<dsa::QuePosition::VECIN1, 1> qZ, qTmp, qPar, qRes, qMisc;
+        dsa::TBuf<dsa::QuePosition::VECCALC> qZ, qTmp, qPar, qRes, qMisc;
         dsa::LocalTensor<float> z, tmp, par, res, misc;
         uint32_t tmpCap = 0, quantum = 1;
 
@@ -431,13 +431,14 @@ private:
             pipe.InitBuffer(qX1, 2, L.tile);
             pipe.InitBuffer(qX2, 2, L.tile);
             if (L.paramQueue) pipe.InitBuffer(qP, 2, L.tile);
-            if (L.z) { pipe.InitBuffer(qZ, 1, L.z); z = qZ.AllocTensor<float>(); }
-            pipe.InitBuffer(qTmp, 1, L.tmp);
-            tmp = qTmp.AllocTensor<float>();
-            if (L.params) { pipe.InitBuffer(qPar, 1, L.params); par = qPar.AllocTensor<float>(); }
-            if (L.resident) { pipe.InitBuffer(qRes, 1, L.resident); res = qRes.AllocTensor<float>(); }
-            pipe.InitBuffer(qMisc, 1, L.misc);
-            misc = qMisc.AllocTensor<float>();
+            if (L.z) { pipe.InitBuffer(qZ, L.z); z = qZ.Get<float>(); }
+            else { pipe.InitBuffer(qZ, 64); z = qZ.Get<float>(); } // Always initialized!
+            pipe.InitBuffer(qTmp, L.tmp);
+            tmp = qTmp.Get<float>();
+            if (L.params) { pipe.InitBuffer(qPar, L.params); par = qPar.Get<float>(); }
+            if (L.resident) { pipe.InitBuffer(qRes, L.resident); res = qRes.Get<float>(); }
+            pipe.InitBuffer(qMisc, L.misc);
+            misc = qMisc.Get<float>();
             tmpCap = L.tmp / sizeof(float) / 8 * 8;
             quantum = std::max<uint32_t>(1, dsa::DMA_ALIGN_BYTES / sizeof(S));
         }
@@ -454,9 +455,9 @@ private:
             if (split) {  // One 32-byte record per core: {sum0, sum1, row0, row1, 0...}
                 const uint32_t rows[2] = {r.nFrag > 0 ? r.frag[0].row : kNoRow, r.nFrag > 1 ? r.frag[1].row : kNoRow};
                 dsa::Duplicate(misc, 0.0f, 8);
-                misc[0] = r.nFrag > 0 ? fragSum[0] : 0.0f;
-                misc[1] = r.nFrag > 1 ? fragSum[1] : 0.0f;
-                std::memcpy(&misc[2], rows, sizeof rows);
+                misc.SetValue(0, r.nFrag > 0 ? fragSum[0] : 0.0f);
+                misc.SetValue(1, r.nFrag > 1 ? fragSum[1] : 0.0f);
+                std::memcpy(misc.data + 2, rows, sizeof rows);
                 dsa::DataCopy(workspace + static_cast<size_t>(b) * 8, misc, 8);
             }
             for (uint32_t row = r.rowA; row < r.rowZ; ++row) {
@@ -473,13 +474,13 @@ private:
                 const CoreRange::Fragment& f = r.frag[k];
                 uint32_t first, last;
                 AdaptiveTiler::RowOwners(plan, D, f.row, nb, first, last);
-                dsa::LocalTensor<float> recs = misc + 8;
+                dsa::LocalTensor<float> recs = misc[8];
                 dsa::DataCopy(recs, workspace + static_cast<size_t>(first) * 8, (last - first + 1) * 8);
                 float total = 0.0f;  // Same order on every owner => identical sigma
                 for (uint32_t t = 0; t <= last - first; ++t) {
                     uint32_t rows[2];
-                    std::memcpy(rows, &recs[t * 8 + 2], sizeof rows);
-                    total += (rows[0] == f.row ? recs[t * 8] : 0.0f) + (rows[1] == f.row ? recs[t * 8 + 1] : 0.0f);
+                    std::memcpy(rows, recs.data + t * 8 + 2, sizeof rows);
+                    total += (rows[0] == f.row ? recs.GetValue(t * 8) : 0.0f) + (rows[1] == f.row ? recs.GetValue(t * 8 + 1) : 0.0f);
                 }
                 Sweep2(f.row, f.cb, f.ce, fragZ[k], total);
             }
@@ -489,7 +490,7 @@ private:
         void RowTiles(uint32_t rA, uint32_t rZ) {
             if (rA >= rZ) return;
             LoadVector(par, gamma, 1.0f);
-            LoadVector(par + D, bias, 0.0f);
+            LoadVector(par[D], bias, 0.0f);
             const uint32_t B = plan.tileRows;
             LoadTile(static_cast<uint64_t>(rA) * D, std::min(B, rZ - rA) * D);
             for (uint32_t row = rA; row < rZ; row += B) {
@@ -499,13 +500,15 @@ private:
                 dsa::LocalTensor<float> zt = ZOf(a);
                 AddInputs(zt, a, bt, n * D);
                 qX2.FreeTensor(bt);
-                for (uint32_t i = 0; i < n; ++i) dsa::Add(zt + i * D, zt + i * D, par + D, D);
+                if (bias) {
+                    for (uint32_t i = 0; i < n; ++i) dsa::Add(zt[i * D], zt[i * D], par[D], D);
+                }
                 for (uint32_t i = 0; i < n; i += kSumSlots) {
                     const uint32_t k = std::min(kSumSlots, n - i);
-                    RowSums(zt + i * D, k);  // misc[256 + r]
+                    RowSums(zt[i * D], k);  // misc[256 + r]
                     for (uint32_t r = 0; r < k; ++r) {
-                        dsa::LocalTensor<float> zr = zt + (i + r) * D;
-                        dsa::Muls(zr, zr, InvRms(misc[kSumSlots + r]), D);
+                        dsa::LocalTensor<float> zr = zt[(i + r) * D];
+                        dsa::Muls(zr, zr, InvRms(misc.GetValue(kSumSlots + r)), D);
                         dsa::Mul(zr, zr, par, D);
                     }
                 }
@@ -522,7 +525,7 @@ private:
             float sum = 0.0f;
             Tiles(start, end, true, [&](uint64_t e, uint32_t n) {
                 dsa::LocalTensor<S> a = qX1.template DeQue<S>(), bt = qX2.template DeQue<S>();
-                dsa::LocalTensor<float> zt = zr ? *zr + static_cast<uint32_t>(e - start) : z;
+                dsa::LocalTensor<float> zt = zr ? (*zr)[static_cast<uint32_t>(e - start)] : z;
                 AddInputs(zt, a, bt, n);
                 qX1.FreeTensor(a);
                 qX2.FreeTensor(bt);
@@ -541,7 +544,7 @@ private:
                 dsa::LocalTensor<S> out;
                 dsa::LocalTensor<float> zt;
                 if (zr) {
-                    zt = *zr + static_cast<uint32_t>(e - start);
+                    zt = (*zr)[static_cast<uint32_t>(e - start)];
                     out = qX1.template AllocTensor<S>();
                 } else {
                     out = qX1.template DeQue<S>();
@@ -594,8 +597,8 @@ private:
                 dsa::Cast(zt, a, n, ToF32);
                 for (uint32_t o = 0; o < n; o += tmpCap) {
                     const uint32_t k = std::min(tmpCap, n - o);
-                    dsa::Cast(tmp, bt + o, k, ToF32);
-                    dsa::Add(zt + o, zt + o, tmp, k);
+                    dsa::Cast(tmp, bt[o], k, ToF32);
+                    dsa::Add(zt[o], zt[o], tmp, k);
                 }
             }
         }
@@ -606,19 +609,23 @@ private:
             DmaIn(pc, src, n);
             for (uint32_t o = 0; o < n; o += tmpCap) {
                 const uint32_t k = std::min(tmpCap, n - o);
-                dsa::Cast(tmp, pc + o, k, ToF32);
-                if (multiply) dsa::Mul(zt + o, zt + o, tmp, k);
-                else dsa::Add(zt + o, zt + o, tmp, k);
+                dsa::Cast(tmp, pc[o], k, ToF32);
+                if (multiply) dsa::Mul(zt[o], zt[o], tmp, k);
+                else dsa::Add(zt[o], zt[o], tmp, k);
             }
             qP.FreeTensor(pc);
         }
 
         void LoadVector(dsa::LocalTensor<float> dst, const S* src, float fill) {
             if (!src) return dsa::Duplicate(dst, fill, D);
-            dsa::LocalTensor<S> st = qX1.template AllocTensor<S>();
-            DmaIn(st, src, D);
-            dsa::Cast(dst, st, D, ToF32);
-            qX1.FreeTensor(st);
+            const uint32_t tileLimit = plan.layout.tile / static_cast<uint32_t>(sizeof(S));
+            for (uint32_t o = 0; o < D; o += tileLimit) {
+                const uint32_t k = std::min(tileLimit, D - o);
+                dsa::LocalTensor<S> st = qX1.template AllocTensor<S>();
+                DmaIn(st, src + o, k);
+                dsa::Cast(dst[o], st, k, ToF32);
+                qX1.FreeTensor(st);
+            }
         }
 
         void Narrow(dsa::LocalTensor<S> out, dsa::LocalTensor<float> zt, uint32_t n) {
@@ -631,46 +638,44 @@ private:
             else return z;
         }
 
-        // sum(Z^2) of one segment: VMUL + VCGADD folds (1 cycle/repeat) instead of VREDUCEV2 (14)
+        // sum(Z^2) of one segment: Mul + BlockReduceSum + VectorReduceSum (pure vector binary tree)
         float SumSquares(dsa::LocalTensor<float> zt, uint32_t n) {
             float total = 0.0f;
             for (uint32_t o = 0; o < n; o += tmpCap) {
                 uint32_t k = std::min(tmpCap, n - o);
-                dsa::Mul(tmp, zt + o, zt + o, k);
+                dsa::Mul(tmp, zt[o], zt[o], k);
                 while (k % 8 == 0 && k >= 8) { dsa::BlockReduceSum(tmp, tmp, k); k /= 8; }
-                for (uint32_t i = 0; i < k; ++i) total += tmp[i];
+                total += dsa::VectorReduceSum(tmp, k);
             }
             return total;
         }
 
-        // sum(Z^2) of `rows` whole rows into misc[256 + r]; folds keep rows apart while D/8^k is whole
+        // sum(Z^2) of `rows` whole rows into misc[256 + r]; pure vector fold keeps rows apart
         void RowSums(dsa::LocalTensor<float> zt, uint32_t rows) {
             if (D > tmpCap) {
-                for (uint32_t r = 0; r < rows; ++r) misc[kSumSlots + r] = SumSquares(zt + r * D, D);
+                for (uint32_t r = 0; r < rows; ++r) misc.SetValue(kSumSlots + r, SumSquares(zt[r * D], D));
                 return;
             }
             const uint32_t per = tmpCap / D;
             for (uint32_t r0 = 0; r0 < rows; r0 += per) {
                 const uint32_t k = std::min(per, rows - r0);
-                dsa::Mul(tmp, zt + r0 * D, zt + r0 * D, k * D);
+                dsa::Mul(tmp, zt[r0 * D], zt[r0 * D], k * D);
                 uint32_t len = D;
                 while (len % 8 == 0 && len >= 8) { dsa::BlockReduceSum(tmp, tmp, k * len); len /= 8; }
                 for (uint32_t r = 0; r < k; ++r) {
-                    float s = 0.0f;
-                    for (uint32_t i = 0; i < len; ++i) s += tmp[r * len + i];
-                    misc[kSumSlots + r0 + r] = s;
+                    misc.SetValue(kSumSlots + r0 + r, dsa::VectorReduceSum(tmp[r * len], len));
                 }
             }
         }
 
         float InvRms(float sumSq) const {
-            return static_cast<float>(1.0 / std::sqrt(static_cast<double>(sumSq) / D + static_cast<double>(eps)));
+            return dsa::VectorInvRms(sumSq, D, eps);
         }
 
         // Resident Z for a column-tiled segment (slots 0-1: fragments, 2: the current row)
         dsa::LocalTensor<float>* Claim(uint32_t n, uint32_t slot) {
             if (!plan.zResident || used + n > plan.zResident) return nullptr;
-            slots[slot] = res + static_cast<uint32_t>(used);
+            slots[slot] = res[static_cast<uint32_t>(used)];
             used += n;
             return &slots[slot];
         }
