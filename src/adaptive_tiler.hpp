@@ -1,106 +1,95 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
 #include <algorithm>
+#if __has_include(<unistd.h>)
+#include <unistd.h>
+#endif
 
 namespace hpc {
 
 enum class TilingMode {
-    ROW_PARALLEL, // M >= 32: Core assigned to row blocks (Zero cross-core communication)
-    SPLIT_D       // M < 32: Core assigned to (Row, ColumnSlice) with inter-thread reduction
+    ROW_PARALLEL, // Whole rows per thread (zero cross-thread communication)
+    SPLIT_D       // Rows cut into 64-byte lines: exact balance + one barrier for the row reduction
 };
 
 struct TilingConfig {
     TilingMode mode;
-    uint32_t activeThreads;
-    uint32_t rowsPerThread;
-    uint32_t slicesPerRow;
-    uint32_t sliceD;
-    uint32_t batchRows;
-    uint32_t tileD;
-    size_t localBufferBytes;
+    uint32_t threads;        // OpenMP team: 1 (inline, no fork/join) or the full pool P
+    uint32_t unitElems;      // Work quantum: one row (ROW_PARALLEL) or one 64-byte line (SPLIT_D)
+    uint32_t unitsPerRow;    // ceil(D / unitElems)
+    uint32_t batchRows;      // Rows whose reductions are in flight together (hides the sqrt latency)
+    uint32_t chunkRows;      // Serpentine granularity: rows per traversal chunk
+    uint32_t residentElems;  // Per-thread resident Z scratchpad (FP32 elements)
+    bool streamStores;       // Non-temporal Y stores: working set overflows the last-level cache
+    bool serpentine;         // Reverse the traversal on every other call
 };
 
 class AdaptiveTiler {
 public:
-    static constexpr uint32_t MAX_THREADS = 40;
-    static constexpr size_t SCRATCHPAD_LIMIT = 191 * 1024; // 191 KB safe line
-    static constexpr uint32_t ALIGN_BYTES = 32;            // 32-byte memory quantum
+    static constexpr uint32_t MAX_THREADS = 256;
+    static constexpr uint32_t MAX_BATCH = 64;
+    static constexpr size_t SCRATCHPAD_LIMIT = 191 * 1024; // 191 KB safe line (resident Z budget)
+    static constexpr uint32_t LINE_BYTES = 64;             // Split quantum: one cache line = 2 x 32-byte bursts
+    static constexpr uint32_t BATCH_ELEMS = 2048;          // Pass-1 work that covers one reduction latency
+    static constexpr double CHUNK_BYTES = 64 * 1024;       // Serpentine chunk (prefetch-friendly run)
 
-    static inline TilingConfig Plan(uint32_t M, uint32_t D, uint32_t elemBytes) {
+    // Cost model, measured on the reference 4-core Cascade Lake VM (docs/ARCHITECTURE_CHALLENGES.md).
+    // Cache-resident rows are compute-bound, so work is counted in elements, not bytes.
+    static constexpr double FORK_JOIN_NS = 3500.0;         // Wake + join of the OpenMP team
+    static constexpr double BARRIER_NS = 1000.0;           // One extra team barrier
+    static constexpr double CORE_NS_PER_ELEM = 0.3;        // One core, cache-resident, any dtype
+
+    static inline TilingConfig Plan(uint32_t M, uint32_t D, uint32_t elemBytes, uint32_t P, size_t llcBytes) {
         TilingConfig cfg;
-        
+        const double rowBytes = 3.0 * D * elemBytes;       // X1 + X2 in, Y out
+        const double totalBytes = rowBytes * M;
+
         // ---------------------------------------------------------------------
-        // Decision Criterion: Row-Parallel vs Split-D
+        // (1) Team size. t(1) = W*c, t(P) = tau + W*c/P  =>  fork iff W*c > tau*P/(P-1).
+        // Never an intermediate team: resizing the OpenMP pool costs far more than it saves.
         // ---------------------------------------------------------------------
-        if (M >= 32) {
-            // Mode 1: Row Parallel
-            cfg.mode = TilingMode::ROW_PARALLEL;
-            cfg.activeThreads = std::min(MAX_THREADS, M);
-            cfg.rowsPerThread = (M + cfg.activeThreads - 1) / cfg.activeThreads;
-            cfg.slicesPerRow = 1;
-            cfg.sliceD = D;
+        const bool fork = P > 1 && static_cast<double>(M) * D * CORE_NS_PER_ELEM > FORK_JOIN_NS * P / (P - 1);
+        cfg.threads = fork ? P : 1;
 
-            // Determine Batch Size & TileD constrained by SCRATCHPAD_LIMIT
-            // -----------------------------------------------------------------
-            // [ARCH CHALLENGE 2]: Knapsack Batch-Size Formulation (docs/ARCHITECTURE_CHALLENGES.md)
-            // State per element ~ 16 bytes (using 64-element streaming reduction).
-            // Maximize B such that (2*B*D*elemBytes_in + B*D*elemBytes_out + aux) <= 195584.
-            // -----------------------------------------------------------------
-            uint32_t maxElementsInLocal = static_cast<uint32_t>(SCRATCHPAD_LIMIT / (elemBytes * 8));
-            if (D <= maxElementsInLocal) {
-                // Entire row fits in scratchpad
-                cfg.tileD = D;
-                cfg.batchRows = std::max(1u, std::min(cfg.rowsPerThread, maxElementsInLocal / D));
-            } else {
-                // Large D: tile across columns
-                cfg.tileD = 2048;
-                cfg.batchRows = 1;
-            }
-            cfg.localBufferBytes = cfg.batchRows * cfg.tileD * elemBytes * 4;
-        } else {
-            // Mode 2: Split-D (Few rows, e.g., M=8, D=32768 or M=1, D=64)
-            cfg.mode = TilingMode::SPLIT_D;
-            
-            if (M == 1) {
-                // Single row launch bypass
-                cfg.activeThreads = 1;
-                cfg.slicesPerRow = 1;
-                cfg.sliceD = D;
-                cfg.rowsPerThread = 1;
-                cfg.batchRows = 1;
-                cfg.tileD = D;
-            } else {
-                // M > 1 and M < 32: divide columns among cores
-                // -------------------------------------------------------------
-                // [ARCH CHALLENGE 1]: Generalized 40-Thread Split-D (docs/ARCHITECTURE_CHALLENGES.md)
-                // Default: Pure mathematical power-of-two slice derivation (max 2^k <= MAX_THREADS / M)
-                // Open Extension: Partition into non-power-of-two (e.g. 5 slices per row for M=8)
-                // while maintaining strict 32-byte hardware boundary alignment.
-                // -------------------------------------------------------------
-                uint32_t maxSlices = MAX_THREADS / M;
-                uint32_t slices = 1;
-                while ((slices << 1) <= maxSlices) {
-                    slices <<= 1;
-                }
+        // ---------------------------------------------------------------------
+        // (2) Work quantum [ARCH CHALLENGE 1]. Whole rows leave the slowest thread
+        // (ceil(M/T) - M/T) rows of extra work; 64-byte lines balance every thread to within
+        // one line (any M, any T, no power-of-two restriction) at the price of one barrier.
+        // ---------------------------------------------------------------------
+        const uint32_t T = cfg.threads;
+        const double excessRows = static_cast<double>((M + T - 1) / T) - static_cast<double>(M) / T;
+        cfg.mode = excessRows * D * CORE_NS_PER_ELEM > BARRIER_NS ? TilingMode::SPLIT_D : TilingMode::ROW_PARALLEL;
+        cfg.unitElems = std::max(1u, cfg.mode == TilingMode::SPLIT_D ? LINE_BYTES / elemBytes : D);
+        cfg.unitsPerRow = (D + cfg.unitElems - 1) / cfg.unitElems;
 
-                cfg.slicesPerRow = slices;
-                cfg.activeThreads = M * slices;
-                cfg.sliceD = (D + slices - 1) / slices;
-                
-                // Align sliceD to 32-byte hardware boundary
-                uint32_t alignElem = ALIGN_BYTES / elemBytes;
-                cfg.sliceD = ((cfg.sliceD + alignElem - 1) / alignElem) * alignElem;
+        // (3) [ARCH CHALLENGE 2/3] Z stays resident in FP32 (4 B/elem) up to the scratchpad budget;
+        // longer row segments recompute Z from X1 + X2 + bias instead of spilling. Short rows run
+        // in batches of B* = BATCH_ELEMS / D so B reductions overlap instead of stalling pass 2.
+        cfg.residentElems = static_cast<uint32_t>(SCRATCHPAD_LIMIT / sizeof(float));
+        cfg.batchRows = std::max(1u, std::min(MAX_BATCH, BATCH_ELEMS / std::max(1u, D)));
 
-                cfg.rowsPerThread = 1;
-                cfg.batchRows = 1;
-                cfg.tileD = cfg.sliceD;
-            }
-            // In Split-D, the slice must stay resident in local buffer (Zero reload)
-            cfg.localBufferBytes = cfg.sliceD * elemBytes * 4;
-        }
+        // (4) Stream Y past the caches once X1 + X2 + Y no longer fit in the LLC.
+        cfg.streamStores = totalBytes > static_cast<double>(llcBytes);
 
+        // (5) [ARCH CHALLENGE 4] Serpentine: the chunks touched last are still cache-resident,
+        // so the next call consumes them first.
+        cfg.serpentine = true;
+        cfg.chunkRows = std::max(1u, static_cast<uint32_t>(CHUNK_BYTES / std::max(1.0, rowBytes)));
         return cfg;
+    }
+
+    static inline size_t LastLevelCacheBytes() {
+        static const size_t bytes = [] {
+            long v = -1;
+#if defined(_SC_LEVEL3_CACHE_SIZE)
+            v = sysconf(_SC_LEVEL3_CACHE_SIZE);
+            if (v <= 0) v = sysconf(_SC_LEVEL2_CACHE_SIZE);
+#endif
+            return v > 0 ? static_cast<size_t>(v) : static_cast<size_t>(32) << 20;
+        }();
+        return bytes;
     }
 };
 

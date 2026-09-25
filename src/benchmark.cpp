@@ -1,134 +1,192 @@
 #include "hpc_vector_norm.hpp"
-#include "kernel_unified.hpp"
-#include <iostream>
-#include <vector>
+#include "adaptive_tiler.hpp"
+#include <omp.h>
+#include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
+#include <cstdlib>
 #include <iomanip>
-#include <random>
+#include <iostream>
+#include <memory>
+#include <string>
+#include <vector>
+
+using hpc::DataType;
 
 struct TestCase {
     std::string name;
     uint32_t M;
     uint32_t D;
-    std::string dtype;
+    DataType dtype;
     double targetUs;
+    uint32_t targetM; // Rows the target refers to (P14/P15 run scaled down; target scaled to match)
 };
 
-// Ground truth reference calculation (double precision)
-void ReferenceAddRmsNorm(
-    const float* x1,
-    const float* x2,
-    const float* gamma,
-    const float* bias,
-    float* y,
-    uint32_t M,
-    uint32_t D,
-    float eps
-) {
-    for (uint32_t i = 0; i < M; ++i) {
-        double sumSq = 0.0;
-        std::vector<double> z(D);
-        for (uint32_t j = 0; j < D; ++j) {
-            double b = bias ? bias[j] : 0.0;
-            z[j] = static_cast<double>(x1[i * D + j]) + static_cast<double>(x2[i * D + j]) + b;
-            sumSq += z[j] * z[j];
-        }
-        double meanSq = sumSq / static_cast<double>(D);
-        double invRms = 1.0 / std::sqrt(meanSq + static_cast<double>(eps));
-        for (uint32_t j = 0; j < D; ++j) {
-            double g = gamma ? gamma[j] : 1.0;
-            y[i * D + j] = static_cast<float>(z[j] * invRms * g);
-        }
-    }
+namespace {
+
+struct AlignedFree { void operator()(void* p) const { std::free(p); } };
+using Buffer = std::unique_ptr<void, AlignedFree>;
+
+Buffer Allocate(size_t bytes) { // 64-byte aligned: every row start is burst/cache-line aligned when D allows
+    return Buffer(std::aligned_alloc(64, (bytes + 63) / 64 * 64));
 }
 
-int main() {
-    std::cout << "========================================================================================\n";
+size_t ElemBytes(DataType t) { return t == DataType::FP32 ? 4 : 2; }
+const char* TypeName(DataType t) { return t == DataType::FP32 ? "FP32" : t == DataType::FP16 ? "FP16" : "BF16"; }
+
+void Put(DataType t, void* base, size_t i, float v) {
+    if (t == DataType::FP32) static_cast<float*>(base)[i] = v;
+    else static_cast<uint16_t*>(base)[i] = t == DataType::FP16 ? hpc::FloatToHalf(v) : hpc::FloatToBF16(v);
+}
+
+double Get(DataType t, const void* base, size_t i) {
+    if (t == DataType::FP32) return static_cast<const float*>(base)[i];
+    const uint16_t v = static_cast<const uint16_t*>(base)[i];
+    return t == DataType::FP16 ? hpc::HalfToFloat(v) : hpc::BF16ToFloat(v);
+}
+
+// Counter-based uniform [-1, 1): reproducible and parallel-friendly
+float Uniform(uint64_t i, uint64_t stream) {
+    uint64_t z = (i + 1) * 0x9E3779B97F4A7C15ull ^ stream * 0xD1B54A32D192ED03ull;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    z ^= z >> 31;
+    return static_cast<float>(z >> 40) * (2.0f / 16777216.0f) - 1.0f;
+}
+
+const char* SimdName() {
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__)
+    return "AVX-512";
+#elif defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+    return "AVX2";
+#else
+    return "scalar";
+#endif
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
+    const bool legacyFp32 = argc > 1 && std::string(argv[1]) == "--fp32";
+    const uint32_t P = std::min<uint32_t>(hpc::AdaptiveTiler::MAX_THREADS, omp_get_max_threads());
+    const size_t llc = hpc::AdaptiveTiler::LastLevelCacheBytes();
+
+    std::cout << "========================================================================================================\n";
     std::cout << "  HPC Fused Residual Vector Normalization Benchmark (15 Test Profiles)\n";
     std::cout << "  Multi-Core SIMD & Cache-Conscious Adaptive Architecture\n";
-    std::cout << "========================================================================================\n\n";
+    std::cout << "  Threads: " << P << " | LLC: " << (llc >> 20) << " MB | SIMD: " << SimdName()
+              << (legacyFp32 ? " | --fp32: every profile runs in FP32" : "") << "\n";
+    std::cout << "========================================================================================================\n\n";
 
     std::vector<TestCase> testCases = {
-        {"P01_1x64",          1,      64,    "FP16",    1.47},
-        {"P02_7x200",         7,     200,    "FP32",    2.06},
-        {"P03_128x256",     128,     256,    "FP32",    2.54},
-        {"P04_768x192",     768,     192,    "FP16",    3.23},
-        {"P05_8x32768",       8,   32768,    "FP16",    5.39},
-        {"P06_1536x576",   1536,     576,    "FP16",    8.58},
-        {"P07_10240x400", 10240,     400,    "FP16",   16.10},
-        {"P08_10240x512", 10240,     512,    "FP16",   17.57},
-        {"P09_4096x1536",  4096,    1536,    "FP32",   41.70},
-        {"P10_8192x1024",  8192,    1024,    "FP16",   47.34},
-        {"P11_4096x3072",  4096,    3072,    "FP32",  132.31},
-        {"P12_4096x4096",  4096,    4096,    "BF16",   48.62},
-        {"P13_10240x3072",10240,    3072,    "FP16",  223.00},
-        {"P14_2Mx128",    50000,     128,    "FP16", 1322.97}, // Scaled for quick bench
-        {"P15_115Kx8192",  5000,    8192,    "FP16", 6081.74}  // Scaled for quick bench
+        {"P01_1x64",          1,      64, DataType::FP16,    1.47,       1},
+        {"P02_7x200",         7,     200, DataType::FP32,    2.06,       7},
+        {"P03_128x256",     128,     256, DataType::FP32,    2.54,     128},
+        {"P04_768x192",     768,     192, DataType::FP16,    3.23,     768},
+        {"P05_8x32768",       8,   32768, DataType::FP16,    5.39,       8},
+        {"P06_1536x576",   1536,     576, DataType::FP16,    8.58,    1536},
+        {"P07_10240x400", 10240,     400, DataType::FP16,   16.10,   10240},
+        {"P08_10240x512", 10240,     512, DataType::FP16,   17.57,   10240},
+        {"P09_4096x1536",  4096,    1536, DataType::FP32,   41.70,    4096},
+        {"P10_8192x1024",  8192,    1024, DataType::FP16,   47.34,    8192},
+        {"P11_4096x3072",  4096,    3072, DataType::FP32,  132.31,    4096},
+        {"P12_4096x4096",  4096,    4096, DataType::BF16,   48.62,    4096},
+        {"P13_10240x3072",10240,    3072, DataType::FP16,  223.00,   10240},
+        {"P14_2Mx128",    50000,     128, DataType::FP16, 1322.97, 2097152}, // Scaled for quick bench
+        {"P15_115Kx8192",  5000,    8192, DataType::FP16, 6081.74,  115000}  // Scaled for quick bench
     };
 
-    std::mt19937 gen(42);
-    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-
     std::cout << std::left << std::setw(18) << "Case Name"
-              << std::setw(16) << "Dimensions"
-              << std::setw(8)  << "Type"
+              << std::setw(14) << "Dimensions"
+              << std::setw(7)  << "Type"
               << std::setw(14) << "Latency (us)"
-              << std::setw(14) << "Target (us)"
-              << std::setw(12) << "Accuracy"
-              << std::setw(10) << "Status" << "\n";
-    std::cout << std::string(90, '-') << "\n";
+              << std::setw(13) << "Target (us)"
+              << std::setw(9)  << "GB/s"
+              << std::setw(11) << "Max Err"
+              << std::setw(11) << "Accuracy"
+              << std::setw(14) << "Plan"
+              << "Status\n";
+    std::cout << std::string(104, '-') << "\n";
 
+    using Clock = std::chrono::steady_clock;
     for (const auto& tc : testCases) {
-        size_t totalElements = static_cast<size_t>(tc.M) * tc.D;
-        std::vector<float> x1(totalElements);
-        std::vector<float> x2(totalElements);
-        std::vector<float> gamma(tc.D, 1.0f);
-        std::vector<float> bias(tc.D, 0.05f);
-        std::vector<float> y(totalElements, 0.0f);
-        std::vector<float> yRef(totalElements, 0.0f);
+        const DataType dt = legacyFp32 ? DataType::FP32 : tc.dtype;
+        const size_t eb = ElemBytes(dt), N = static_cast<size_t>(tc.M) * tc.D;
+        Buffer x1 = Allocate(N * eb), x2 = Allocate(N * eb), y = Allocate(N * eb);
+        Buffer gamma = Allocate(tc.D * eb), bias = Allocate(tc.D * eb);
 
-        for (size_t i = 0; i < totalElements; ++i) {
-            x1[i] = dist(gen);
-            x2[i] = dist(gen);
+        // First touch from the worker threads (page placement follows the static partition)
+        #pragma omp parallel for schedule(static)
+        for (int64_t i = 0; i < static_cast<int64_t>(N); ++i) {
+            Put(dt, x1.get(), i, Uniform(i, 1));
+            Put(dt, x2.get(), i, Uniform(i, 2));
+            Put(dt, y.get(), i, 0.0f);
+        }
+        for (uint32_t j = 0; j < tc.D; ++j) {
+            Put(dt, gamma.get(), j, 1.0f + 0.5f * Uniform(j, 3));
+            Put(dt, bias.get(), j, 0.05f + 0.05f * Uniform(j, 4));
+        }
+        auto run = [&] {
+            hpc::FusedResidualNormalize(x1.get(), x2.get(), gamma.get(), bias.get(), y.get(), tc.M, tc.D, dt, 1e-6f);
+        };
+
+        // 1. Correctness check against an FP64 reference computed from the quantized inputs
+        run();
+        const double relTol = dt == DataType::FP32 ? 1e-5 : dt == DataType::FP16 ? 1.0 / 1024 : 1.0 / 128;
+        double maxErr = 0.0;
+        int64_t bad = 0;
+        #pragma omp parallel for schedule(static) reduction(max : maxErr) reduction(+ : bad)
+        for (int64_t i = 0; i < static_cast<int64_t>(tc.M); ++i) {
+            const size_t row = static_cast<size_t>(i) * tc.D;
+            auto z = [&](uint32_t j) { return Get(dt, x1.get(), row + j) + Get(dt, x2.get(), row + j) + Get(dt, bias.get(), j); };
+            double sumSq = 0.0;
+            for (uint32_t j = 0; j < tc.D; ++j) sumSq += z(j) * z(j);
+            const double invRms = 1.0 / std::sqrt(sumSq / tc.D + 1e-6);
+            for (uint32_t j = 0; j < tc.D; ++j) {
+                const double ref = z(j) * invRms * Get(dt, gamma.get(), j);
+                const double err = std::fabs(Get(dt, y.get(), row + j) - ref);
+                maxErr = std::max(maxErr, err);
+                bad += err > 1e-5 + relTol * std::fabs(ref);
+            }
         }
 
-        // 1. Correctness check
-        ReferenceAddRmsNorm(x1.data(), x2.data(), gamma.data(), bias.data(), yRef.data(), tc.M, tc.D, 1e-6f);
-        hpc::KernelUnifiedPipeline<float>::Execute(x1.data(), x2.data(), gamma.data(), bias.data(), y.data(), tc.M, tc.D, 1e-6f);
+        // 2. Latency: median over 11 batches of ~10 ms each, after warm-up
+        auto timeCalls = [&](uint64_t n) {
+            const auto t0 = Clock::now();
+            for (uint64_t i = 0; i < n; ++i) run();
+            return std::chrono::duration<double, std::micro>(Clock::now() - t0).count();
+        };
+        timeCalls(3);
+        const double estimateUs = std::max(timeCalls(5) / 5.0, 0.01);
+        const uint64_t perBatch = std::clamp<uint64_t>(static_cast<uint64_t>(10000.0 / estimateUs), 1, 2000000);
+        timeCalls(perBatch);
+        std::vector<double> samples(11);
+        for (auto& s : samples) s = timeCalls(perBatch) / perBatch;
+        std::sort(samples.begin(), samples.end());
+        const double latencyUs = samples[samples.size() / 2];
 
-        double maxDiff = 0.0;
-        for (size_t i = 0; i < totalElements; ++i) {
-            double diff = std::abs(y[i] - yRef[i]);
-            if (diff > maxDiff) maxDiff = diff;
-        }
-        bool pass = (maxDiff < 1e-4);
-
-        // 2. Latency measurement (warmup + timed iterations)
-        for (int w = 0; w < 5; ++w) {
-            hpc::KernelUnifiedPipeline<float>::Execute(x1.data(), x2.data(), gamma.data(), bias.data(), y.data(), tc.M, tc.D, 1e-6f);
-        }
-
-        int iters = (tc.M * tc.D > 10000000) ? 10 : 50;
-        auto start = std::chrono::high_resolution_clock::now();
-        for (int it = 0; it < iters; ++it) {
-            hpc::KernelUnifiedPipeline<float>::Execute(x1.data(), x2.data(), gamma.data(), bias.data(), y.data(), tc.M, tc.D, 1e-6f);
-        }
-        auto end = std::chrono::high_resolution_clock::now();
-        double elapsedUs = std::chrono::duration<double, std::micro>(end - start).count() / iters;
+        const double targetUs = tc.targetUs * tc.M / tc.targetM;
+        const double gbps = (3.0 * N + 2.0 * tc.D) * eb / (latencyUs * 1e3);
+        const hpc::TilingConfig plan = hpc::AdaptiveTiler::Plan(tc.M, tc.D, static_cast<uint32_t>(eb), P, llc);
+        const std::string planStr = std::to_string(plan.threads) + "T " +
+            (plan.mode == hpc::TilingMode::SPLIT_D ? "split" : "rows") + (plan.streamStores ? " NT" : "");
 
         std::string dimStr = std::to_string(tc.M) + "x" + std::to_string(tc.D);
         std::cout << std::left << std::setw(18) << tc.name
-                  << std::setw(16) << dimStr
-                  << std::setw(8)  << tc.dtype
-                  << std::setw(14) << std::fixed << std::setprecision(2) << elapsedUs
-                  << std::setw(14) << tc.targetUs
-                  << std::setw(12) << (pass ? "100% PASS" : "FAIL")
-                  << std::setw(10) << (elapsedUs <= tc.targetUs ? "TOP 1 🏆" : "OPTIMIZING")
+                  << std::setw(14) << dimStr
+                  << std::setw(7)  << TypeName(dt)
+                  << std::setw(14) << std::fixed << std::setprecision(2) << latencyUs
+                  << std::setw(13) << targetUs
+                  << std::setw(9)  << std::setprecision(1) << gbps
+                  << std::setw(11) << std::scientific << std::setprecision(2) << maxErr << std::fixed
+                  << std::setw(11) << (bad == 0 ? "100% PASS" : "FAIL")
+                  << std::setw(14) << planStr
+                  << (latencyUs <= targetUs ? "TOP 1 🏆" : "OPTIMIZING")
                   << "\n";
     }
 
-    std::cout << std::string(90, '=') << "\n";
+    std::cout << std::string(104, '=') << "\n";
     std::cout << "All benchmark tests completed successfully.\n";
     return 0;
 }
