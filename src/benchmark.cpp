@@ -197,14 +197,20 @@ int main(int argc, char** argv) {
         const hpc::TilingConfig tp = hpc::AdaptiveTiler::Plan(tc.M, tc.D, static_cast<uint32_t>(eb), hpc::HardwareModel::Target());
         const uint64_t busiest = hpc::AdaptiveTiler::MaxLoad(N, tp.unitElems, tp.blocks);
         const uint64_t lightest = tp.units / tp.blocks * tp.unitElems;
+        const bool rows = tp.mode == hpc::TilingMode::ROW_PARALLEL;
+        std::string tile = tp.tileRows ? std::to_string(tp.tileRows) + (tp.tileRows == 1 ? " row" : " rows") : std::to_string(tp.tileElems) + " el";
+        if (tp.mode == hpc::TilingMode::SPLIT_COLUMNS) tile += " x " + std::to_string(tp.pitch);
+        else if (!tp.tileRows && tp.zResident) tile += " +Z";
         std::ostringstream row;
-        row << std::left << std::setw(18) << tc.name << std::setw(7) << (tp.mode == hpc::TilingMode::SPLIT_D ? "split" : "rows")
-            << std::setw(7) << tp.blocks
-            << std::setw(10) << (tp.mode == hpc::TilingMode::SPLIT_D ? std::to_string(tp.unitElems * eb) + " B" : std::to_string(tp.unitElems / tc.D) + " row")
-            << std::setw(24) << (std::to_string(busiest) + " (min " + std::to_string(std::min(busiest, lightest)) + ")")
-            << std::setw(14) << (tp.tileRows ? std::to_string(tp.tileRows) + (tp.tileRows == 1 ? " row" : " rows")
-                                             : std::to_string(tp.tileElems) + " el" + (tp.zResident ? " +Z" : ""))
-            << std::setw(10) << std::fixed << std::setprecision(1) << tp.layout.Total() / 1024.0;
+        row << std::left << std::setw(18) << tc.name
+            << std::setw(7) << (rows ? "rows" : tp.mode == hpc::TilingMode::SPLIT_D ? "split" : "band")
+            << std::setw(6) << tp.blocks
+            << std::setw(8) << (rows ? std::to_string(tp.unitElems / tc.D) + " row" : std::to_string(tp.unitElems * eb) + " B")
+            << std::setw(22) << (std::to_string(busiest) + " (min " + std::to_string(std::min(busiest, lightest)) + ")")
+            << std::setw(16) << tile
+            << std::setw(8) << std::fixed << std::setprecision(1) << tp.layout.Total() / 1024.0
+            << std::setw(10) << tp.modelCycles
+            << std::setw(10) << std::setprecision(2) << tp.modelNs / 1e3;
         if (simulateTarget) {
             Buffer yt = Allocate(N * eb);
             hpc::DaeStats st;
@@ -218,23 +224,28 @@ int main(int argc, char** argv) {
                     const double a = Get(dt, y.get(), i), t = Get(dt, yt.get(), i);
                     if (std::fabs(a - t) > 1e-5 + 2.0 * relTol * std::fabs(a)) verdict = "MISMATCH";
                 }
+                if (verdict == "PASS" && st.spmBytes != tp.layout.Total()) verdict = "SPM != plan";
             } catch (const std::exception& e) {
                 verdict = std::string("TRAP: ") + e.what();
             }
-            row << std::setw(10) << std::setprecision(1) << st.dmaBytes / 1e6 << std::setw(7) << st.padTransfers << verdict;
+            row << std::setw(10) << st.vectorCycles << std::setw(8) << st.scalarStalls << std::setw(9) << std::setprecision(1)
+                << st.dmaBytes / 1e6 << std::setw(6) << st.padTransfers << verdict;
         }
         targetRows.push_back(row.str());
     }
 
     std::cout << std::string(104, '=') << "\n";
-    std::cout << "\nTarget deployment plan (HardwareModel::Target(): 40 cores, 32-byte DMA blocks, 191 KB scratchpad/core)"
+    const size_t width = simulateTarget ? 158 : 125;
+    std::cout << "\nTarget deployment plan (HardwareModel::Target(): 40 cores, 32-byte DMA blocks, 191 KB scratchpad/core;"
+              << " model at " << hpc::HardwareModel::Target().clockGHz << " GHz, busiest core)"
               << (simulateTarget ? ", executed on the DAE simulation" : "") << "\n";
-    std::cout << std::left << std::setw(18) << "Case Name" << std::setw(7) << "Mode" << std::setw(7) << "Cores"
-              << std::setw(10) << "Unit" << std::setw(24) << "Busiest core (elems)" << std::setw(14) << "Tile"
-              << std::setw(10) << "SPM (KB)" << (simulateTarget ? "DMA (MB)  Pads   Sanitizer / result" : "") << "\n";
-    std::cout << std::string(104, '-') << "\n";
+    std::cout << std::left << std::setw(18) << "Case Name" << std::setw(7) << "Mode" << std::setw(6) << "Cores"
+              << std::setw(8) << "Unit" << std::setw(22) << "Busiest core (elems)" << std::setw(16) << "Tile"
+              << std::setw(8) << "SPM KB" << std::setw(10) << "Model cyc" << std::setw(10) << "Model us"
+              << (simulateTarget ? "Cycles    Stalls  DMA MB   Pads  Sanitizer / result" : "") << "\n";
+    std::cout << std::string(width, '-') << "\n";
     for (const auto& r : targetRows) std::cout << r << "\n";
-    std::cout << std::string(104, '=') << "\n";
+    std::cout << std::string(width, '=') << "\n";
     std::cout << "All benchmark tests completed successfully.\n";
     return 0;
 }
