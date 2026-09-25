@@ -77,9 +77,9 @@ make -j
 
 ---
 
-## 🧩 Architectural Focus: The 4 Open Tasks
+## 🧩 Architectural Focus: The 5 Open Tasks
 
-We invite contributors and AI autonomous agents to solve the 4 open optimization bottlenecks:
+We invite contributors and AI autonomous agents to solve the 5 open optimization bottlenecks (detailed in [`docs/ARCHITECTURE_CHALLENGES.md`](docs/ARCHITECTURE_CHALLENGES.md)):
 
 1. **Task 1: Split-D Reduction for Profile 5 ($8 \times 32768$)**
    - $M=8$ rows is too small for 40 threads (leaves 32 threads idle if row-parallel).

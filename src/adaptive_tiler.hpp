@@ -42,7 +42,11 @@ public:
             cfg.sliceD = D;
 
             // Determine Batch Size & TileD constrained by SCRATCHPAD_LIMIT
-            // State per element ~ 16 bytes (using 64-element streaming reduction)
+            // -----------------------------------------------------------------
+            // [ARCH CHALLENGE 2]: Knapsack Batch-Size Formulation (docs/ARCHITECTURE_CHALLENGES.md)
+            // State per element ~ 16 bytes (using 64-element streaming reduction).
+            // Maximize B such that (2*B*D*elemBytes_in + B*D*elemBytes_out + aux) <= 195584.
+            // -----------------------------------------------------------------
             uint32_t maxElementsInLocal = static_cast<uint32_t>(SCRATCHPAD_LIMIT / (elemBytes * 8));
             if (D <= maxElementsInLocal) {
                 // Entire row fits in scratchpad
@@ -68,8 +72,12 @@ public:
                 cfg.tileD = D;
             } else {
                 // M > 1 and M < 32: divide columns among cores
-                // Pure mathematical power-of-two slice derivation:
-                // Find maximum 2^k <= (MAX_THREADS / M) such that columns divide cleanly
+                // -------------------------------------------------------------
+                // [ARCH CHALLENGE 1]: Generalized 40-Thread Split-D (docs/ARCHITECTURE_CHALLENGES.md)
+                // Default: Pure mathematical power-of-two slice derivation (max 2^k <= MAX_THREADS / M)
+                // Open Extension: Partition into non-power-of-two (e.g. 5 slices per row for M=8)
+                // while maintaining strict 32-byte hardware boundary alignment.
+                // -------------------------------------------------------------
                 uint32_t maxSlices = MAX_THREADS / M;
                 uint32_t slices = 1;
                 while ((slices << 1) <= maxSlices) {

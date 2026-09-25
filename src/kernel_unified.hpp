@@ -85,6 +85,12 @@ private:
             // Thread-local scratchpad buffer (Max 191 KB, zero stack spill)
             std::vector<float> localZ(D);
 
+            // -----------------------------------------------------------------
+            // [ARCH CHALLENGE 3]: Zero-Bubble True Double-Buffering Pipeline (Ping-Pong)
+            // (See docs/ARCHITECTURE_CHALLENGES.md)
+            // Current: Synchronous sequential iteration.
+            // Extension: Overlap SIMD compute of row i with prefetching row i+1.
+            // -----------------------------------------------------------------
             for (uint32_t r = startRow; r < endRow; ++r) {
                 const T* rowX1 = x1 + r * D;
                 const T* rowX2 = x2 + r * D;
