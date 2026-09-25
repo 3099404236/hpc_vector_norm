@@ -47,5 +47,13 @@ add_executable(hpc_vector_norm_test
 target_include_directories(hpc_vector_norm_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(hpc_vector_norm_test PRIVATE hpc_vector_norm)
 
+add_executable(test_dsa_runtime
+    tests/test_dsa_runtime.cpp
+)
+target_include_directories(test_dsa_runtime PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(test_dsa_runtime PRIVATE OpenMP::OpenMP_CXX)
+
 enable_testing()
 add_test(NAME correctness COMMAND hpc_vector_norm_test)
+add_test(NAME dsa_runtime_sanitizer COMMAND test_dsa_runtime)
+
