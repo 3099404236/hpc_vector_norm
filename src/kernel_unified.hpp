@@ -329,7 +329,7 @@ public:
         if (M == 0 || D == 0) return stats;
         if (plan.tileElems == 0) throw std::invalid_argument("DaePipeline needs a plan with DAE tiles (HardwareModel::Target())");
         const uint32_t blocks = std::max(1u, std::min(plan.blocks, AdaptiveTiler::MAX_THREADS));
-        // Split-D partial records in global memory: one 32-byte block per core
+        // Split-D partial records in system memory: one 32-byte block per core
         float* workspace = static_cast<float*>(std::aligned_alloc(64, (blocks * 32u + 63) / 64 * 64));
         std::vector<dsa::HardwareCycleTracker> trackers(blocks);
         std::vector<size_t> spm(blocks, 0);
@@ -603,7 +603,7 @@ private:
             }
         }
 
-        // zt (+|*)= parameter chunk streamed from global memory
+        // zt (+|*)= parameter chunk streamed from system memory
         void ApplyParam(dsa::LocalTensor<float> zt, const S* src, uint32_t n, bool multiply) {
             dsa::LocalTensor<S> pc = qP.template AllocTensor<S>();
             DmaIn(pc, src, n);

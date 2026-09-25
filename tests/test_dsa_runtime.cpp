@@ -19,7 +19,6 @@ struct AlignedAllocator {
     template <typename U> bool operator!=(const AlignedAllocator<U>&) const { return false; }
 };
 template <typename T> using AlignedVector = std::vector<T, AlignedAllocator<T>>;
-template <typename T> using GmVector = AlignedVector<T>; // Backward-compatibility alias
 
 template <typename F>
 bool ExpectTrap(const char* what, F body) {

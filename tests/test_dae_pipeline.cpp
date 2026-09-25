@@ -44,11 +44,11 @@ template <class C> double RelTol() {
     else return 1.0 / 128;
 }
 
-// Global memory on the 32-byte DMA grid, optionally shifted by `offset` elements
-template <class S> struct Gm {
+// System memory on the 32-byte DMA grid, optionally shifted by `offset` elements
+template <class S> struct HostBuffer {
     std::vector<S> mem;
     S* p;
-    Gm(size_t n, uint32_t offset) : mem(n + offset + 64) {
+    HostBuffer(size_t n, uint32_t offset) : mem(n + offset + 64) {
         p = reinterpret_cast<S*>((reinterpret_cast<uintptr_t>(mem.data()) + 63) & ~uintptr_t(63)) + offset;
     }
 };
@@ -99,7 +99,7 @@ void RunShape(uint32_t M, uint32_t D, int variant, bool hasGamma, bool hasBias, 
     using S = typename C::S;
     const size_t N = size_t(M) * D;
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-    Gm<S> x1(N, offset), x2(N, offset), g(D, offset), b(D, offset), y(N, offset);
+    HostBuffer<S> x1(N, offset), x2(N, offset), g(D, offset), b(D, offset), y(N, offset);
     for (size_t i = 0; i < N; ++i) { x1.p[i] = Enc<C>(dist(rng)); x2.p[i] = Enc<C>(dist(rng)); }
     for (uint32_t j = 0; j < D; ++j) { g.p[j] = Enc<C>(1.0f + 0.5f * dist(rng)); b.p[j] = Enc<C>(0.1f * dist(rng)); }
     std::memset(y.mem.data(), 0x5A, y.mem.size() * sizeof(S));

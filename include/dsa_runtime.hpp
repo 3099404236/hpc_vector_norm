@@ -145,10 +145,6 @@ inline uint32_t GetThreadNum() {
     return static_cast<uint32_t>(omp_get_num_threads());
 }
 
-// Aliases for compatibility
-inline uint32_t GetBlockIdx() { return GetCoreIdx(); }
-inline uint32_t GetBlockNum() { return GetCoreNum(); }
-
 // -----------------------------------------------------------------------------
 // LocalTensor<T> Implementation for On-Chip Scratchpad
 // -----------------------------------------------------------------------------
@@ -373,8 +369,8 @@ public:
 // Streaming DataCopy Primitives with Integrated 32-Byte DMA Alignment Guard
 // -----------------------------------------------------------------------------
 // Both endpoints of a block DMA must sit on a 32-byte block boundary
-inline void CheckDmaAddress(const void* gm, const void* local) {
-    if (reinterpret_cast<uintptr_t>(gm) % DMA_ALIGN_BYTES != 0 ||
+inline void CheckDmaAddress(const void* systemMem, const void* local) {
+    if (reinterpret_cast<uintptr_t>(systemMem) % DMA_ALIGN_BYTES != 0 ||
         reinterpret_cast<uintptr_t>(local) % DMA_ALIGN_BYTES != 0) {
         throw std::runtime_error("[Hardware Fault - DMA UNALIGNED]: Transfer address is not 32-byte aligned!");
     }
@@ -418,7 +414,7 @@ inline void DataCopy(T* dst, LocalTensor<T> src, uint32_t count) {
 
 // -----------------------------------------------------------------------------
 // Padded DMA for transfers that are not whole 32-byte blocks (row tails, tensor ends).
-// Global memory may be at any address and length; the scratchpad side stays block
+// System memory may be at any address and length; the scratchpad side stays block
 // aligned. Loads zero-fill the rest of the last block; stores write only `count`
 // elements. The engine still moves whole blocks, so the traffic is rounded up.
 // -----------------------------------------------------------------------------

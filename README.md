@@ -41,9 +41,9 @@ To bridge the gap between high-level C++ and the target decoupled access-execute
 
 - **DAE Pipeline Semantics**: Direct mapping for `TPipe`, `TQue<QuePosition, depth>`, `LocalTensor<T>`, `DataCopy`, `Add`, `Mul`, `BlockReduceSum`, and `SyncAll<true>()`.
 - **Integrated Hardware Sanitizer Traps**:
-  - `pass_spm_budget`: Instantly aborts if total allocated scratchpad exceeds **191 KB (195,584 bytes)**.
-  - `pass_dma_align`: Instantly aborts if DMA transfers are not aligned to **32 bytes**.
-  - `pass_async_hazard`: Validates queue depth and double-buffering lifecycle.
+  - **Scratchpad Budget Guard**: Instantly aborts if total allocated scratchpad exceeds **191 KB (195,584 bytes)**.
+  - **DMA Alignment Guard**: Instantly aborts if DMA transfers are not aligned to **32 bytes**.
+  - **Queue Hazard Guard**: Validates queue depth and double-buffering lifecycle.
 - **Hardware Virtual Cycle Tracker**:
   - Automatically profiles instruction costs: `Add`(2 cycles/repeat), `Mul`(2 cycles/repeat), `BlockReduceSum`(1 cycle/repeat), `WholeReduceSum`(14 cycles/repeat).
   - Run verification via `ctest -R dsa_runtime_sanitizer` or `./build/test_dsa_runtime`.
@@ -154,7 +154,7 @@ The layout (`DaeLayout`) lists exactly the buffers the kernel claims through `TP
 planner's arithmetic:
 
 - **Row tiles.** X1 and X2 are double-buffered in the native dtype (`4s` B per element), and Y is written back through the X1 slot. For 16-bit dtypes one FP32 Z tile adds 4 B per element; FP32 computes in place. So a row tile costs `b = 12` B per element for FP16/BF16 and 16 B for FP32. Resident FP32 γ/β take `8D` B, and scratch and records take 10 KB. That gives `B*(D) = ⌊(195,584 − 10,240 − 8D) / (b·D)⌋` rows before each buffer is rounded up to 32 bytes: 29 rows at `D = 512`.
-- **Column tiles** (Split-D fragments, and rows too long for a row tile). X1, X2 and a γ/β chunk are double-buffered, plus FP32 Z: `6s + 4` B per element. The segment's FP32 Z stays resident when it fits, so the normalize sweep reads nothing from global memory a second time.
+- **Column tiles** (Split-D fragments, and rows too long for a row tile). X1, X2 and a γ/β chunk are double-buffered, plus FP32 Z: `6s + 4` B per element. The segment's FP32 Z stays resident when it fits, so the normalize sweep reads nothing from main memory a second time.
 
 The full-size target plans are below. `./hpc_vector_norm_bench` prints them. `tests/test_dae_pipeline.cpp` checks that every plan:
 
@@ -188,7 +188,7 @@ simulated core (`GetCoreIdx`), and everything goes through `include/dsa_runtime.
 
 - **Double buffering.** X1 and X2 use `TQue<VECIN, 2>`: tile k+1's `DataCopy` is issued before tile k is dequeued. Column tiles stream γ/β chunks through a third queue.
 - **Row tiles.** `Z = X1 + X2 + bias` in FP32, with `Cast` for 16-bit dtypes. Σz² per row uses `Mul` plus `BlockReduceSum` folds, which cost 1 cycle per repeat against 14 for `WholeReduceSum`, while the row length stays a multiple of 8. Then `Muls` by 1/σ, `Mul` by γ, `Cast` back into the X1 slot, and `DataCopy` out.
-- **Split-D.** Sweep 1 runs over the core's (at most two) row fragments with Z resident. Each core then writes one 32-byte record `{Σ₀, Σ₁, row₀, row₁}` to global memory. Every core reaches the single `SyncAll`, including a core whose sanitizer trapped, so the barrier never deadlocks. Each owner of a row then gathers that row's records in owner order and normalizes its resident Z. Because every owner sums in the same order, all owners compute an identical σ.
+- **Split-D.** Sweep 1 runs over the core's (at most two) row fragments with Z resident. Each core then writes one 32-byte record `{Σ₀, Σ₁, row₀, row₁}` to shared system memory. Every core reaches the single `SyncAll`, including a core whose sanitizer trapped, so the barrier never deadlocks. Each owner of a row then gathers that row's records in owner order and normalizes its resident Z. Because every owner sums in the same order, all owners compute an identical σ.
 - **DMA.** Every transfer is a 32-byte `DataCopy`. `DataCopyPad` is used only where a transfer does not end on a 32-byte block (`D·s % 32 ≠ 0`) or starts off the 32-byte grid.
 - **Results with `--target`.** On all 15 profiles the output matches the host kernel, with 0 padded transfers and at most 191 KB of scratchpad per core. DMA moves only compulsory traffic: X1, X2 and Y, plus γ/β once per core segment. For P13 that is 189.2 MB against 188.7 MB of tensors.
 
@@ -215,11 +215,11 @@ least 4 rows. Each thread memoizes the plan for the last shape, so repeated call
 exposed two defects:
 
 1. **`TQue` double buffering was silently single-buffered.** `AllocTensor` picked slot `(tail + allocatedCount) % depth` and ignored tensors already enqueued. After an `EnQue`, the next `AllocTensor` therefore returned the same buffer, and the prefetch of tile k+1 overwrote tile k before it was dequeued. The queue is now a per-slot state machine (FREE → ALLOCATED → ENQUEUED → DEQUEUED) with FIFO order. It traps allocation beyond the queue depth, freeing a free or in-flight buffer, and tensors that belong to another queue.
-2. **`DataCopy` did not check addresses.** It checked only the transfer size, so a whole-block transfer from a misaligned address passed. Misaligned global or local addresses now trap.
+2. **`DataCopy` did not check addresses.** It checked only the transfer size, so a whole-block transfer from a misaligned address passed. Misaligned system memory or local addresses now trap.
 
 The runtime also gains:
 
-- `Cast`, charged at the VCONV cycle cost;
+- `Cast`, charged at the vector conversion cycle cost;
 - `DataCopyPad`, which zero-pads a partial block and is counted;
 - per-core DMA byte, transfer and pad counters;
 - a trap when `InitBuffer` asks for more buffers than the queue depth.
