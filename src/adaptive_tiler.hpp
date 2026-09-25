@@ -146,6 +146,7 @@ public:
     static constexpr uint32_t TMP_BYTES = 8192;          // DAE FP32 scratch chunk
     static constexpr uint32_t TMP_FLOATS = TMP_BYTES / sizeof(float);
     static constexpr uint32_t REP_FLOATS = 2048;         // DAE replicated gamma (and beta): <= 8 KB each
+    static constexpr uint32_t ROW_GROUP = 128;           // DAE row sums in flight at once: a worker's fixed per-row arrays
     static constexpr double CHUNK_BYTES = 64 * 1024;     // Host serpentine chunk (prefetch-friendly run)
 
     static inline CoreRange Range(const TilingConfig& cfg, uint32_t M, uint32_t D, uint32_t t, uint32_t n) {
@@ -310,7 +311,8 @@ public:
     // -------------------------------------------------------------------------
     // One tile of k rows at pitch w: Z = X1 + X2 + beta, squares and row sums, inverse RMS,
     // scale, gamma, narrow. `lens` gives band rows (SPLIT_COLUMNS) their own column counts
-    // (0: empty row); null means k full rows of w.
+    // (0: empty row); null means k full rows of w. Row sums go in groups of ROW_GROUP rows, the
+    // squares of a group through the scratch chunk as many rows at a time as fit.
     static inline uint64_t TileCycles(uint64_t k, uint64_t w, uint32_t s, uint64_t rep, const uint32_t* lens) {
         using I = DaeIsa;
         const uint64_t e = k * w;
@@ -321,11 +323,14 @@ public:
         for (uint64_t g = 0; g < k; g += rep) c += 2 * I::Op(std::min(rep, k - g) * w);  // beta, gamma
         if (w <= TMP_FLOATS) {
             const uint64_t per = TMP_FLOATS / w;
-            for (uint64_t r0 = 0; r0 < k; r0 += per) {
-                const uint64_t m = std::min(per, k - r0);
-                c += I::Op(m * w);
-                if (!lens) c += I::ReduceRuns(m, w);
-                else for (uint64_t i = r0; i < r0 + m; ++i) c += lens[i] ? I::Reduce(lens[i]) : 0;
+            for (uint64_t g = 0; g < k; g += ROW_GROUP) {
+                const uint64_t end = std::min<uint64_t>(k, g + ROW_GROUP);
+                for (uint64_t r0 = g; r0 < end; r0 += per) {
+                    const uint64_t m = std::min(per, end - r0);
+                    c += I::Op(m * w);
+                    if (!lens) c += I::ReduceRuns(m, w);
+                    else for (uint64_t i = r0; i < r0 + m; ++i) c += lens[i] ? I::Reduce(lens[i]) : 0;
+                }
             }
         } else {
             c += k * SquareSumCycles(w);

@@ -1,22 +1,61 @@
 // Target-side checks: the 40-core plans obey the hardware laws, the planner's vector-cycle
 // model equals the runtime's cycle count, and the DAE pipeline that executes the plans
 // (dsa_runtime, one OpenMP thread per simulated core) is exact, free of scalar stalls,
-// sanitizer-clean, claims exactly the planned scratchpad, and only pads DMA transfers where a
-// row does not end on a 32-byte block.
+// sanitizer-clean, claims exactly the planned scratchpad, only pads DMA transfers where a
+// row does not end on a 32-byte block, and allocates nothing but the simulator's scratchpad.
+// Its workers are freestanding: a trap aborts the process (DSA_ASSERT), which the death tests
+// check, and the abort report names the run in progress.
 #include "hpc_vector_norm.hpp"
 #include "kernel_unified.hpp"
 #include <omp.h>
+#include <atomic>
 #include <cmath>
+#include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <new>
 #include <random>
+#include <string>
 #include <vector>
+#include <sys/wait.h>
+#include <unistd.h>
 
 using namespace hpc;
+
+// -----------------------------------------------------------------------------
+// Heap probe: every operator new of the process is counted while armed
+// -----------------------------------------------------------------------------
+namespace {
+std::atomic<bool> g_countNew{false};
+std::atomic<uint64_t> g_newCalls{0};
+
+void* CountedNew(std::size_t n, std::size_t align) {
+    if (g_countNew.load(std::memory_order_relaxed)) g_newCalls.fetch_add(1, std::memory_order_relaxed);
+    n = n ? n : 1;
+    void* p = align > alignof(std::max_align_t) ? std::aligned_alloc(align, (n + align - 1) / align * align) : std::malloc(n);
+    if (!p) throw std::bad_alloc();
+    return p;
+}
+} // namespace
+
+void* operator new(std::size_t n) { return CountedNew(n, 0); }
+void* operator new[](std::size_t n) { return CountedNew(n, 0); }
+void* operator new(std::size_t n, std::align_val_t a) { return CountedNew(n, static_cast<std::size_t>(a)); }
+void* operator new[](std::size_t n, std::align_val_t a) { return CountedNew(n, static_cast<std::size_t>(a)); }
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+void operator delete(void* p, std::align_val_t) noexcept { std::free(p); }
+void operator delete[](void* p, std::align_val_t) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t, std::align_val_t) noexcept { std::free(p); }
+void operator delete[](void* p, std::size_t, std::align_val_t) noexcept { std::free(p); }
 
 namespace {
 
 int g_checks = 0, g_failures = 0;
+char g_running[400] = "";  // The run in progress, reported if a trap aborts the process
 
 void Check(bool ok, const char* what) {
     ++g_checks;
@@ -24,6 +63,14 @@ void Check(bool ok, const char* what) {
         ++g_failures;
         std::printf("FAIL %s\n", what);
     }
+}
+
+void ReportAbort(int) {
+    const char head[] = "\nAborted during: ";
+    ssize_t r = write(STDERR_FILENO, head, sizeof head - 1);
+    r = write(STDERR_FILENO, g_running, std::strlen(g_running));
+    r = write(STDERR_FILENO, "\n", 1);
+    (void)r;
 }
 
 template <class C> const char* Name();
@@ -150,19 +197,13 @@ void RunPlan(uint32_t M, uint32_t D, const TilingConfig& plan, bool hasGamma, bo
     for (uint32_t j = 0; j < D; ++j) { g.p[j] = Enc<C>(1.0f + 0.5f * dist(rng)); b.p[j] = Enc<C>(0.1f * dist(rng)); }
     std::memset(y.mem.data(), 0x5A, y.mem.size() * sizeof(S));
 
-    DaeStats st;
     char msg[320];
     std::snprintf(msg, sizeof msg, "%s %s M=%u D=%u gamma=%d bias=%d offset=%u blocks=%u mode=%s tileRows=%u tile=%u pitch=%u rep=%u zRes=%u",
                   Name<C>(), label, M, D, hasGamma, hasBias, offset, plan.blocks, ModeName(plan.mode), plan.tileRows,
                   plan.tileElems, plan.pitch, plan.repRows, plan.zResident);
-    try {
-        st = DaePipeline<C>::Execute(x1.p, x2.p, hasGamma ? g.p : nullptr, hasBias ? b.p : nullptr, y.p, M, D, 1e-6f, plan);
-    } catch (const std::exception& e) {
-        std::printf("FAIL sanitizer trap: %s\n  %s\n", msg, e.what());
-        ++g_checks;
-        ++g_failures;
-        return;
-    }
+    std::snprintf(g_running, sizeof g_running, "%s", msg);
+    const DaeStats st = DaePipeline<C>::Execute(x1.p, x2.p, hasGamma ? g.p : nullptr, hasBias ? b.p : nullptr, y.p, M, D, 1e-6f, plan);
+    g_running[0] = '\0';
     bool ok = true;
     double maxErr = 0.0;
     for (uint32_t i = 0; i < M; ++i) {
@@ -205,6 +246,7 @@ void RunAll(std::mt19937& rng) {
     const uint32_t shapes[][2] = {
         {1, 64}, {7, 200}, {128, 256}, {768, 192}, {8, 32768}, {1536, 576}, {3, 100}, {5, 7}, {2, 1000}, {17, 4097},
         {41, 5000}, {1, 70001}, {3, 100003}, {40, 3072}, {130, 128}, {1, 1u << 20}, {8, 4096}, {13, 12288}, {39, 2048},
+        {65536, 24},  // Row tiles of 137-138 rows: more than one row group per tile
     };
     const HardwareModel hw = HardwareModel::Target();
     const char* labels[] = {"model", "split", "rows", "band"};
@@ -240,13 +282,147 @@ void RunWaterlinePlan(std::mt19937& rng) {
     RunPlan<F32>(M, D, plan, true, true, 0, rng, "waterline");
 }
 
+// Tiles of many row groups (a worker keeps the sums of ROW_GROUP rows at a time): a machine
+// whose DMA tiles cost so much that every core gets the largest tile its scratchpad admits
+template <class C>
+void RunWidePlans(std::mt19937& rng) {
+    using S = typename C::S;
+    HardwareModel hw = HardwareModel::Target();
+    hw.tileNs = 1e12;
+    struct Case { uint32_t M, D; TilingMode mode; } cases[] = {
+        {12000, 8, TilingMode::ROW_PARALLEL},     // 300-row tiles: groups of 128, 128, 44
+        {65536, 24, TilingMode::ROW_PARALLEL},    // Squares chunks of 85 rows straddle the groups
+        {300, 640, TilingMode::SPLIT_COLUMNS}};   // One 300-row band tile per core
+    for (const Case& c : cases) {
+        const TilingConfig plan = AdaptiveTiler::Build(c.M, c.D, sizeof(S), hw, c.mode, true);
+        char msg[160];
+        std::snprintf(msg, sizeof msg, "%s wide plan M=%u D=%u mode=%s tileRows=%u", Name<C>(), c.M, c.D, ModeName(plan.mode), plan.tileRows);
+        Check(plan.tileElems > 0 && plan.tileRows > 2 * AdaptiveTiler::ROW_GROUP, msg);
+        RunPlan<C>(c.M, c.D, plan, true, true, 0, rng, "wide");
+        RunPlan<C>(c.M, c.D, plan, false, true, 1, rng, "wide");
+    }
+}
+
+// -----------------------------------------------------------------------------
+// 3. Zero-allocation execution [ARCH CHALLENGE 6]. With a caller-owned workspace, the only heap
+// allocations during DaePipeline::Execute are the simulator's scratchpad buffers (dsa_runtime
+// backs each TPipe buffer with a std::vector); the coordinator and the workers allocate nothing.
+// The coordinator's own workspace gives bit-identical results.
+// -----------------------------------------------------------------------------
+uint64_t SimulatorBuffers(const DaeLayout& L) {  // TPipe::InitBuffer blocks of one core
+    return 2 * (L.paramQueue ? 3 : 2) + 1 + (L.z ? 1 : 0) + (L.params ? 1 : 0) + (L.resident ? 1 : 0) + (L.misc ? 1 : 0);
+}
+
+template <class C>
+void CheckAllocations(std::mt19937& rng) {
+    using S = typename C::S;
+    const HardwareModel hw = HardwareModel::Target();
+    struct Case { uint32_t M, D; TilingMode mode; } cases[] = {
+        {768, 192, TilingMode::ROW_PARALLEL},  {65536, 24, TilingMode::ROW_PARALLEL}, {1, 70001, TilingMode::ROW_PARALLEL},
+        {8, 32768, TilingMode::SPLIT_COLUMNS}, {17, 4097, TilingMode::SPLIT_D},       {3, 100003, TilingMode::SPLIT_D}};
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (const Case& c : cases) {
+        const TilingConfig plan = AdaptiveTiler::Build(c.M, c.D, sizeof(S), hw, c.mode, true);
+        const size_t N = size_t(c.M) * c.D;
+        HostBuffer<S> x1(N, 0), x2(N, 0), g(c.D, 0), b(c.D, 0), y(N, 0), y2(N, 0);
+        for (size_t i = 0; i < N; ++i) { x1.p[i] = Enc<C>(dist(rng)); x2.p[i] = Enc<C>(dist(rng)); }
+        for (uint32_t j = 0; j < c.D; ++j) { g.p[j] = Enc<C>(1.0f + 0.5f * dist(rng)); b.p[j] = Enc<C>(0.1f * dist(rng)); }
+        const size_t bytes = DaePipeline<C>::WorkspaceBytes(plan, c.M);
+        float* workspace = bytes ? static_cast<float*>(std::aligned_alloc(64, bytes)) : nullptr;
+        char msg[200];
+        std::snprintf(msg, sizeof msg, "%s zero-allocation M=%u D=%u mode=%s workspace=%zu B", Name<C>(), c.M, c.D, ModeName(plan.mode), bytes);
+        std::snprintf(g_running, sizeof g_running, "%s", msg);
+        g_newCalls = 0;
+        g_countNew = true;
+        const DaeStats st = DaePipeline<C>::Execute(x1.p, x2.p, g.p, b.p, y.p, c.M, c.D, 1e-6f, plan, workspace, bytes);
+        g_countNew = false;
+        const uint64_t news = g_newCalls;
+        const DaeStats own = DaePipeline<C>::Execute(x1.p, x2.p, g.p, b.p, y2.p, c.M, c.D, 1e-6f, plan);
+        g_running[0] = '\0';
+        std::free(workspace);
+        Check(plan.tileElems > 0 && (bytes == 0) == (plan.mode == TilingMode::ROW_PARALLEL), msg);
+        Check(news == plan.blocks * SimulatorBuffers(plan.layout), msg);
+        Check(std::memcmp(y.p, y2.p, N * sizeof(S)) == 0 && st.vectorCycles == own.vectorCycles && st.dmaBytes == own.dmaBytes &&
+                  st.spmBytes == own.spmBytes && VectorCycles(st.busiest) == plan.modelCycles, msg);
+        if (news != plan.blocks * SimulatorBuffers(plan.layout)) {
+            std::printf("  operator new calls: %llu, simulator buffers: %llu\n", (unsigned long long)news,
+                        (unsigned long long)(plan.blocks * SimulatorBuffers(plan.layout)));
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// 4. Freestanding traps: a broken coordinator or worker invariant is a DSA_ASSERT, which
+// reports "[DSA Hardware Trap]" and aborts instead of throwing. Each case runs in a child
+// process: this binary, re-executed with --trap <case>.
+// -----------------------------------------------------------------------------
+struct TrapCase { const char* name; const char* report; };
+const TrapCase kTraps[] = {
+    {"plan", "needs a feasible plan"},              // Coordinator: a host plan has no DAE tiles
+    {"workspace", "reduction workspace"},           // Coordinator: workspace off the 64-byte grid
+    {"team", "core count"},                         // Worker: nested region, one thread for 40 cores
+    {"band", "column band wider than the plan"}};   // Worker: band pitch below the band width
+
+int RunTrapCase(const char* name) {
+    const uint32_t M = 8, D = 32768;  // P05: the column band on 40 cores
+    std::vector<uint16_t> x(size_t(M) * D, 0x3C00), y(size_t(M) * D);
+    TilingConfig plan = AdaptiveTiler::Plan(M, D, 2, HardwareModel::Target());
+    const size_t bytes = DaePipeline<F16>::WorkspaceBytes(plan, M);
+    std::vector<float> workspace(bytes / sizeof(float) + 32);
+    auto run = [&] { DaePipeline<F16>::Execute(x.data(), x.data(), nullptr, nullptr, y.data(), M, D, 1e-6f, plan); };
+    if (!std::strcmp(name, "plan")) {
+        plan = AdaptiveTiler::Plan(M, D, 2, HardwareModel::Host(4));
+        run();
+    } else if (!std::strcmp(name, "workspace")) {
+        float* misaligned = reinterpret_cast<float*>((reinterpret_cast<uintptr_t>(workspace.data()) + 63) / 64 * 64) + 1;
+        DaePipeline<F16>::Execute(x.data(), x.data(), nullptr, nullptr, y.data(), M, D, 1e-6f, plan, misaligned, bytes);
+    } else if (!std::strcmp(name, "team")) {
+        omp_set_max_active_levels(1);
+        #pragma omp parallel num_threads(2)
+        {
+            if (omp_get_thread_num() == 0) run();
+        }
+    } else if (!std::strcmp(name, "band")) {
+        plan.pitch = 16;
+        run();
+    }
+    return 0;  // Nothing trapped
+}
+
+void CheckTraps(const char* self) {
+    for (const TrapCase& t : kTraps) {
+        const std::string cmd = std::string("'") + self + "' --trap " + t.name + " 2>&1";
+        FILE* pipe = popen(cmd.c_str(), "r");
+        std::string out;
+        char buf[256];
+        while (pipe && std::fgets(buf, sizeof buf, pipe)) out += buf;
+        const int status = pipe ? pclose(pipe) : -1;
+        const bool aborted = status != -1 && ((WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT) ||
+                                              (WIFEXITED(status) && WEXITSTATUS(status) == 128 + SIGABRT));
+        const bool reported = out.find("[DSA Hardware Trap]: [DaePipeline]") != std::string::npos && out.find(t.report) != std::string::npos;
+        char msg[160];
+        std::snprintf(msg, sizeof msg, "DSA_ASSERT trap '%s' (status %d)", t.name, status);
+        Check(aborted && reported, msg);
+        if (!(aborted && reported)) std::printf("  child output: %s\n", out.c_str());
+    }
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 3 && std::strcmp(argv[1], "--trap") == 0) return RunTrapCase(argv[2]);
+    std::signal(SIGABRT, ReportAbort);
     std::mt19937 rng(7);
     CheckProfilePlans();
     CheckPlannerScan();
+    CheckTraps(argv[0]);
     RunWaterlinePlan(rng);
+    CheckAllocations<F32>(rng);
+    CheckAllocations<F16>(rng);
+    CheckAllocations<BF16>(rng);
+    RunWidePlans<F32>(rng);
+    RunWidePlans<F16>(rng);
+    RunWidePlans<BF16>(rng);
     RunAll<F32>(rng);
     RunAll<F16>(rng);
     RunAll<BF16>(rng);

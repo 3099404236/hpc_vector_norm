@@ -8,9 +8,9 @@
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
-#include <string>
+#include <cstring>
+#include <stdexcept>
 #include <type_traits>
-#include <vector>
 #include <omp.h>
 
 namespace hpc {
@@ -311,6 +311,12 @@ private:
 // DataCopyPad where a transfer does not end on a DMA block. The scalar unit never
 // reads the scratchpad (GetValue: a 500-cycle V->S stall): row sums reach it through
 // VectorReduceSum, and Split-D partials are combined by vector adds.
+//
+// Coordinator and workers [ARCH CHALLENGE 6]: DaePipeline::Execute runs on the calling
+// thread. It takes a finished plan, owns the 64-byte-aligned reduction workspace and
+// dispatches one Core per simulated core with POD arguments. A Core is freestanding: it
+// allocates nothing (per-row state lives in fixed arrays on its stack), throws nothing (a
+// broken invariant is a DSA_ASSERT trap) and passes LocalTensor views by value.
 // =============================================================================
 struct DaeStats {
     uint64_t vectorCycles = 0;  // Busiest core: vector + scalar stalls + barriers
@@ -328,68 +334,86 @@ class DaePipeline {
 public:
     using S = typename C::S;
 
-    static DaeStats Execute(const S* x1, const S* x2, const S* gamma, const S* bias, S* y,
-                            uint32_t M, uint32_t D, float eps, const TilingConfig& plan) {
+    // Reduction workspace a plan needs: one record of partial sums per core in whole 32-byte
+    // blocks, rounded up to 64 bytes (0: the plan never reduces across cores)
+    static size_t WorkspaceBytes(const TilingConfig& plan, uint32_t M) {
+        const size_t bytes = size_t(Cores(plan)) * AdaptiveTiler::RecordFloats(plan, M) * sizeof(float);
+        return (bytes + 63) / 64 * 64;
+    }
+
+    // Coordinator with a caller-owned workspace (64-byte aligned, WorkspaceBytes() long): it
+    // allocates nothing. The plan is evaluated once, by the caller, never by the workers.
+    static DaeStats Execute(const S* x1, const S* x2, const S* gamma, const S* bias, S* y, uint32_t M, uint32_t D,
+                            float eps, const TilingConfig& plan, float* workspace, size_t workspaceBytes) {
         DaeStats stats;
         if (M == 0 || D == 0) return stats;
-        if (plan.tileElems == 0) throw std::invalid_argument("DaePipeline needs a feasible plan with DAE tiles (HardwareModel::Target())");
-        const uint32_t blocks = std::max(1u, std::min(plan.blocks, AdaptiveTiler::MAX_THREADS));
-        const bool split = plan.mode != TilingMode::ROW_PARALLEL;
-        // Split-D partial records in system memory: whole 32-byte blocks per core, zeroed
-        const size_t wsBytes = std::max<size_t>(64, (size_t(blocks) * AdaptiveTiler::RecordFloats(plan, M) * sizeof(float) + 63) / 64 * 64);
-        float* workspace = static_cast<float*>(std::aligned_alloc(64, wsBytes));
-        if (!workspace) throw std::bad_alloc();
-        std::memset(workspace, 0, wsBytes);
-        std::vector<dsa::HardwareCycleTracker> trackers(blocks);
-        std::vector<size_t> spm(blocks, 0);
-        std::string error;
-        #pragma omp parallel num_threads(blocks)
+        DSA_ASSERT(plan.tileElems > 0, "[DaePipeline]: needs a feasible plan with DAE tiles (HardwareModel::Target())");
+        const size_t need = WorkspaceBytes(plan, M);
+        DSA_ASSERT(need == 0 || (workspace && reinterpret_cast<uintptr_t>(workspace) % 64 == 0 && workspaceBytes >= need),
+                   "[DaePipeline]: the reduction workspace must be 64-byte aligned and WorkspaceBytes() long");
+        if (need) std::memset(workspace, 0, need);  // A core without units publishes nothing: its records read 0
+        const Args args{x1, x2, gamma, bias, y, M, D, eps, &plan, workspace, Cores(plan)};
+        CoreResult results[AdaptiveTiler::MAX_THREADS];
+        #pragma omp parallel num_threads(args.cores)
         {
-            const uint32_t coreId = dsa::GetCoreIdx(), numCores = dsa::GetCoreNum();
-            dsa::g_cycleTracker.Reset();
-            Core core(x1, x2, gamma, bias, y, M, D, eps, plan, workspace, coreId);
-            const CoreRange range = AdaptiveTiler::Range(plan, M, D, coreId, numCores);
-            std::string err;
-            try {
-                if (numCores != blocks) throw std::runtime_error("[DaePipeline]: the plan needs " + std::to_string(blocks) + " cores");
-                core.Init();
-                core.Phase1(range);
-            } catch (const std::exception& e) {
-                err = e.what();
-            }
-            if (split) dsa::SyncAll();  // Reached by every core, failed or not: no deadlock
-            if (split && err.empty()) {
-                try {
-                    core.Phase2(range, numCores);
-                } catch (const std::exception& e) {
-                    err = e.what();
-                }
-            }
-            trackers[coreId] = dsa::g_cycleTracker;
-            spm[coreId] = core.pipe.GetTotalAllocatedBytes();
-            if (!err.empty()) {
-                #pragma omp critical(hpc_dae_error)
-                if (error.empty()) error = err;
-            }
+            Core core(args, dsa::GetCoreIdx());
+            core.Execute(dsa::GetCoreNum(), results[core.b]);
         }
-        std::free(workspace);
-        if (!error.empty()) throw std::runtime_error(error);
-        for (uint32_t b = 0; b < blocks; ++b) {
-            if (trackers[b].GetTotalVectorCycles() >= stats.vectorCycles) {
-                stats.vectorCycles = trackers[b].GetTotalVectorCycles();
-                stats.busiest = trackers[b];
+        for (uint32_t b = 0; b < args.cores; ++b) {
+            const dsa::HardwareCycleTracker& t = results[b].cycles;
+            if (t.GetTotalVectorCycles() >= stats.vectorCycles) {
+                stats.vectorCycles = t.GetTotalVectorCycles();
+                stats.busiest = t;
             }
-            stats.scalarStalls += trackers[b].scalarStallCount;
-            stats.dmaBytes += trackers[b].dmaBytesMoved;
-            stats.dmaTransfers += trackers[b].dmaTransfers;
-            stats.padTransfers += trackers[b].padTransfers;
-            stats.barriers = std::max(stats.barriers, trackers[b].barrierCount);
-            stats.spmBytes = std::max(stats.spmBytes, spm[b]);
+            stats.scalarStalls += t.scalarStallCount;
+            stats.dmaBytes += t.dmaBytesMoved;
+            stats.dmaTransfers += t.dmaTransfers;
+            stats.padTransfers += t.padTransfers;
+            stats.barriers = std::max(stats.barriers, t.barrierCount);
+            stats.spmBytes = std::max(stats.spmBytes, results[b].spmBytes);
         }
         return stats;
     }
 
+    // Coordinator with its own workspace: allocated on the calling thread the first time a plan
+    // needs more, then reused, so repeated calls allocate nothing
+    static DaeStats Execute(const S* x1, const S* x2, const S* gamma, const S* bias, S* y, uint32_t M, uint32_t D,
+                            float eps, const TilingConfig& plan) {
+        const size_t bytes = M && D ? WorkspaceBytes(plan, M) : 0;
+        return Execute(x1, x2, gamma, bias, y, M, D, eps, plan, bytes ? CoordinatorWorkspace(bytes) : nullptr, bytes);
+    }
+
 private:
+    static uint32_t Cores(const TilingConfig& plan) { return std::max(1u, std::min(plan.blocks, AdaptiveTiler::MAX_THREADS)); }
+
+    static float* CoordinatorWorkspace(size_t bytes) {
+        struct Buffer { float* p = nullptr; size_t n = 0; ~Buffer() { std::free(p); } };
+        thread_local Buffer buf;
+        if (buf.n < bytes) {
+            std::free(buf.p);
+            buf.p = static_cast<float*>(std::aligned_alloc(64, bytes));
+            buf.n = buf.p ? bytes : 0;
+        }
+        return buf.p;
+    }
+
+    // Everything a worker receives: plain pointers and sizes, shared read-only
+    struct Args {
+        const S *x1, *x2, *gamma, *bias;
+        S* y;
+        uint32_t M, D;
+        float eps;
+        const TilingConfig* plan;
+        float* workspace;  // Partial-sum records: the only memory the cores share besides X1/X2/Y
+        uint32_t cores;    // Simulated cores the plan was made for
+    };
+
+    // One core's outcome, written once by its worker
+    struct alignas(64) CoreResult {
+        dsa::HardwareCycleTracker cycles;
+        size_t spmBytes;
+    };
+
     static float ToF32(S v) {
         if constexpr (std::is_same<C, F32>::value) return v;
         else if constexpr (std::is_same<C, F16>::value) return HalfToFloat(v);
@@ -418,11 +442,11 @@ private:
 
     struct Cols { uint32_t off, len; };  // A band row's own columns inside its tile row
 
+    // ---- Worker: one simulated core ------------------------------------------------------------
     struct Core {
-        Core(const S* x1_, const S* x2_, const S* gamma_, const S* bias_, S* y_, uint32_t M_, uint32_t D_, float eps_,
-             const TilingConfig& plan_, float* workspace_, uint32_t b_)
-            : x1(x1_), x2(x2_), gamma(gamma_), bias(bias_), y(y_), M(M_), D(D_), eps(eps_), plan(plan_),
-              workspace(workspace_), b(b_) {}
+        Core(const Args& a, uint32_t core)
+            : x1(a.x1), x2(a.x2), gamma(a.gamma), bias(a.bias), y(a.y), M(a.M), D(a.D), eps(a.eps), plan(*a.plan),
+              workspace(a.workspace), cores(a.cores), b(core) {}
 
         const S *x1, *x2, *gamma, *bias;
         S* y;
@@ -430,15 +454,28 @@ private:
         float eps;
         const TilingConfig& plan;
         float* workspace;
-        uint32_t b;
+        uint32_t cores, b;
 
         dsa::TPipe pipe;
         dsa::TQue<dsa::QuePosition::VECIN, 2> qX1, qX2, qP;  // Double-buffered tiles; qP: gamma/beta chunks
         dsa::TBuf<dsa::QuePosition::VECCALC> bZ, bTmp, bPar, bRes, bMisc;
         dsa::LocalTensor<float> z, tmp, par, res, misc;
         uint32_t tmpCap = 0, quantum = 1, rep = 1, pitch = 0;
-        std::vector<float> sums;  // Row sums of squares, on the scalar side
-        std::vector<Cols> cols;   // Band rows of the current tile
+
+        void Execute(uint32_t numCores, CoreResult& out) {
+            // A split plan's SyncAll waits for every core the plan was made for
+            DSA_ASSERT(numCores == cores, "[DaePipeline]: the OpenMP team does not have the plan's core count");
+            dsa::g_cycleTracker.Reset();
+            Init();
+            const CoreRange range = AdaptiveTiler::Range(plan, M, D, b, numCores);
+            Phase1(range);
+            if (plan.mode != TilingMode::ROW_PARALLEL) {  // Split-D: one barrier, passed by every core
+                dsa::SyncAll();
+                Phase2(range, numCores);
+            }
+            out.cycles = dsa::g_cycleTracker;
+            out.spmBytes = pipe.GetTotalAllocatedBytes();
+        }
 
         void Init() {
             const DaeLayout& L = plan.layout;
@@ -476,8 +513,8 @@ private:
         void RowTiles(uint32_t rA, uint32_t rZ) {
             if (rA >= rZ) return;
             const uint32_t B = plan.tileRows;
+            float sums[AdaptiveTiler::ROW_GROUP];  // Row sums of squares, on the scalar side
             auto load = [&](uint32_t row) { LoadTile(uint64_t(row) * D, std::min(B, rZ - row) * D); };
-            sums.assign(B, 0.0f);
             // Prologue [ARCH CHALLENGE 3]: tile 0, gamma/beta and tile 1 are all in flight before
             // the vector unit starts, and widening gamma/beta overlaps tile 1's DMA.
             load(rA);
@@ -487,10 +524,16 @@ private:
             for (uint32_t row = rA; row < rZ; row += B) {
                 const uint32_t k = std::min(B, rZ - row);
                 dsa::LocalTensor<S> a = qX1.template DeQue<S>(), bt = qX2.template DeQue<S>();
-                dsa::LocalTensor<float> zt = ZOf(a);
-                TileSums(zt, a, bt, k, nullptr, sums.data());
+                const dsa::LocalTensor<float> zt = ZOf(a);
+                TileZ(zt, a, bt, k);
                 qX2.FreeTensor(bt);
-                TileScale(zt, k, nullptr, sums.data());
+                // Every row sum of a group is issued before the group's first scaling
+                for (uint32_t g = 0; g < k; g += AdaptiveTiler::ROW_GROUP) {
+                    const uint32_t n = std::min(AdaptiveTiler::ROW_GROUP, k - g);
+                    RowSums(zt[g * pitch], n, nullptr, sums);
+                    ScaleRows(zt[g * pitch], n, nullptr, sums);
+                }
+                if (gamma) ApplyRows(zt, k, par, true);
                 Narrow(a, zt, k * D);
                 DmaOut(y + uint64_t(row) * D, a, k * D);
                 qX1.FreeTensor(a);
@@ -498,19 +541,22 @@ private:
             }
         }
 
-        // Z = X1 + X2 (+ beta) for the k rows of a tile at pitch `pitch`, then every row's sum of
-        // squares into out[0, k). `cols` limits band rows to their own columns (null: full rows).
-        void TileSums(dsa::LocalTensor<float> zt, dsa::LocalTensor<S> a, dsa::LocalTensor<S> bt, uint32_t k,
-                      const Cols* cols, float* out) {
+        // Z = X1 + X2 (+ beta) for the k rows of a tile at pitch `pitch`
+        void TileZ(dsa::LocalTensor<float> zt, dsa::LocalTensor<S> a, dsa::LocalTensor<S> bt, uint32_t k) {
             AddInputs(zt, a, bt, k * pitch);
             if (bias) ApplyRows(zt, k, par[BetaAt()], false);
+        }
+
+        // Sums of squares of n <= ROW_GROUP rows into out[0, n). `cols` limits band rows to their
+        // own columns (null: full rows).
+        void RowSums(dsa::LocalTensor<float> zt, uint32_t n, const Cols* cols, float* out) {
             if (pitch > tmpCap) {  // Long rows (full rows only): one row at a time
-                for (uint32_t i = 0; i < k; ++i) out[i] = SumSquares(zt[i * pitch], pitch);
+                for (uint32_t i = 0; i < n; ++i) out[i] = SumSquares(zt[i * pitch], pitch);
                 return;
             }
             const uint32_t per = tmpCap / pitch;  // Rows whose squares fit the scratch chunk
-            for (uint32_t r0 = 0; r0 < k; r0 += per) {
-                const uint32_t m = std::min(per, k - r0);
+            for (uint32_t r0 = 0; r0 < n; r0 += per) {
+                const uint32_t m = std::min(per, n - r0);
                 dsa::Mul(tmp, zt[r0 * pitch], zt[r0 * pitch], m * pitch);
                 if (cols) {
                     for (uint32_t i = 0; i < m; ++i) {
@@ -528,14 +574,13 @@ private:
             }
         }
 
-        // Y = Z * invRms(row) (* gamma): one VectorInvRms and one Muls per row, gamma once per
-        // `rep` replicated rows
-        void TileScale(dsa::LocalTensor<float> zt, uint32_t k, const Cols* cols, const float* sumSq) {
-            for (uint32_t i = 0; i < k; ++i) {
+        // Z *= invRms(row) for n rows (band rows: their own columns): one VectorInvRms and one
+        // Muls per row
+        void ScaleRows(dsa::LocalTensor<float> zt, uint32_t n, const Cols* cols, const float* sumSq) {
+            for (uint32_t i = 0; i < n; ++i) {
                 const Cols c = cols ? cols[i] : Cols{0, pitch};
                 if (c.len) dsa::Muls(zt[i * pitch + c.off], zt[i * pitch + c.off], InvRms(sumSq[i]), c.len);
             }
-            if (gamma) ApplyRows(zt, k, par, true);
         }
 
         // zt (+|*)= a resident parameter block of `rep` rows, rep rows per instruction
@@ -606,28 +651,33 @@ private:
         void BandPhase1(const CoreRange& r) {
             if (r.rowZ <= r.rowA) return;  // No units: the zeroed records stand for this core
             const uint32_t c0 = AdaptiveTiler::BandBegin(r, quantum), w = AdaptiveTiler::BandEnd(r, quantum) - c0;
-            if (w > pitch) throw std::runtime_error("[DaePipeline]: column band wider than the plan's pitch");
-            const uint32_t B = plan.tileRows;
+            DSA_ASSERT(w <= pitch, "[DaePipeline]: column band wider than the plan's pitch");
+            const uint32_t B = plan.tileRows, R = AdaptiveTiler::RecordFloats(plan, M);
+            float sums[AdaptiveTiler::ROW_GROUP];
+            Cols cols[AdaptiveTiler::ROW_GROUP];
             auto load = [&](uint32_t row) { LoadBand(r, row, std::min(B, r.rowZ - row), c0); };
-            sums.assign(M, 0.0f);
-            cols.resize(B);
             load(r.rowA);
             const bool staged = StageParams(c0, w);
             if (r.rowA + B < r.rowZ) load(r.rowA + B);
             WidenParams(c0, w, staged);
+            // One record of M partials in whole 32-byte blocks, for every core to gather; the
+            // scalar unit writes each row's partial into it as the sum arrives
+            dsa::Duplicate(misc, 0.0f, R);
             for (uint32_t row = r.rowA; row < r.rowZ; row += B) {
                 const uint32_t k = std::min(B, r.rowZ - row);
-                BandCols(r, row, k, c0);
                 dsa::LocalTensor<S> a = qX1.template DeQue<S>(), bt = qX2.template DeQue<S>();
-                TileSums(res[(row - r.rowA) * pitch], a, bt, k, cols.data(), sums.data() + row);
+                const dsa::LocalTensor<float> zt = res[(row - r.rowA) * pitch];
+                TileZ(zt, a, bt, k);
                 qX1.FreeTensor(a);
                 qX2.FreeTensor(bt);
+                for (uint32_t g = 0; g < k; g += AdaptiveTiler::ROW_GROUP) {
+                    const uint32_t n = std::min(AdaptiveTiler::ROW_GROUP, k - g);
+                    BandCols(r, row + g, n, c0, cols);
+                    RowSums(zt[g * pitch], n, cols, sums);
+                    for (uint32_t i = 0; i < n; ++i) misc.SetValue(row + g + i, sums[i]);
+                }
                 if (row + 2 * B < r.rowZ) load(row + 2 * B);
             }
-            // One record of M partials in whole 32-byte blocks, for every core to gather
-            const uint32_t R = AdaptiveTiler::RecordFloats(plan, M);
-            dsa::Duplicate(misc, 0.0f, R);
-            for (uint32_t i = 0; i < M; ++i) misc.SetValue(i, sums[i]);
             dsa::DataCopy(workspace + size_t(b) * R, misc, R);
         }
 
@@ -637,17 +687,23 @@ private:
             // Every core's partials in one DMA, summed by a fixed tree of vector adds (the same on
             // every core, so all owners of a row compute the same sigma); one VectorReduceSum per
             // row then hands each total to the scalar unit
-            dsa::LocalTensor<float> g = misc[R];
-            dsa::DataCopy(g, workspace, nb * R);
-            for (uint32_t n = nb; n > 1; n -= n / 2) dsa::Add(g, g, g[(n - n / 2) * R], n / 2 * R);
-            for (uint32_t i = 0; i < M; ++i) sums[i] = dsa::VectorReduceSum(g[i], 1);
+            const dsa::LocalTensor<float> recs = misc[R];
+            dsa::DataCopy(recs, workspace, nb * R);
+            for (uint32_t n = nb; n > 1; n -= n / 2) dsa::Add(recs, recs, recs[(n - n / 2) * R], n / 2 * R);
             const uint32_t B = plan.tileRows;
+            float sums[AdaptiveTiler::ROW_GROUP];
+            Cols cols[AdaptiveTiler::ROW_GROUP];
             for (uint32_t row = r.rowA; row < r.rowZ; row += B) {
                 const uint32_t k = std::min(B, r.rowZ - row);
-                BandCols(r, row, k, c0);
                 const dsa::LocalTensor<float> zt = res[(row - r.rowA) * pitch];
-                TileScale(zt, k, cols.data(), sums.data() + row);
-                StoreBand(row, k, c0, zt);
+                for (uint32_t g = 0; g < k; g += AdaptiveTiler::ROW_GROUP) {
+                    const uint32_t n = std::min(AdaptiveTiler::ROW_GROUP, k - g);
+                    for (uint32_t i = 0; i < n; ++i) sums[i] = dsa::VectorReduceSum(recs[row + g + i], 1);
+                    BandCols(r, row + g, n, c0, cols);
+                    ScaleRows(zt[g * pitch], n, cols, sums);
+                }
+                if (gamma) ApplyRows(zt, k, par, true);
+                StoreBand(r, row, k, c0, zt);
             }
         }
 
@@ -655,39 +711,41 @@ private:
         void LoadBand(const CoreRange& r, uint32_t row, uint32_t k, uint32_t c0) {
             dsa::LocalTensor<S> a = qX1.template AllocTensor<S>(), bt = qX2.template AllocTensor<S>();
             for (uint32_t i = 0; i < k; ++i) {
-                uint32_t cb, ce;
-                AdaptiveTiler::BandRow(r, row + i, quantum, cb, ce);
-                if (cb >= ce) continue;
-                const uint64_t e = uint64_t(row + i) * D + cb;
-                DmaIn(a[i * pitch + (cb - c0)], x1 + e, ce - cb);
-                DmaIn(bt[i * pitch + (cb - c0)], x2 + e, ce - cb);
+                const Cols c = BandCol(r, row + i, c0);
+                if (!c.len) continue;
+                const uint64_t e = uint64_t(row + i) * D + c0 + c.off;
+                DmaIn(a[i * pitch + c.off], x1 + e, c.len);
+                DmaIn(bt[i * pitch + c.off], x2 + e, c.len);
             }
             qX1.EnQue(a);
             qX2.EnQue(bt);
         }
 
         // Band rows back to Y, one DMA per row (FP32 straight from the resident Z)
-        void StoreBand(uint32_t row, uint32_t k, uint32_t c0, dsa::LocalTensor<float> zt) {
+        void StoreBand(const CoreRange& r, uint32_t row, uint32_t k, uint32_t c0, dsa::LocalTensor<float> zt) {
+            dsa::LocalTensor<S> out;
             if constexpr (std::is_same<C, F32>::value) {
-                for (uint32_t i = 0; i < k; ++i) {
-                    if (cols[i].len) DmaOut(y + uint64_t(row + i) * D + c0 + cols[i].off, zt[i * pitch + cols[i].off], cols[i].len);
-                }
+                out = zt;
             } else {
-                dsa::LocalTensor<S> out = qX1.template AllocTensor<S>();
+                out = qX1.template AllocTensor<S>();
                 Narrow(out, zt, k * pitch);
-                for (uint32_t i = 0; i < k; ++i) {
-                    if (cols[i].len) DmaOut(y + uint64_t(row + i) * D + c0 + cols[i].off, out[i * pitch + cols[i].off], cols[i].len);
-                }
-                qX1.FreeTensor(out);
             }
+            for (uint32_t i = 0; i < k; ++i) {
+                const Cols c = BandCol(r, row + i, c0);
+                if (c.len) DmaOut(y + uint64_t(row + i) * D + c0 + c.off, out[i * pitch + c.off], c.len);
+            }
+            if constexpr (!std::is_same<C, F32>::value) qX1.FreeTensor(out);
         }
 
-        void BandCols(const CoreRange& r, uint32_t row, uint32_t k, uint32_t c0) {
-            for (uint32_t i = 0; i < k; ++i) {
-                uint32_t cb, ce;
-                AdaptiveTiler::BandRow(r, row + i, quantum, cb, ce);
-                cols[i] = cb < ce ? Cols{cb - c0, ce - cb} : Cols{0, 0};
-            }
+        // A band row's own columns inside its tile row (len 0: the core has none of that row)
+        Cols BandCol(const CoreRange& r, uint32_t row, uint32_t c0) const {
+            uint32_t cb, ce;
+            AdaptiveTiler::BandRow(r, row, quantum, cb, ce);
+            return cb < ce ? Cols{cb - c0, ce - cb} : Cols{0, 0};
+        }
+
+        void BandCols(const CoreRange& r, uint32_t row, uint32_t n, uint32_t c0, Cols* cols) const {
+            for (uint32_t i = 0; i < n; ++i) cols[i] = BandCol(r, row + i, c0);
         }
 
         // ---- Column tiles: Split-D fragments and rows too long for a row tile --------------------
@@ -696,7 +754,7 @@ private:
             used = 0;
             for (uint32_t k = 0; k < r.nFrag; ++k) {
                 const CoreRange::Fragment& f = r.frag[k];
-                fragZ[k] = Claim(f.ce - f.cb, k);
+                fragZ[k] = Claim(f.ce - f.cb);
                 fragSum[k] = Sweep1(f.row, f.cb, f.ce, fragZ[k]);
             }
             if (split) {  // Two 32-byte records per core: {sum0, 0 x7}, {sum1, 0 x7}
@@ -707,12 +765,12 @@ private:
             }
             for (uint32_t row = r.rowA; row < r.rowZ; ++row) {
                 const size_t mark = used;
-                dsa::LocalTensor<float>* zr = Claim(D, 2);
+                const dsa::LocalTensor<float> zr = Claim(D);
                 Sweep2(row, 0, D, zr, Sweep1(row, 0, D, zr), false);
                 used = mark;
             }
             // The first gamma chunk of fragment 0 streams in while this core waits at SyncAll
-            primed = split && r.nFrag > 0 && fragZ[0] != nullptr && gamma != nullptr;
+            primed = split && r.nFrag > 0 && Resident(fragZ[0]) && gamma != nullptr;
             if (primed) {
                 const uint64_t start = uint64_t(r.frag[0].row) * D + r.frag[0].cb;
                 LoadParam(gamma + r.frag[0].cb, TileLength(start, start + (r.frag[0].ce - r.frag[0].cb)));
@@ -736,9 +794,11 @@ private:
         }
 
         // Sweep 1 over row segment [cb, ce): Z = X1 + X2 + beta and sum(Z^2), Z kept in `zr` when
-        // given. X1, X2 and the beta chunk of tile k+1 are in flight while tile k is processed.
-        float Sweep1(uint32_t row, uint32_t cb, uint32_t ce, dsa::LocalTensor<float>* zr) {
+        // it is resident. X1, X2 and the beta chunk of tile k+1 are in flight while tile k is
+        // processed.
+        float Sweep1(uint32_t row, uint32_t cb, uint32_t ce, dsa::LocalTensor<float> zr) {
             const uint64_t base = uint64_t(row) * D, start = base + cb;
+            const bool keep = Resident(zr);
             float sum = 0.0f;
             Tiles(start, base + ce, false,
                   [&](uint64_t e, uint32_t n) {
@@ -747,7 +807,7 @@ private:
                   },
                   [&](uint64_t e, uint32_t n) {
                       dsa::LocalTensor<S> a = qX1.template DeQue<S>(), bt = qX2.template DeQue<S>();
-                      dsa::LocalTensor<float> zt = zr ? (*zr)[static_cast<uint32_t>(e - start)] : z;
+                      dsa::LocalTensor<float> zt = keep ? zr[static_cast<uint32_t>(e - start)] : z;
                       AddInputs(zt, a, bt, n);
                       qX1.FreeTensor(a);
                       qX2.FreeTensor(bt);
@@ -759,14 +819,14 @@ private:
 
         // Sweep 2: Y = Z * invRms * gamma. From resident Z only gamma streams (its first chunk may
         // already be in flight: `primed`); otherwise X1/X2 and beta re-stream to recompute Z.
-        void Sweep2(uint32_t row, uint32_t cb, uint32_t ce, dsa::LocalTensor<float>* zr, float sumSq, bool primed) {
+        void Sweep2(uint32_t row, uint32_t cb, uint32_t ce, dsa::LocalTensor<float> zr, float sumSq, bool primed) {
             const uint64_t base = uint64_t(row) * D, start = base + cb, end = base + ce;
             const float inv = InvRms(sumSq);
-            if (zr) {
+            if (Resident(zr)) {
                 Tiles(start, end, primed,
                       [&](uint64_t e, uint32_t n) { if (gamma) LoadParam(gamma + (e - base), n); },
                       [&](uint64_t e, uint32_t n) {
-                          const dsa::LocalTensor<float> zt = (*zr)[static_cast<uint32_t>(e - start)];
+                          const dsa::LocalTensor<float> zt = zr[static_cast<uint32_t>(e - start)];
                           dsa::Muls(zt, zt, inv, n);
                           if (gamma) UseParam(zt, n, true);
                           dsa::LocalTensor<S> out = qX1.template AllocTensor<S>();
@@ -901,18 +961,21 @@ private:
 
         float InvRms(float sumSq) const { return dsa::VectorInvRms(sumSq, D, eps); }
 
-        // Resident Z for a column-tiled segment (slots 0-1: fragments, 2: the current row)
-        dsa::LocalTensor<float>* Claim(uint32_t n, uint32_t slot) {
-            if (!plan.zResident || used + n > plan.zResident) return nullptr;
-            slots[slot] = res[static_cast<uint32_t>(used)];
+        // Resident Z for a column-tiled segment: a view into `res`, or an empty view when it does
+        // not fit (sweep 2 then recomputes Z)
+        dsa::LocalTensor<float> Claim(uint32_t n) {
+            if (!plan.zResident || used + n > plan.zResident) return {};
+            const dsa::LocalTensor<float> v = res[static_cast<uint32_t>(used)];
             used += n;
-            return &slots[slot];
+            return v;
         }
 
+        static bool Resident(dsa::LocalTensor<float> v) { return v.GetData() != nullptr; }
+
+        // Column tiles: state carried across SyncAll
         size_t used = 0;
         bool primed = false;
-        dsa::LocalTensor<float> slots[3];
-        dsa::LocalTensor<float>* fragZ[2] = {nullptr, nullptr};
+        dsa::LocalTensor<float> fragZ[2];  // The fragments' resident Z (empty: recomputed)
         float fragSum[2] = {0.0f, 0.0f};
     };
 };

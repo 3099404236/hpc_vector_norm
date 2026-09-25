@@ -213,21 +213,18 @@ int main(int argc, char** argv) {
             << std::setw(10) << std::setprecision(2) << tp.modelNs / 1e3;
         if (simulateTarget) {
             Buffer yt = Allocate(N * eb);
+            // Freestanding workers: a sanitizer trap or a DSA_ASSERT aborts the run with its report
             hpc::DaeStats st;
             std::string verdict = "PASS";
-            try {
-                if (dt == DataType::FP32) st = hpc::DaePipeline<hpc::F32>::Execute(static_cast<const float*>(x1.get()), static_cast<const float*>(x2.get()), static_cast<const float*>(gamma.get()), static_cast<const float*>(bias.get()), static_cast<float*>(yt.get()), tc.M, tc.D, 1e-6f, tp);
-                else if (dt == DataType::FP16) st = hpc::DaePipeline<hpc::F16>::Execute(static_cast<const uint16_t*>(x1.get()), static_cast<const uint16_t*>(x2.get()), static_cast<const uint16_t*>(gamma.get()), static_cast<const uint16_t*>(bias.get()), static_cast<uint16_t*>(yt.get()), tc.M, tc.D, 1e-6f, tp);
-                else st = hpc::DaePipeline<hpc::BF16>::Execute(static_cast<const uint16_t*>(x1.get()), static_cast<const uint16_t*>(x2.get()), static_cast<const uint16_t*>(gamma.get()), static_cast<const uint16_t*>(bias.get()), static_cast<uint16_t*>(yt.get()), tc.M, tc.D, 1e-6f, tp);
-                // Both executors round the same FP32 math: allow two units in the last place
-                for (size_t i = 0; i < N && verdict == "PASS"; ++i) {
-                    const double a = Get(dt, y.get(), i), t = Get(dt, yt.get(), i);
-                    if (std::fabs(a - t) > 1e-5 + 2.0 * relTol * std::fabs(a)) verdict = "MISMATCH";
-                }
-                if (verdict == "PASS" && st.spmBytes != tp.layout.Total()) verdict = "SPM != plan";
-            } catch (const std::exception& e) {
-                verdict = std::string("TRAP: ") + e.what();
+            if (dt == DataType::FP32) st = hpc::DaePipeline<hpc::F32>::Execute(static_cast<const float*>(x1.get()), static_cast<const float*>(x2.get()), static_cast<const float*>(gamma.get()), static_cast<const float*>(bias.get()), static_cast<float*>(yt.get()), tc.M, tc.D, 1e-6f, tp);
+            else if (dt == DataType::FP16) st = hpc::DaePipeline<hpc::F16>::Execute(static_cast<const uint16_t*>(x1.get()), static_cast<const uint16_t*>(x2.get()), static_cast<const uint16_t*>(gamma.get()), static_cast<const uint16_t*>(bias.get()), static_cast<uint16_t*>(yt.get()), tc.M, tc.D, 1e-6f, tp);
+            else st = hpc::DaePipeline<hpc::BF16>::Execute(static_cast<const uint16_t*>(x1.get()), static_cast<const uint16_t*>(x2.get()), static_cast<const uint16_t*>(gamma.get()), static_cast<const uint16_t*>(bias.get()), static_cast<uint16_t*>(yt.get()), tc.M, tc.D, 1e-6f, tp);
+            // Both executors round the same FP32 math: allow two units in the last place
+            for (size_t i = 0; i < N && verdict == "PASS"; ++i) {
+                const double a = Get(dt, y.get(), i), t = Get(dt, yt.get(), i);
+                if (std::fabs(a - t) > 1e-5 + 2.0 * relTol * std::fabs(a)) verdict = "MISMATCH";
             }
+            if (verdict == "PASS" && st.spmBytes != tp.layout.Total()) verdict = "SPM != plan";
             row << std::setw(10) << st.vectorCycles << std::setw(8) << st.scalarStalls << std::setw(9) << std::setprecision(1)
                 << st.dmaBytes / 1e6 << std::setw(6) << st.padTransfers << verdict;
         }

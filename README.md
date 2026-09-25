@@ -103,7 +103,8 @@ ctest --output-on-failure
 The public entry point is `hpc::FusedResidualNormalize(x1, x2, gamma, bias, y, rows, cols, dtype, eps)`
 (`include/hpc_vector_norm.hpp`). FP16/BF16 tensors are raw `uint16_t` storage; `gamma`/`bias` may be null.
 The target executor is `hpc::DaePipeline<Codec>::Execute(..., plan)` (`src/kernel_unified.hpp`), with
-`plan = AdaptiveTiler::Plan(M, D, elemBytes, HardwareModel::Target())`.
+`plan = AdaptiveTiler::Plan(M, D, elemBytes, HardwareModel::Target())`. `Execute(..., plan, workspace, bytes)` takes a
+caller-owned, 64-byte-aligned reduction workspace of `DaePipeline<Codec>::WorkspaceBytes(plan, M)` bytes and allocates nothing.
 
 ---
 
@@ -223,7 +224,12 @@ simulated core (`GetCoreIdx`), and everything goes through `include/dsa_runtime.
   - Each core publishes `{Σ₀, 0 ×7}{Σ₁, 0 ×7}` in two 32-byte records.
   - The owners of a row fetch the contiguous record range that holds the row's partials, with zeros in between, and reduce it with one `VectorReduceSum`.
   - The first γ chunk of sweep 2 is already in flight during the `SyncAll`.
-  - Every core reaches the barrier, including one whose sanitizer trapped, so the barrier never deadlocks.
+- **Coordinator and freestanding workers (Challenge 6).**
+  - `DaePipeline::Execute` runs on the calling thread. It checks the plan, owns the reduction workspace (caller-provided, or its own buffer reused across calls) and hands every core a POD `Args`.
+  - Each core runs `Core::Execute` with no heap allocation and no exceptions. Row sums and band columns sit in fixed 128-row arrays on the worker's stack; longer tiles run in groups of 128 rows, and the cycle model counts the groups.
+  - Invariants are `DSA_ASSERT`s, and `LocalTensor` views are passed by value.
+  - A trap aborts the whole process, so no core is ever left waiting at the `SyncAll`.
+  - A heap probe in the tests confirms that `Execute` allocates nothing beyond the simulator's scratchpad buffers.
 - **Exact scratchpad claim.** The kernel claims only the layout's buffers. The previous merge added a 64-byte placeholder Z buffer when a plan has none, which pushed plans that fill the scratchpad to the byte over the waterline. 100,000 × 128 FP32 trapped at 195,648 B, for example. A regression test now runs such a plan.
 - **DMA.** Every transfer is a 32-byte `DataCopy`. `DataCopyPad` is used only where a transfer does not end on a 32-byte block (`D·s % 32 ≠ 0`) or starts off the 32-byte grid.
 - **Results with `--target`.** On all 15 profiles the output matches the host kernel, with 0 scalar stalls and 0 padded transfers. Every core claims exactly its planned scratchpad (at most 191 KB). The runtime's cycle count equals the model's.
@@ -286,8 +292,8 @@ The runtime also gains:
 - per-core DMA byte, transfer and pad counters;
 - a trap when `InitBuffer` asks for more buffers than the queue depth.
 
-Size: `adaptive_tiler.hpp` is 488 lines of code, including the instruction-level cycle model. `kernel_unified.hpp` is 769: the
-host executor is 248 and the DAE executor is 521. The ISA layer adds 105.
+Size: `adaptive_tiler.hpp` is 492 lines of code, including the instruction-level cycle model. `kernel_unified.hpp` is 800: the
+host executor is 248 and the DAE executor is 552. The ISA layer adds 105.
 
 ### Measured results (4-core Cascade Lake VM, AVX-512, ~40 GB/s DRAM)
 

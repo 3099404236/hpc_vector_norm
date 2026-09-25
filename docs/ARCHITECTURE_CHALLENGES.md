@@ -2,7 +2,7 @@
 
 Welcome to the `hpc_vector_norm` performance optimization project!
 
-To achieve theoretical roofline performance without hardcoding specific case branches, we have left **5 major architectural open vectors** for contributors and autonomous AI agents. You are invited to design, mathematically formulate, and implement these solutions.
+To achieve theoretical roofline performance without hardcoding specific case branches, we have left **6 major architectural open vectors** for contributors and autonomous AI agents. You are invited to design, mathematically formulate, and implement these solutions.
 
 Each challenge below has two solutions:
 
@@ -40,7 +40,7 @@ Design an asymmetric or non-power-of-two partitioning algorithm in `AdaptiveTile
 - **Reduction tree without scalar stalls.** Scalar reads of the scratchpad (`GetValue`) cost 500 cycles each, so partial sums only ever meet in vector registers:
   - **Column band.** Each core publishes one record of $M$ partials in 32-byte blocks, then passes one `SyncAll`. Every core then fetches all $P$ records with one DMA and sums them with a fixed tree of vector adds (40 → 20 → 10 → 5 → 3 → 2 → 1, six `Add`s). One `VectorReduceSum` per row then hands each row total to the scalar unit.
   - **Row-major.** Each core publishes two 32-byte records, $\{\Sigma_0, 0^{\times 7}\}$ and $\{\Sigma_1, 0^{\times 7}\}$. The owners of row $r$ are cores $\text{owner}(u_0) \dots \text{owner}(u_1)$ with $\text{owner}(u) = \lfloor ((u+1)P - 1) / U \rfloor$ (`RowOwners`). Owner `first` holds row $r$ as its last fragment and every later owner holds it as its first, so the row's partials are the contiguous record range $[2\,\text{first} + n_{\text{first}} - 1,\ 2\,\text{last}]$, with zero records in between. Each owner fetches that range with one DMA and reduces it with one `VectorReduceSum`.
-  - **Determinism and safety.** Every owner sums the same records in the same order, so all of them compute an identical $\sigma$. Every core reaches the `SyncAll`, including one whose sanitizer trapped, so a fault cannot deadlock the barrier.
+  - **Determinism and safety.** Every owner sums the same records in the same order, so all of them compute an identical $\sigma$. A sanitizer trap or a broken invariant aborts the whole process (Challenge 6), so a fault cannot leave cores waiting at the barrier.
 - **Resident Z.** Sweep 1 keeps FP32 Z in the scratchpad: the whole band for the column band (8 × 832 floats, 26 KB for P05), or up to $\min(\text{share}, 3D)$ elements for row-major fragments. Sweep 2 normalizes from there and reads only γ, so X1/X2 are never read from main memory a second time. In row-major plans, the first γ chunk of sweep 2 is issued before the `SyncAll` and arrives while the core waits.
 - **When to split.** The planner compares the slowest core's modeled time. At 1.5 GHz, P05 costs 28.1 µs with whole rows (only 8 of the 40 cores busy), 14.2 µs with the row-major split and 12.3 µs with the column band. The band wins at every clock from 1.0 to 4.0 GHz. `SyncAll` costs 7500 cycles, which is 72% of the busiest core's 10,365. P05 is the only one of the 15 profiles that splits.
 - **Verified** (`tests/test_dae_pipeline.cpp`):
@@ -207,6 +207,53 @@ Refactor the inner `Core` execution into a freestanding worker routine:
 2. Remove any `throw` statements from `Core`, replacing them with `DSA_ASSERT`.
 3. Accept the pre-allocated reduction workspace buffer passed down from the Coordinator.
 
+### ✅ 40-Core Target Implementation (DAE)
+- **Coordinator** (`DaePipeline::Execute`, on the calling thread).
+  - It receives a finished plan. `AdaptiveTiler::Plan` runs once, on the caller, never in a worker.
+  - It checks the plan and the workspace with `DSA_ASSERT`, zeroes the workspace, and starts one worker per core of the plan.
+  - Each worker receives a POD `Args`: pointers, sizes, `const TilingConfig*` and `float* workspace`.
+  - Each worker writes its cycle tracker and scratchpad claim into its own 64-byte-aligned slot of a fixed `CoreResult[40]` array, which the coordinator then aggregates.
+- **Reduction workspace.** `DaePipeline::WorkspaceBytes(plan, M)` sizes it: one record of partial sums per core, in whole 32-byte blocks, rounded up to 64 bytes. It is 0 for row plans, 2,560 B for row-major Split-D on 40 cores, and 1,280 B for P05's column band. There are two entry points:
+  - `Execute(..., plan, workspace, bytes)` takes a caller-owned, 64-byte-aligned buffer and allocates nothing.
+  - `Execute(..., plan)` uses a buffer that the calling thread allocates the first time a plan needs more, and reuses on every later call.
+- **Worker** (`Core::Execute`, one per simulated core). It is freestanding:
+  - **No heap.**
+    - The row sums (`float sums[128]`) and a band tile's column ranges (`Cols cols[128]`) are fixed arrays on the worker's stack, sized by `AdaptiveTiler::ROW_GROUP = 128`.
+    - A tile of more rows runs in groups of 128 rows. Each group's row sums are all issued before its first scaling, as before.
+    - The cycle model counts the groups, so the tile size stays free. Plans with tiles of at most 128 rows are unchanged, which covers all 15 profiles, and the model still equals the runtime's count on every executed plan.
+    - Of 41,611 scanned plans, only 244 change (M ≥ 65,536, D ≤ 100, tiles of 137 rows or more), by at most ±0.2% of modeled time. Capping tiles at 128 rows instead would have cost these plans up to 13%.
+  - **No exceptions.**
+    - The worker's two invariants are `DSA_ASSERT`s: its OpenMP team has the plan's core count, and its column band fits the plan's pitch.
+    - The coordinator's preconditions (a DAE plan, and a valid workspace) are `DSA_ASSERT`s too.
+    - There is no `try`/`catch`, and no error strings are passed between threads.
+    - A trap aborts the whole process, so a fault can never leave cores waiting at the `SyncAll`.
+  - **Value semantics.** Every `LocalTensor` is passed and returned by value. The column tiles' resident-Z claim returns a view instead of a `LocalTensor*` into a slot array; an empty view means "recompute Z".
+  - **No M-sized state.**
+    - The column band no longer collects all `M` row sums. Each tile's partials go into the core's record as they arrive (`SetValue`, no stall).
+    - After the barrier, each tile reduces only its own rows' totals.
+    - The instruction count is unchanged.
+  - **Stack.** A worker uses about 3 KB of stack (`-fstack-usage`): 1.1 KB for the OpenMP region frame, which holds `Core`, and 1.9 KB for the band's phase 1 with its two arrays.
+- **Verified** (`tests/test_dae_pipeline.cpp`):
+  - **Heap probe.** The test replaces the global `operator new` and counts its calls during `Execute`. The cases are row tiles, tiles of more than one row group, long-row column tiles, the column band and row-major Split-D, each in FP32/FP16/BF16.
+    - Each count is exactly `blocks × (TPipe buffers of the layout)`. These are the simulator's own scratchpad blocks: `dsa_runtime` backs each `InitBuffer` with a `std::vector`.
+    - The coordinator and the workers add none.
+  - **Both entry points.** The caller-owned workspace and the coordinator's own give bit-identical Y and identical statistics.
+  - **Death tests.** The test binary re-runs itself once per case, and each case must abort with a `[DSA Hardware Trap]` that names the violation:
+    - a host plan;
+    - a workspace off the 64-byte grid;
+    - a nested region that starts one thread for 40 cores;
+    - a band pitch below the band width.
+  - **Long tiles.** All of these match the FP64 reference and the cycle model: row tiles of 137–138 rows (the planner's own choice for 65,536 × 24), row tiles of 300–594 rows, and a 300-row band tile.
+- **Still in `include/dsa_runtime.hpp`.**
+  - The runtime still reports its own sanitizer traps with `throw` (`TPipe`, `TQue`, `DataCopy`), which `tests/test_dsa_runtime.cpp` catches. Inside a worker, such a trap now terminates the process, just as a `DSA_ASSERT` does. The test's abort handler then names the run in progress.
+  - A `-fno-exceptions` build would need these traps routed through `DSA_ASSERT` as well.
+
+### ✅ CPU Implementation
+- The host workers (`KernelUnifiedPipeline::Worker`) already follow the same rules:
+  - Batch sums and Split-D partials are fixed arrays (`double sums[64]`, and `RowPartial parts[40]` on the caller).
+  - Nothing in the parallel region throws.
+  - The resident-Z scratchpad (191 KB) is allocated once per thread, on that thread's first call, and reused afterwards.
+
 ---
 
 ## 📏 Cost Model & Methodology
@@ -254,10 +301,21 @@ The host constants were measured on the reference CI host, a 4-core Cascade Lake
 ### Tests
 
 - **`tests/test_correctness.cpp`** forces every host plan variant (Split-D, streaming, recomputed Z) with 1–40 threads against an FP64 reference. It also checks for writes outside Y and for bitwise-identical results across serpentine directions.
-- **`tests/test_dae_pipeline.cpp`** (52,630 checks):
+- **`tests/test_dae_pipeline.cpp`** (52,724 checks):
   - It checks the invariants of the 15 full-size target plans, and of 2,448 more shapes in every forced mode.
   - It runs a plan that fills the scratchpad to the byte (195,584 B).
-  - It runs model-chosen, rows, row-major Split-D and column-band plans of 19 shapes through the DAE runtime: with and without γ/β, on aligned and offset bases, in FP32/FP16/BF16.
+  - It runs model-chosen, rows, row-major Split-D and column-band plans of 20 shapes through the DAE runtime: with and without γ/β, on aligned and offset bases, in FP32/FP16/BF16. It also runs plans whose tiles span several row groups.
   - Every run must match an FP64 reference and leave canaries around Y intact. It must have zero scalar stalls, one `SyncAll` exactly when split, a scratchpad claim equal to the plan, the planner's cycle count, and zero padded transfers wherever rows end on 32-byte blocks.
-  - Mutations it catches (failed checks): an unplanned 64-byte buffer (467), one `GetValue` per row (839), a wrong gather tree (288), an off-by-one record range (439), missing γ/β replication (354).
+  - Challenge 6 checks: a heap probe (`operator new` during `Execute`), bit-identical results from both workspace entry points, and death tests for every `DSA_ASSERT`. A trap aborts the run and reports which run was in progress.
+  - Mutations it catches (failed checks):
+    - an unplanned 64-byte buffer (the waterline plan aborts with the runtime's overflow trap; 483 without that plan);
+    - one `GetValue` per row (1,431);
+    - a wrong gather tree (270);
+    - an off-by-one record range (442);
+    - missing γ/β replication (378);
+    - a heap `std::vector` for the row sums (6);
+    - `throw` instead of `DSA_ASSERT` (1);
+    - the team-size `DSA_ASSERT` removed (1);
+    - a cycle model without row groups (15);
+    - wrong row-group offsets (18 and 6).
 - **`tests/test_dsa_runtime.cpp`** (`ctest -R dsa_runtime_sanitizer`) checks every sanitizer trap, including the new queue-lifecycle, address-alignment and `DataCopyPad` checks.
