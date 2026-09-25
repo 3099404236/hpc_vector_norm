@@ -43,8 +43,8 @@ inline float* ThreadScratch(size_t floats) {
 // A null tensor becomes a stride-0 constant (mask 0) so the hot loops stay branch-free.
 template <class PC> struct Params {
     const typename PC::S *b, *g;
-    size_t bm, gm;
-    Params At(uint32_t cb) const { return {b + (cb & bm), g + (cb & gm), bm, gm}; }
+    size_t bMask, gMask;
+    Params At(uint32_t cb) const { return {b + (cb & bMask), g + (cb & gMask), bMask, gMask}; }
 };
 
 // -----------------------------------------------------------------------------
@@ -58,8 +58,8 @@ template <class C, class PC, bool kKeep, bool kPrefetch>
 double SumSquares(const typename C::S* x1, const typename C::S* x2, const Params<PC>& p, float* z, uint32_t n) {
     using namespace simd;
     const auto* b = p.b; // Locals: the Z stores cannot alias them, so they stay in registers
-    const size_t bm = p.bm;
-    auto zAt = [&](uint32_t c) { return Add(Add(Load(C{}, x1 + c), Load(C{}, x2 + c)), Load(PC{}, b + (c & bm))); };
+    const size_t bMask = p.bMask;
+    auto zAt = [&](uint32_t c) { return Add(Add(Load(C{}, x1 + c), Load(C{}, x2 + c)), Load(PC{}, b + (c & bMask))); };
     double total = 0.0;
     for (uint32_t c = 0; c < n;) {
         const uint32_t e = std::min(n, c + 4096u);
@@ -90,7 +90,7 @@ double SumSquares(const typename C::S* x1, const typename C::S* x2, const Params
         }
         if (c < e) { // Masked tail: padding lanes load as 0 and add nothing
             const uint32_t k = e - c;
-            const V v = Add(Add(LoadN(C{}, x1 + c, k), LoadN(C{}, x2 + c, k)), LoadN(PC{}, b + (c & bm), k));
+            const V v = Add(Add(LoadN(C{}, x1 + c, k), LoadN(C{}, x2 + c, k)), LoadN(PC{}, b + (c & bMask), k));
             if (kKeep) StoreN(F32{}, z + c, v, k);
             a1 = Fma(v, v, a1);
             c = e;
@@ -110,16 +110,16 @@ void Normalize(const typename C::S* x1, const typename C::S* x2, const Params<PC
     using namespace simd;
     using S = typename C::S;
     const auto *b = p.b, *g = p.g;
-    const size_t bm = p.bm, gm = p.gm;
+    const size_t bMask = p.bMask, gMask = p.gMask;
     const V s = Set1(invRms);
     auto out = [&](uint32_t c) {
-        const V zv = kKeep ? Load(F32{}, z + c) : Add(Add(Load(C{}, x1 + c), Load(C{}, x2 + c)), Load(PC{}, b + (c & bm)));
-        return Mul(Mul(zv, s), Load(PC{}, g + (c & gm)));
+        const V zv = kKeep ? Load(F32{}, z + c) : Add(Add(Load(C{}, x1 + c), Load(C{}, x2 + c)), Load(PC{}, b + (c & bMask)));
+        return Mul(Mul(zv, s), Load(PC{}, g + (c & gMask)));
     };
     auto outN = [&](uint32_t c, uint32_t k) {
         const V zv = kKeep ? LoadN(F32{}, z + c, k)
-                           : Add(Add(LoadN(C{}, x1 + c, k), LoadN(C{}, x2 + c, k)), LoadN(PC{}, b + (c & bm), k));
-        return Mul(Mul(zv, s), LoadN(PC{}, g + (c & gm), k));
+                           : Add(Add(LoadN(C{}, x1 + c, k), LoadN(C{}, x2 + c, k)), LoadN(PC{}, b + (c & bMask), k));
+        return Mul(Mul(zv, s), LoadN(PC{}, g + (c & gMask), k));
     };
     uint32_t c = 0;
     if (kStream) { // Peel up to the vector alignment that streaming stores require
@@ -240,7 +240,7 @@ private:
                 if (j.bias) WidenTo<C>(j.bias, scratch, D);
                 if (j.gamma) WidenTo<C>(j.gamma, scratch + D, D);
                 const Params<F32> p32{j.bias ? scratch : ParamDefaults<F32>::kZero.data(),
-                                      j.gamma ? scratch + D : ParamDefaults<F32>::kOne.data(), p16.bm, p16.gm};
+                                      j.gamma ? scratch + D : ParamDefaults<F32>::kOne.data(), p16.bMask, p16.gMask};
                 return Run<kStream>(j, p32, tid, nt, parts, frag, nFrag, rA, rZ, scratch + 2 * D, cap - 2 * D);
             }
         }
