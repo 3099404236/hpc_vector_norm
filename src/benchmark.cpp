@@ -1,5 +1,6 @@
 #include "hpc_vector_norm.hpp"
 #include "adaptive_tiler.hpp"
+#include "kernel_unified.hpp"
 #include <omp.h>
 #include <algorithm>
 #include <chrono>
@@ -9,6 +10,7 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -68,7 +70,11 @@ const char* SimdName() {
 } // namespace
 
 int main(int argc, char** argv) {
-    const bool legacyFp32 = argc > 1 && std::string(argv[1]) == "--fp32";
+    bool legacyFp32 = false, simulateTarget = false;
+    for (int a = 1; a < argc; ++a) {
+        legacyFp32 |= std::string(argv[a]) == "--fp32";
+        simulateTarget |= std::string(argv[a]) == "--target";
+    }
     const uint32_t P = std::min<uint32_t>(hpc::AdaptiveTiler::MAX_THREADS, omp_get_max_threads());
     const size_t llc = hpc::AdaptiveTiler::LastLevelCacheBytes();
 
@@ -110,6 +116,7 @@ int main(int argc, char** argv) {
     std::cout << std::string(104, '-') << "\n";
 
     using Clock = std::chrono::steady_clock;
+    std::vector<std::string> targetRows;
     for (const auto& tc : testCases) {
         const DataType dt = legacyFp32 ? DataType::FP32 : tc.dtype;
         const size_t eb = ElemBytes(dt), N = static_cast<size_t>(tc.M) * tc.D;
@@ -168,7 +175,7 @@ int main(int argc, char** argv) {
 
         const double targetUs = tc.targetUs * tc.M / tc.targetM;
         const double gbps = (3.0 * N + 2.0 * tc.D) * eb / (latencyUs * 1e3);
-        const hpc::TilingConfig plan = hpc::AdaptiveTiler::Plan(tc.M, tc.D, static_cast<uint32_t>(eb), P, llc);
+        const hpc::TilingConfig plan = hpc::AdaptiveTiler::Plan(tc.M, tc.D, static_cast<uint32_t>(eb), hpc::HardwareModel::Host(P), llc);
         const std::string planStr = std::to_string(plan.threads) + "T " +
             (plan.mode == hpc::TilingMode::SPLIT_D ? "split" : "rows") + (plan.streamStores ? " NT" : "");
 
@@ -184,8 +191,49 @@ int main(int argc, char** argv) {
                   << std::setw(14) << planStr
                   << (latencyUs <= targetUs ? "TOP 1 🏆" : "OPTIMIZING")
                   << "\n";
+
+        // 3. The deployment plan for the same tensor on the 40-core target, optionally executed
+        //    through the DAE hardware simulation (sanitizer on) and checked against the reference
+        const hpc::TilingConfig tp = hpc::AdaptiveTiler::Plan(tc.M, tc.D, static_cast<uint32_t>(eb), hpc::HardwareModel::Target());
+        const uint64_t busiest = hpc::AdaptiveTiler::MaxLoad(N, tp.unitElems, tp.blocks);
+        const uint64_t lightest = tp.units / tp.blocks * tp.unitElems;
+        std::ostringstream row;
+        row << std::left << std::setw(18) << tc.name << std::setw(7) << (tp.mode == hpc::TilingMode::SPLIT_D ? "split" : "rows")
+            << std::setw(7) << tp.blocks
+            << std::setw(10) << (tp.mode == hpc::TilingMode::SPLIT_D ? std::to_string(tp.unitElems * eb) + " B" : std::to_string(tp.unitElems / tc.D) + " row")
+            << std::setw(24) << (std::to_string(busiest) + " (min " + std::to_string(std::min(busiest, lightest)) + ")")
+            << std::setw(14) << (tp.tileRows ? std::to_string(tp.tileRows) + (tp.tileRows == 1 ? " row" : " rows")
+                                             : std::to_string(tp.tileElems) + " el" + (tp.zResident ? " +Z" : ""))
+            << std::setw(10) << std::fixed << std::setprecision(1) << tp.layout.Total() / 1024.0;
+        if (simulateTarget) {
+            Buffer yt = Allocate(N * eb);
+            hpc::DaeStats st;
+            std::string verdict = "PASS";
+            try {
+                if (dt == DataType::FP32) st = hpc::DaePipeline<hpc::F32>::Execute(static_cast<const float*>(x1.get()), static_cast<const float*>(x2.get()), static_cast<const float*>(gamma.get()), static_cast<const float*>(bias.get()), static_cast<float*>(yt.get()), tc.M, tc.D, 1e-6f, tp);
+                else if (dt == DataType::FP16) st = hpc::DaePipeline<hpc::F16>::Execute(static_cast<const uint16_t*>(x1.get()), static_cast<const uint16_t*>(x2.get()), static_cast<const uint16_t*>(gamma.get()), static_cast<const uint16_t*>(bias.get()), static_cast<uint16_t*>(yt.get()), tc.M, tc.D, 1e-6f, tp);
+                else st = hpc::DaePipeline<hpc::BF16>::Execute(static_cast<const uint16_t*>(x1.get()), static_cast<const uint16_t*>(x2.get()), static_cast<const uint16_t*>(gamma.get()), static_cast<const uint16_t*>(bias.get()), static_cast<uint16_t*>(yt.get()), tc.M, tc.D, 1e-6f, tp);
+                // Both executors round the same FP32 math: allow two units in the last place
+                for (size_t i = 0; i < N && verdict == "PASS"; ++i) {
+                    const double a = Get(dt, y.get(), i), t = Get(dt, yt.get(), i);
+                    if (std::fabs(a - t) > 1e-5 + 2.0 * relTol * std::fabs(a)) verdict = "MISMATCH";
+                }
+            } catch (const std::exception& e) {
+                verdict = std::string("TRAP: ") + e.what();
+            }
+            row << std::setw(10) << std::setprecision(1) << st.dmaBytes / 1e6 << std::setw(7) << st.padTransfers << verdict;
+        }
+        targetRows.push_back(row.str());
     }
 
+    std::cout << std::string(104, '=') << "\n";
+    std::cout << "\nTarget deployment plan (HardwareModel::Target(): 40 cores, 32-byte DMA blocks, 191 KB scratchpad/core)"
+              << (simulateTarget ? ", executed on the DAE simulation" : "") << "\n";
+    std::cout << std::left << std::setw(18) << "Case Name" << std::setw(7) << "Mode" << std::setw(7) << "Cores"
+              << std::setw(10) << "Unit" << std::setw(24) << "Busiest core (elems)" << std::setw(14) << "Tile"
+              << std::setw(10) << "SPM (KB)" << (simulateTarget ? "DMA (MB)  Pads   Sanitizer / result" : "") << "\n";
+    std::cout << std::string(104, '-') << "\n";
+    for (const auto& r : targetRows) std::cout << r << "\n";
     std::cout << std::string(104, '=') << "\n";
     std::cout << "All benchmark tests completed successfully.\n";
     return 0;

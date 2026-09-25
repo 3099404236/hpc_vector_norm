@@ -1,9 +1,36 @@
 #include "dsa_runtime.hpp"
 #include <iostream>
 #include <cassert>
+#include <cstdlib>
 #include <vector>
 
 using namespace dsa;
+
+// Global-memory buffers on the 32-byte DMA block boundary (alignas on a std::vector
+// object does not align its heap storage)
+template <typename T>
+struct GmAllocator {
+    using value_type = T;
+    GmAllocator() = default;
+    template <typename U> GmAllocator(const GmAllocator<U>&) {}
+    T* allocate(size_t n) { return static_cast<T*>(std::aligned_alloc(64, (n * sizeof(T) + 63) / 64 * 64)); }
+    void deallocate(T* p, size_t) { std::free(p); }
+    template <typename U> bool operator==(const GmAllocator<U>&) const { return true; }
+    template <typename U> bool operator!=(const GmAllocator<U>&) const { return false; }
+};
+template <typename T> using GmVector = std::vector<T, GmAllocator<T>>;
+
+template <typename F>
+bool ExpectTrap(const char* what, F body) {
+    try {
+        body();
+    } catch (const std::exception& e) {
+        std::cout << "PASS: " << what << ":\n  --> " << e.what() << "\n";
+        return true;
+    }
+    std::cerr << "FAIL: Sanitizer did not trap: " << what << "\n";
+    return false;
+}
 
 // -----------------------------------------------------------------------------
 // High-Performance DAE Stream Pipeline Kernel running seamlessly on CPU
@@ -56,8 +83,8 @@ int main() {
     std::cout << "=================================================================\n";
 
     constexpr uint32_t ELEMS = 2048;
-    alignas(32) std::vector<float> input(ELEMS, 2.0f);
-    alignas(32) std::vector<float> output(ELEMS, 0.0f);
+    GmVector<float> input(ELEMS, 2.0f);
+    GmVector<float> output(ELEMS, 0.0f);
 
     SampleDaePipelineKernel kernel;
     kernel.Process(input.data(), output.data(), ELEMS);
@@ -103,6 +130,91 @@ int main() {
     } catch (const std::exception& e) {
         std::cout << "PASS: Caught unaligned DMA fault successfully:\n  --> " << e.what() << "\n";
     }
+
+    // -------------------------------------------------------------------------
+    // Test 4: Double buffering keeps the in-flight tile intact (prefetch tile k+1
+    // before tile k is consumed)
+    // -------------------------------------------------------------------------
+    std::cout << "\n[Testing Double-Buffer Slot Lifecycle]...\n";
+    {
+        GmVector<float> a(8, 1.0f), b(8, 2.0f);
+        TPipe dbPipe;
+        TQue<QuePosition::VECIN, 2> dq;
+        dbPipe.InitBuffer(dq, 2, 8 * sizeof(float));
+        LocalTensor<float> t0 = dq.AllocTensor<float>();
+        DataCopy(t0, a.data(), 8);
+        dq.EnQue(t0);
+        LocalTensor<float> t1 = dq.AllocTensor<float>();  // prefetch into the second buffer
+        DataCopy(t1, b.data(), 8);
+        dq.EnQue(t1);
+        LocalTensor<float> c0 = dq.DeQue<float>();
+        LocalTensor<float> c1 = dq.DeQue<float>();
+        if (t0.GetData() == t1.GetData() || c0[0] != 1.0f || c1[0] != 2.0f) {
+            std::cerr << "FAIL: prefetched tile overwrote the tile in flight\n";
+            return 1;
+        }
+        dq.FreeTensor(c0);
+        dq.FreeTensor(c1);
+        std::cout << "PASS: tiles 0/1 in distinct buffers, FIFO order kept\n";
+    }
+    bool ok = true;
+    ok &= ExpectTrap("third AllocTensor on a 2-buffer queue without FreeTensor", [] {
+        TPipe p;
+        TQue<QuePosition::VECIN, 2> q2;
+        p.InitBuffer(q2, 2, 64);
+        q2.AllocTensor<float>();
+        q2.AllocTensor<float>();
+        q2.AllocTensor<float>();
+    });
+    ok &= ExpectTrap("FreeTensor on a tile still enqueued", [] {
+        TPipe p;
+        TQue<QuePosition::VECIN, 2> q2;
+        p.InitBuffer(q2, 2, 64);
+        LocalTensor<float> t = q2.AllocTensor<float>();
+        q2.EnQue(t);
+        q2.FreeTensor(t);
+    });
+
+    // -------------------------------------------------------------------------
+    // Test 5: DMA address alignment (size is a whole block, address is not)
+    // -------------------------------------------------------------------------
+    std::cout << "\n[Testing Sanitizer Guard: DMA Address Alignment]...\n";
+    ok &= ExpectTrap("DataCopy from an address 4 bytes past a block boundary", [&] {
+        TPipe p;
+        TQue<QuePosition::VECIN, 1> q1;
+        p.InitBuffer(q1, 1, 256);
+        LocalTensor<float> t = q1.AllocTensor<float>();
+        DataCopy(t, input.data() + 1, 8);
+    });
+
+    // -------------------------------------------------------------------------
+    // Test 6: DataCopyPad moves a 20-byte tail and zero-fills the rest of the block
+    // -------------------------------------------------------------------------
+    std::cout << "\n[Testing DataCopyPad]...\n";
+    {
+        TPipe p;
+        TQue<QuePosition::VECIN, 1> q1;
+        p.InitBuffer(q1, 1, 64);
+        LocalTensor<float> t = q1.AllocTensor<float>();
+        const uint64_t pads = g_cycleTracker.padTransfers;
+        DataCopyPad(t, input.data() + 3, 5);
+        if (t[4] != 2.0f || t[5] != 0.0f || t[7] != 0.0f || g_cycleTracker.padTransfers != pads + 1) {
+            std::cerr << "FAIL: DataCopyPad did not move/pad the tail\n";
+            return 1;
+        }
+        std::cout << "PASS: 20-byte padded transfer\n";
+    }
+
+    // -------------------------------------------------------------------------
+    // Test 7: Scratchpad budget counts blocks, and buffer counts must fit the queue
+    // -------------------------------------------------------------------------
+    ok &= ExpectTrap("InitBuffer with more buffers than the queue depth", [] {
+        TPipe p;
+        TQue<QuePosition::VECIN, 1> q1;
+        p.InitBuffer(q1, 2, 64);
+    });
+
+    if (!ok) return 1;
 
     std::cout << "\n=================================================================\n";
     std::cout << "  ALL DAE Stream Pipeline Runtime tests PASSED with 100% integrity!\n";

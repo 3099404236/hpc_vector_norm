@@ -53,7 +53,14 @@ add_executable(test_dsa_runtime
 target_include_directories(test_dsa_runtime PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(test_dsa_runtime PRIVATE OpenMP::OpenMP_CXX)
 
+add_executable(test_dae_pipeline
+    tests/test_dae_pipeline.cpp
+)
+target_include_directories(test_dae_pipeline PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(test_dae_pipeline PRIVATE hpc_vector_norm)
+
 enable_testing()
 add_test(NAME correctness COMMAND hpc_vector_norm_test)
 add_test(NAME dsa_runtime_sanitizer COMMAND test_dsa_runtime)
+add_test(NAME dae_pipeline COMMAND test_dae_pipeline)
 

@@ -109,13 +109,11 @@ void RunShape(uint32_t M, uint32_t D, std::mt19937& rng) {
                             omp_set_num_threads(threads);
                             FusedResidualNormalize(bx1.p, bx2.p, g, b, by.p, M, D, TypeOf<C>(), 1e-6f);
                         } else {
-                            TilingConfig cfg = AdaptiveTiler::Plan(M, D, sizeof(S), threads, AdaptiveTiler::LastLevelCacheBytes());
-                            cfg.threads = threads;
-                            if (v.split) {
-                                cfg.mode = TilingMode::SPLIT_D;
-                                cfg.unitElems = std::max<uint32_t>(1, AdaptiveTiler::LINE_BYTES / sizeof(S));
-                                cfg.unitsPerRow = (D + cfg.unitElems - 1) / cfg.unitElems;
-                            }
+                            const HardwareModel hw = HardwareModel::Host(threads);
+                            const size_t llc = AdaptiveTiler::LastLevelCacheBytes();
+                            TilingConfig cfg = v.split ? AdaptiveTiler::Build(M, D, sizeof(S), hw, TilingMode::SPLIT_D, true, llc)
+                                                       : AdaptiveTiler::Plan(M, D, sizeof(S), hw, llc);
+                            cfg.threads = threads;  // Force the team even where the model runs inline
                             cfg.streamStores = cfg.streamStores || v.stream;
                             if (v.cap) cfg.residentElems = v.cap;
                             KernelUnifiedPipeline<C>::ExecutePlan(bx1.p, bx2.p, g, b, by.p, M, D, 1e-6f, cfg);
@@ -175,13 +173,10 @@ void RunNaN() {  // A NaN input poisons exactly its own row, through every narro
     x1[3 * D + 7] = Enc<C>(std::nanf(""));
     for (int threads : {1, 4}) {
         for (bool split : {false, true}) {
-            TilingConfig cfg = AdaptiveTiler::Plan(M, D, sizeof(S), threads, AdaptiveTiler::LastLevelCacheBytes());
+            const HardwareModel hw = HardwareModel::Host(threads);
+            TilingConfig cfg = split ? AdaptiveTiler::Build(M, D, sizeof(S), hw, TilingMode::SPLIT_D, true)
+                                     : AdaptiveTiler::Plan(M, D, sizeof(S), hw);
             cfg.threads = threads;
-            if (split) {
-                cfg.mode = TilingMode::SPLIT_D;
-                cfg.unitElems = std::max<uint32_t>(1, AdaptiveTiler::LINE_BYTES / sizeof(S));
-                cfg.unitsPerRow = (D + cfg.unitElems - 1) / cfg.unitElems;
-            }
             KernelUnifiedPipeline<C>::ExecutePlan(x1.data(), x2.data(), g.data(), nullptr, y.data(), M, D, 1e-6f, cfg);
             ++g_checks;
             bool ok = true;
