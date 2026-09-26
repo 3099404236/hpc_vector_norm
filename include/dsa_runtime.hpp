@@ -50,16 +50,6 @@
     } while (0)
 #endif
 
-#ifndef __gm__
-#define __gm__
-#endif
-
-#ifndef __aicore__
-#define __aicore__
-#endif
-
-using GM_ADDR = void*;
-
 namespace dsa {
 
 #ifndef DAE_HALF_DEFINED
@@ -899,7 +889,9 @@ public:
 // Allows direct static local tensor allocation without FIFO queue sequencer tax.
 // -----------------------------------------------------------------------------
 namespace Hardware {
-    struct UB {};
+    struct Scratchpad {};
+    using SPM = Scratchpad;
+    using UB = Scratchpad; // Unified Scratchpad Buffer
 }
 
 template <typename TargetSpace = Hardware::UB>
