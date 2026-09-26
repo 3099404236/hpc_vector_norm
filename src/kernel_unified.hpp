@@ -325,16 +325,112 @@ private:
 // fold partition); and the worker has no scalar integer-to-float unit, so the coordinator
 // passes invD = 1 / D at launch.
 //
-// DAE v1.5 [ARCH CHALLENGE 8]: every TQue lifecycle step costs the queue sequencer 625 cycles.
-// A core whose share is a single small tile (AdaptiveTiler::DirectFits) runs DirectCore instead:
-// static LocalMemAllocator buffers and scoreboard flags, no queue at all. Its row sums go through
-// the 64-lane ReduceSum on zero-padded rows and its inverse RMS stays in the vector unit (Rsqrt,
-// Newton-Raphson, Brcb). The kernel launch frame holds only 64-bit addresses and 32-bit scalars
-// (Trap #409), and every result reaches the egress channel through a V -> MTE3 flag.
+// DAE v1.5 [ARCH CHALLENGE 8]: every TQue lifecycle step costs the queue sequencer 625 cycles, so
+// no kernel takes one. The streaming kernel's X1/X2, gamma/beta chunks and egress buffers are
+// static rings (BufferRing) ordered by scoreboard flags. A core whose share fits the direct kernel's
+// static buffers (AdaptiveTiler::DirectFits) runs DirectCore where the planner models it faster:
+// LocalMemAllocator buffers, its row sums through the 64-lane ReduceSum on zero-padded rows, its
+// inverse RMS in the vector unit (Rsqrt, Newton-Raphson, Brcb). Row tiles can take the same inverse
+// RMS a row group at a time (laneRms). The kernel launch frame holds only 64-bit addresses and 32-bit
+// scalars (Trap #409), and every result reaches the egress channel through a V -> MTE3 flag.
 // =============================================================================
+// Static buffer ring [ARCH CHALLENGE 8]: `n` slots carved from static TBufs, handed out the way a
+// TQue hands out its buffers (Alloc: the lowest free slot; DeQue: the oldest enqueued one), so a
+// kernel keeps every schedule and every timeline of its TQue version. None of it runs on the queue
+// sequencer (a TQue lifecycle step costs 625 cycles): the slot bookkeeping is the kernel's own, and
+// scoreboard event flags order the pipes, one literal event ID per slot. READY passes a slot's data
+// from its producer to its consumer, RELEASE hands the slot back to be overwritten; every flag set
+// is waited exactly once. The TQue sanitizer's lifecycle traps are DSA_ASSERTs here. WAYS buffers
+// share each slot's lifecycle: X1 and X2 of a tile travel together.
+template <dsa::QuePosition POS, uint32_t WAYS, dsa::HardEvent READY, dsa::HardEvent RELEASE>
+class BufferRing {
+public:
+    static constexpr uint32_t MAX_SLOTS = 4;  // EVENT_ID0..EVENT_ID3
+
+    // `slots` buffers of `slotBytes` per way, on event IDs [firstEvent, firstEvent + slots)
+    void Init(dsa::TPipe& pipe, uint32_t slots, uint32_t slotBytes, uint32_t firstEvent) {
+        DSA_ASSERT(slots >= 1 && firstEvent + slots <= MAX_SLOTS, "[BufferRing]: a slot needs a literal event ID of its own (EVENT_ID0..EVENT_ID3)");
+        n = slots, event0 = firstEvent, head = queued = 0;
+        stride = (slotBytes + dsa::DMA_ALIGN_BYTES - 1) / dsa::DMA_ALIGN_BYTES * dsa::DMA_ALIGN_BYTES;
+        for (uint32_t w = 0; w < WAYS; ++w) {
+            pipe.InitBuffer(buf[w], size_t(n) * stride);
+            base[w] = buf[w].template Get<uint8_t>().GetData();
+        }
+        for (uint32_t s = 0; s < MAX_SLOTS; ++s) state[s] = FREE, released[s] = false;
+    }
+
+    template <class T>
+    dsa::LocalTensor<T> View(uint32_t slot, uint32_t way = 0) const {
+        return dsa::LocalTensor<T>(reinterpret_cast<T*>(base[way] + size_t(slot) * stride), stride / sizeof(T), stride, POS);
+    }
+
+    // The lowest free slot, once its previous contents are released
+    uint32_t Alloc() {
+        for (uint32_t s = 0; s < n; ++s) {
+            if (state[s] != FREE) continue;
+            if (released[s]) {
+                dsa::WaitFlag<RELEASE>(Event(s));
+                released[s] = false;
+            }
+            state[s] = ALLOCATED;
+            return s;
+        }
+        DSA_ASSERT(false, "[BufferRing]: every slot is in use (allocation beyond the ring's depth)");
+        return 0;
+    }
+    // The slot's data is issued: its consumer may take it in FIFO order
+    void EnQue(uint32_t slot) {
+        DSA_ASSERT(slot < n && state[slot] == ALLOCATED, "[BufferRing]: EnQue of a slot that is not allocated");
+        state[slot] = ENQUEUED;
+        fifo[(head + queued++) % MAX_SLOTS] = slot;
+        dsa::SetFlag<READY>(Event(slot));
+    }
+    uint32_t DeQue() {
+        DSA_ASSERT(queued > 0, "[BufferRing]: DeQue on an empty ring");
+        const uint32_t slot = fifo[head];
+        head = (head + 1) % MAX_SLOTS, --queued;
+        state[slot] = DEQUEUED;
+        dsa::WaitFlag<READY>(Event(slot));
+        return slot;
+    }
+    // A slot used on the spot, outside the FIFO: its data is ready for its consumer
+    void Landed(uint32_t slot) {
+        DSA_ASSERT(slot < n && state[slot] == ALLOCATED, "[BufferRing]: a slot used on the spot must be allocated");
+        dsa::CrossPipe<READY>(Event(slot));
+    }
+    void Free(uint32_t slot) {
+        DSA_ASSERT(slot < n && (state[slot] == ALLOCATED || state[slot] == DEQUEUED),
+                   "[BufferRing]: freeing a slot that is free or still in flight");
+        state[slot] = FREE, released[slot] = true;
+        dsa::SetFlag<RELEASE>(Event(slot));
+    }
+    // End of the kernel: every slot consumed and freed, every release flag waited
+    void Drain() {
+        DSA_ASSERT(queued == 0, "[BufferRing]: a slot was enqueued and never taken");
+        for (uint32_t s = 0; s < n; ++s) {
+            DSA_ASSERT(state[s] == FREE, "[BufferRing]: a slot is still in use at the end of the kernel");
+            if (released[s]) {
+                dsa::WaitFlag<RELEASE>(Event(s));
+                released[s] = false;
+            }
+        }
+    }
+
+private:
+    enum : uint8_t { FREE, ALLOCATED, ENQUEUED, DEQUEUED };
+    uint8_t Event(uint32_t slot) const { return static_cast<uint8_t>(dsa::EVENT_ID0 + event0 + slot); }
+
+    dsa::TBuf<POS> buf[WAYS];
+    uint8_t* base[WAYS] = {};
+    uint32_t n = 0, stride = 0, event0 = 0, head = 0, queued = 0;
+    uint8_t state[MAX_SLOTS] = {};
+    uint32_t fifo[MAX_SLOTS] = {};
+    bool released[MAX_SLOTS] = {};  // A RELEASE flag is set and not yet waited
+};
+
 struct DaeStats {
     uint64_t vectorCycles = 0;  // Busiest core: vector + scalar stalls + barriers + queue sequencer
-    uint64_t queueCycles = 0;   // Most TQue sequencer cycles of any core (0: direct kernel)
+    uint64_t queueCycles = 0;   // Most TQue sequencer cycles of any core (no kernel takes a TQue step)
     uint64_t dmaBytes = 0;      // All cores
     uint64_t dmaTransfers = 0;
     uint64_t padTransfers = 0;  // Transfers that were not whole 32-byte blocks
@@ -482,6 +578,26 @@ private:
         else dsa::DataCopyPad(dst, src, Descriptor<T>(n));
     }
 
+    // inv = 1 / sqrt(sums * invD + eps) for k rows in vector lanes, never through the scalar unit:
+    // the Rsqrt table value, refined by Newton-Raphson, inv *= 1.5 - (mean / 2) inv^2, as many steps
+    // as the output's precision needs (AdaptiveTiler::NewtonSteps). `sums` ends up holding -mean / 2
+    // (`mean` may be `sums` itself); `nr` is scratch. AdaptiveTiler::LaneRmsCycles counts it.
+    static void LaneInvRms(dsa::LocalTensor<float> sums, dsa::LocalTensor<float> mean, dsa::LocalTensor<float> inv,
+                           dsa::LocalTensor<float> nr, uint32_t k, float invD, float eps) {
+        dsa::Muls(mean, sums, invD, k);
+        dsa::Adds(mean, mean, eps, k);
+        dsa::Rsqrt(inv, mean, k);
+        const uint32_t steps = AdaptiveTiler::NewtonSteps(sizeof(S));
+        if (!steps) return;
+        dsa::Muls(sums, mean, -0.5f, k);  // -mean / 2, in the lanes of the spent row sums
+        for (uint32_t i = 0; i < steps; ++i) {
+            dsa::Mul(nr, inv, inv, k);
+            dsa::Mul(nr, nr, sums, k);
+            dsa::Adds(nr, nr, 1.5f, k);
+            dsa::Mul(inv, inv, nr, k);
+        }
+    }
+
     struct Cols { uint32_t off, len; };  // A band row's own columns inside its tile row
 
     // ---- Worker: one simulated core ------------------------------------------------------------
@@ -500,15 +616,20 @@ private:
         uint32_t cores, b;
 
         dsa::TPipe pipe;
-        dsa::TQue<dsa::QuePosition::VECIN, 4> qX1, qX2, qP;  // Ingress: `depth` tiles in flight; qP: gamma/beta chunks
-        dsa::TQue<dsa::QuePosition::VECOUT, 4> qY;           // Egress: every result leaves from one of these
+        // Static rings, no queue sequencer (BufferRing). Ingress: X1 and X2 of `depth` tiles in
+        // flight, and gamma/beta chunks for column tiles (event IDs after the tiles'). Egress: every
+        // result leaves from a slot of qY.
+        BufferRing<dsa::QuePosition::VECIN, 2, dsa::HardEvent::MTE2_V, dsa::HardEvent::V_MTE2> qX;
+        BufferRing<dsa::QuePosition::VECIN, 1, dsa::HardEvent::MTE2_V, dsa::HardEvent::V_MTE2> qP;
+        BufferRing<dsa::QuePosition::VECOUT, 1, dsa::HardEvent::V_MTE3, dsa::HardEvent::MTE3_V> qY;
         dsa::TBuf<dsa::QuePosition::VECCALC> bZ, bTmp, bPar, bRes, bMisc;
         dsa::TBuf<dsa::QuePosition::VECOUT> bRec;            // Split-D: the record this core publishes
         dsa::LocalTensor<float> z, tmp, fold, par, res, misc, rec;
+        dsa::LocalTensor<float> laneSum, laneInv, laneNr;    // laneRms: a row group's lanes, after the fold partition
         uint32_t tmpCap = 0, quantum = 1, rep = 1, pitch = 0;
-        // Egress buffers stay taken until outDepth - 1 later results took theirs, so results
-        // rotate through all of them and a store never holds up the next result
-        dsa::LocalTensor<S> held[4];
+        // Egress slots stay taken until outDepth - 1 later results took theirs, so results rotate
+        // through all of them and a store never holds up the next result
+        uint32_t held[4] = {};
         uint32_t nHeld = 0;
 
         void Execute(uint32_t numCores, CoreResult& out) {
@@ -522,7 +643,11 @@ private:
                 dsa::SyncAll();
                 Phase2(range, numCores);
             }
-            while (nHeld) qY.FreeTensor(held[--nHeld]);
+            while (nHeld) qY.Free(held[--nHeld]);
+            qX.Drain();
+            qP.Drain();
+            qY.Drain();
+            dsa::CrossPipe<dsa::HardEvent::MTE3_S>(dsa::EVENT_ID0);  // The kernel ends once Y has landed
             out.cycles = dsa::g_cycleTracker;
             out.timeline = dsa::g_timeline.Summary();
             out.spmBytes = pipe.GetTotalAllocatedBytes();
@@ -532,10 +657,9 @@ private:
             const DaeLayout& L = plan.layout;
             DSA_ASSERT(L.out && L.outDepth >= 1 && L.outDepth <= 4 && L.tmp >= AdaptiveTiler::SCRATCH_BYTES,
                        "[DaePipeline]: the plan's layout has no egress buffer or no fold partition");
-            pipe.InitBuffer(qX1, L.depth, L.tile);
-            pipe.InitBuffer(qX2, L.depth, L.tile);
-            if (L.paramQueue) pipe.InitBuffer(qP, L.depth, L.tile);
-            pipe.InitBuffer(qY, L.outDepth, L.out);
+            qX.Init(pipe, L.depth, L.tile, 0);
+            if (L.paramQueue) qP.Init(pipe, L.depth, L.tile, L.depth);
+            qY.Init(pipe, L.outDepth, L.out, 0);
             // Exactly the plan's buffers: the claim is DaeLayout::Total(), the number the planner
             // fitted under 191 KB (an unplanned buffer overflows plans sized to the byte)
             if (L.z) { pipe.InitBuffer(bZ, L.z); z = bZ.Get<float>(); }
@@ -550,14 +674,21 @@ private:
             quantum = dsa::Max<uint32_t>(1u, dsa::DMA_ALIGN_BYTES / sizeof(S));
             rep = dsa::Max(1u, plan.repRows);
             pitch = plan.pitch ? plan.pitch : D;
+            if (plan.laneRms) {
+                DSA_ASSERT(pitch <= tmpCap && L.tmp >= AdaptiveTiler::SCRATCH_BYTES + AdaptiveTiler::LANE_BYTES,
+                           "[DaePipeline]: a lane-RMS plan needs rows within the scratch chunk and lane partitions");
+                const uint32_t at = AdaptiveTiler::SCRATCH_BYTES / sizeof(float), G = AdaptiveTiler::ROW_GROUP;
+                laneSum = tmp[at], laneInv = tmp[at + G], laneNr = tmp[at + 2 * G];
+            }
         }
 
-        // The next egress buffer for a result; Release it once its store is issued
-        dsa::LocalTensor<S> TakeOut() { return qY.template AllocTensor<S>(); }
-        void ReleaseOut(dsa::LocalTensor<S> o) {
-            held[nHeld++] = o;
+        // The next egress slot for a result; Release it once its store is issued
+        uint32_t TakeOut() { return qY.Alloc(); }
+        dsa::LocalTensor<S> Out(uint32_t slot) const { return qY.template View<S>(slot); }
+        void ReleaseOut(uint32_t slot) {
+            held[nHeld++] = slot;
             if (nHeld < plan.layout.outDepth) return;
-            qY.FreeTensor(held[0]);  // The oldest result's buffer: the next one to be taken
+            qY.Free(held[0]);  // The oldest result's buffer: the next one to be taken
             for (uint32_t i = 1; i < nHeld; ++i) held[i - 1] = held[i];
             --nHeld;
         }
@@ -580,59 +711,51 @@ private:
             if (rA >= rZ) return;
             const AdaptiveTiler::RowSchedule tiles{rA, rZ, plan.tileRows, plan.headRows, plan.tailRows};
             float sums[AdaptiveTiler::ROW_GROUP];  // Row sums of squares, on the scalar side
-            uint32_t nextX1 = rA, nextX2 = rA;      // The next tile each input queue loads
-            auto loadX1 = [&] { const uint32_t k = tiles.Rows(nextX1); LoadRows(qX1, x1, nextX1, k); nextX1 += k; };
-            auto loadX2 = [&] { const uint32_t k = tiles.Rows(nextX2); LoadRows(qX2, x2, nextX2, k); nextX2 += k; };
-            auto refill = [&] {
-                if (nextX1 < rZ) loadX1();
-                if (nextX2 < rZ) loadX2();
-            };
+            uint32_t next = rA;                     // The next tile to load
+            auto load = [&] { const uint32_t k = tiles.Rows(next); LoadRows(next, k); next += k; };
+            auto refill = [&] { if (next < rZ) load(); };
             // Prologue [ARCH CHALLENGE 3]: the first `depth` tiles and gamma/beta are all in
             // flight before the vector unit starts; widening gamma/beta overlaps their DMA.
             bool staged = plan.paramsFirst && StageParams(0, D);
-            loadX1();
-            loadX2();
+            load();
             if (!plan.paramsFirst) staged = StageParams(0, D);
-            for (uint32_t i = 1; i < plan.layout.depth && nextX1 < rZ; ++i) {
-                loadX1();
-                loadX2();
-            }
+            for (uint32_t i = 1; i < plan.layout.depth && next < rZ; ++i) load();
             WidenParams(0, D, staged);
             for (uint32_t row = rA; row < rZ;) {
-                const uint32_t k = tiles.Rows(row);
-                dsa::LocalTensor<S> a = qX1.template DeQue<S>(), bt = qX2.template DeQue<S>();
+                const uint32_t k = tiles.Rows(row), t = qX.DeQue();
                 // 16-bit: Z in the FP32 Z tile, narrowed into an egress buffer at the end. FP32: Z is
                 // built in the egress buffer itself, so the result needs no copy.
-                dsa::LocalTensor<S> o;
+                uint32_t o = 0;
                 dsa::LocalTensor<float> zt = z;
-                if constexpr (std::is_same<C, F32>::value) zt = o = TakeOut();
-                TileZ(zt, a, bt, k);
-                qX1.FreeTensor(a);  // Both inputs are consumed: Y never lives in an input buffer
-                qX2.FreeTensor(bt);
+                if constexpr (std::is_same<C, F32>::value) zt = Out(o = TakeOut());
+                TileZ(zt, qX.template View<S>(t, 0), qX.template View<S>(t, 1), k);
+                qX.Free(t);  // Both inputs are consumed: Y never lives in an input buffer
                 if (plan.earlyLoads) refill();  // X1/X2 of a later tile stream in now
                 // Every row sum of a group is issued before the group's first scaling
                 for (uint32_t g = 0; g < k; g += AdaptiveTiler::ROW_GROUP) {
                     const uint32_t n = dsa::Min(AdaptiveTiler::ROW_GROUP, k - g);
                     RowSums(zt[g * pitch], n, nullptr, sums);
-                    ScaleRows(zt[g * pitch], n, nullptr, sums);
+                    if (plan.laneRms) ScaleRowsInLanes(zt[g * pitch], n, sums);
+                    else ScaleRows(zt[g * pitch], n, nullptr, sums);
                 }
                 if (gamma) ApplyRows(zt, k, par, true);
                 if constexpr (!std::is_same<C, F32>::value) {
                     o = TakeOut();
-                    Narrow(o, zt, k * D);
+                    Narrow(Out(o), zt, k * D);
                 }
-                DmaOut(y + uint64_t(row) * D, o, k * D);  // Egress from VECOUT
+                DmaOut(y + uint64_t(row) * D, Out(o), k * D);  // Egress from VECOUT
                 ReleaseOut(o);
                 if (!plan.earlyLoads) refill();
                 row += k;
             }
         }
 
-        template <class Q>
-        void LoadRows(Q& q, const S* src, uint32_t row, uint32_t k) {
-            dsa::LocalTensor<S> t = q.template AllocTensor<S>();
-            DmaIn(t, src + uint64_t(row) * D, k * D);
-            q.EnQue(t);
+        // X1 and X2 of k rows into the next tile slot
+        void LoadRows(uint32_t row, uint32_t k) {
+            const uint32_t t = qX.Alloc();
+            DmaIn(qX.template View<S>(t, 0), x1 + uint64_t(row) * D, k * D);
+            DmaIn(qX.template View<S>(t, 1), x2 + uint64_t(row) * D, k * D);
+            qX.EnQue(t);
         }
 
         // Z = X1 + X2 (+ beta) for the k rows of a tile at pitch `pitch`
@@ -676,6 +799,23 @@ private:
             for (uint32_t i = 0; i < n; ++i) {
                 const Cols c = cols ? cols[i] : Cols{0, pitch};
                 if (c.len) dsa::Muls(zt[i * pitch + c.off], zt[i * pitch + c.off], InvRms(sumSq[i]), c.len);
+            }
+        }
+
+        // Z *= invRms for n <= ROW_GROUP full rows through vector lanes (laneRms): the scalar unit
+        // writes the row sums into lanes, one chain of vector instructions computes every row's
+        // inverse RMS (LaneInvRms), and one Brcb per row spreads its value over that row of the
+        // scratch chunk, which then scales as many rows as it holds with one Mul. A Brcb writes whole
+        // 64-lane repeats, so the chunk's last one may run into the fold partition, never the lanes.
+        void ScaleRowsInLanes(dsa::LocalTensor<float> zt, uint32_t n, const float* sumSq) {
+            for (uint32_t i = 0; i < n; ++i) laneSum.SetValue(i, sumSq[i]);
+            dsa::CrossPipe<dsa::HardEvent::S_V>(dsa::EVENT_ID0);  // The lanes are written before the vector unit reads them
+            LaneInvRms(laneSum, laneSum, laneInv, laneNr, n, invD, eps);
+            const uint32_t per = tmpCap / pitch, reps = (pitch + AdaptiveTiler::LANES - 1) / AdaptiveTiler::LANES;
+            for (uint32_t r0 = 0; r0 < n; r0 += per) {
+                const uint32_t m = dsa::Min(per, n - r0);
+                for (uint32_t i = 0; i < m; ++i) dsa::Brcb(tmp[i * pitch], laneInv[r0 + i], reps, dsa::BrcbRepeatParams{1, 8});
+                dsa::Mul(zt[r0 * pitch], zt[r0 * pitch], tmp, m * pitch);
             }
         }
 
@@ -767,12 +907,10 @@ private:
             // the VECOUT record buffer, where the egress channel can read it.
             dsa::Duplicate(rec, 0.0f, R);
             for (uint32_t row = r.rowA; row < r.rowZ; row += B) {
-                const uint32_t k = dsa::Min(B, r.rowZ - row);
-                dsa::LocalTensor<S> a = qX1.template DeQue<S>(), bt = qX2.template DeQue<S>();
+                const uint32_t k = dsa::Min(B, r.rowZ - row), t = qX.DeQue();
                 const dsa::LocalTensor<float> zt = res[(row - r.rowA) * pitch];
-                TileZ(zt, a, bt, k);
-                qX1.FreeTensor(a);
-                qX2.FreeTensor(bt);
+                TileZ(zt, qX.template View<S>(t, 0), qX.template View<S>(t, 1), k);
+                qX.Free(t);
                 for (uint32_t g = 0; g < k; g += AdaptiveTiler::ROW_GROUP) {
                     const uint32_t n = dsa::Min(AdaptiveTiler::ROW_GROUP, k - g);
                     BandCols(r, row + g, n, c0, cols);
@@ -812,7 +950,8 @@ private:
 
         // k band rows into one tile slot at pitch `pitch`: one whole-block DMA per row and input
         void LoadBand(const CoreRange& r, uint32_t row, uint32_t k, uint32_t c0) {
-            dsa::LocalTensor<S> a = qX1.template AllocTensor<S>(), bt = qX2.template AllocTensor<S>();
+            const uint32_t t = qX.Alloc();
+            const dsa::LocalTensor<S> a = qX.template View<S>(t, 0), bt = qX.template View<S>(t, 1);
             for (uint32_t i = 0; i < k; ++i) {
                 const Cols c = BandCol(r, row + i, c0);
                 if (!c.len) continue;
@@ -820,20 +959,20 @@ private:
                 DmaIn(a[i * pitch + c.off], x1 + e, c.len);
                 DmaIn(bt[i * pitch + c.off], x2 + e, c.len);
             }
-            qX1.EnQue(a);
-            qX2.EnQue(bt);
+            qX.EnQue(t);
         }
 
         // Band rows back to Y, one DMA per row, from the next egress buffer: the resident Z is
         // narrowed (16-bit) or copied (FP32) into it, so its stores never delay the next tile
         void StoreBand(const CoreRange& r, uint32_t row, uint32_t k, uint32_t c0, dsa::LocalTensor<float> zt) {
-            const dsa::LocalTensor<S> out = TakeOut();
+            const uint32_t o = TakeOut();
+            const dsa::LocalTensor<S> out = Out(o);
             Narrow(out, zt, k * pitch);
             for (uint32_t i = 0; i < k; ++i) {
                 const Cols c = BandCol(r, row + i, c0);
                 if (c.len) DmaOut(y + uint64_t(row + i) * D + c0 + c.off, out[i * pitch + c.off], c.len);
             }
-            ReleaseOut(out);
+            ReleaseOut(o);
         }
 
         // A band row's own columns inside its tile row (len 0: the core has none of that row)
@@ -905,11 +1044,10 @@ private:
                       if (bias) LoadParam(bias + (e - base), n);
                   },
                   [&](uint64_t e, uint32_t n) {
-                      dsa::LocalTensor<S> a = qX1.template DeQue<S>(), bt = qX2.template DeQue<S>();
+                      const uint32_t t = qX.DeQue();
                       dsa::LocalTensor<float> zt = keep ? zr[static_cast<uint32_t>(e - start)] : z;
-                      AddInputs(zt, a, bt, n);
-                      qX1.FreeTensor(a);
-                      qX2.FreeTensor(bt);
+                      AddInputs(zt, qX.template View<S>(t, 0), qX.template View<S>(t, 1), n);
+                      qX.Free(t);
                       if (bias) UseParam(zt, n, false);
                       sum += SumSquares(zt, n);
                   });
@@ -928,10 +1066,10 @@ private:
                           const dsa::LocalTensor<float> zt = zr[static_cast<uint32_t>(e - start)];
                           dsa::Muls(zt, zt, inv, n);
                           if (gamma) UseParam(zt, n, true);
-                          const dsa::LocalTensor<S> out = TakeOut();
-                          Narrow(out, zt, n);
-                          DmaOut(y + e, out, n);
-                          ReleaseOut(out);
+                          const uint32_t o = TakeOut();
+                          Narrow(Out(o), zt, n);
+                          DmaOut(y + e, Out(o), n);
+                          ReleaseOut(o);
                       });
                 return;
             }
@@ -941,17 +1079,16 @@ private:
                       if (bias) LoadParam(bias + (e - base), n);
                   },
                   [&](uint64_t e, uint32_t n) {
-                      dsa::LocalTensor<S> a = qX1.template DeQue<S>(), bt = qX2.template DeQue<S>();
-                      AddInputs(z, a, bt, n);
-                      qX1.FreeTensor(a);
-                      qX2.FreeTensor(bt);
+                      const uint32_t t = qX.DeQue();
+                      AddInputs(z, qX.template View<S>(t, 0), qX.template View<S>(t, 1), n);
+                      qX.Free(t);
                       if (bias) UseParam(z, n, false);
                       dsa::Muls(z, z, inv, n);
                       if (gamma) ApplyParamNow(z, gamma + (e - base), n, true);  // qP holds the next beta
-                      const dsa::LocalTensor<S> out = TakeOut();
-                      Narrow(out, z, n);
-                      DmaOut(y + e, out, n);
-                      ReleaseOut(out);
+                      const uint32_t o = TakeOut();
+                      Narrow(Out(o), z, n);
+                      DmaOut(y + e, Out(o), n);
+                      ReleaseOut(o);
                   });
         }
 
@@ -977,33 +1114,32 @@ private:
         }
 
         void LoadTile(uint64_t e, uint32_t n) {
-            dsa::LocalTensor<S> a = qX1.template AllocTensor<S>();
-            DmaIn(a, x1 + e, n);
-            qX1.EnQue(a);
-            dsa::LocalTensor<S> bt = qX2.template AllocTensor<S>();
-            DmaIn(bt, x2 + e, n);
-            qX2.EnQue(bt);
+            const uint32_t t = qX.Alloc();
+            DmaIn(qX.template View<S>(t, 0), x1 + e, n);
+            DmaIn(qX.template View<S>(t, 1), x2 + e, n);
+            qX.EnQue(t);
         }
 
         void LoadParam(const S* src, uint32_t n) {
-            dsa::LocalTensor<S> pc = qP.template AllocTensor<S>();
-            DmaIn(pc, src, n);
-            qP.EnQue(pc);
+            const uint32_t t = qP.Alloc();
+            DmaIn(qP.template View<S>(t), src, n);
+            qP.EnQue(t);
         }
 
         // zt (+|*)= the parameter chunk at the head of qP
         void UseParam(dsa::LocalTensor<float> zt, uint32_t n, bool multiply) {
-            dsa::LocalTensor<S> pc = qP.template DeQue<S>();
-            Combine(zt, pc, n, multiply);
-            qP.FreeTensor(pc);
+            const uint32_t t = qP.DeQue();
+            Combine(zt, qP.template View<S>(t), n, multiply);
+            qP.Free(t);
         }
 
-        // The same with a chunk loaded on the spot, outside the queue order
+        // The same with a chunk loaded on the spot, outside the FIFO order
         void ApplyParamNow(dsa::LocalTensor<float> zt, const S* src, uint32_t n, bool multiply) {
-            dsa::LocalTensor<S> pc = qP.template AllocTensor<S>();
-            DmaIn(pc, src, n);
-            Combine(zt, pc, n, multiply);
-            qP.FreeTensor(pc);
+            const uint32_t t = qP.Alloc();
+            DmaIn(qP.template View<S>(t), src, n);
+            qP.Landed(t);
+            Combine(zt, qP.template View<S>(t), n, multiply);
+            qP.Free(t);
         }
 
         // FP32 chunks combine directly; 16-bit chunks are widened through the scratch buffer
@@ -1078,14 +1214,13 @@ private:
     };
 
     // ---- Direct kernel [ARCH CHALLENGE 8]: a core's rows in one shot, no queues ----------------
-    // A share that fits DIRECT_BYTES per tensor is a single tile, so a queue would have nothing to
-    // overlap, and its lifecycle alone (ten TQue steps, 6,250 sequencer cycles) outweighs the
-    // kernel. DirectCore claims static buffers from a LocalMemAllocator (no TPipe, no TQue) and
-    // orders the pipes with scoreboard flags on literal event IDs, since without a TPipe there is
-    // nothing to fetch event IDs from. Its row sums come from the 64-lane ReduceSum on zero-padded
-    // rows, and the inverse RMS never leaves the vector unit: Rsqrt, Newton-Raphson, then one Brcb
-    // broadcast per row instead of a 500-cycle scalar read. AdaptiveTiler::DirectTimeline replays
-    // exactly this sequence.
+    // A share that fits DIRECT_BYTES per tensor runs as a single tile. DirectCore claims static
+    // buffers from a LocalMemAllocator (no TPipe, no TQue) and orders the pipes with scoreboard flags
+    // on literal event IDs, since without a TPipe there is nothing to fetch event IDs from. Its row
+    // sums come from the 64-lane ReduceSum on zero-padded rows, and the inverse RMS never leaves the
+    // vector unit: Rsqrt, Newton-Raphson, then one Brcb broadcast per row instead of a 500-cycle
+    // scalar read. The planner runs it where it finishes before the row tiles, which take no queue
+    // step either. AdaptiveTiler::DirectTimeline replays exactly this sequence.
     struct DirectCore {
         static constexpr bool kF32 = std::is_same<C, F32>::value;
         static constexpr uint32_t SHARE = AdaptiveTiler::DIRECT_BYTES / sizeof(S);  // Elements in a share's buffer
@@ -1199,11 +1334,7 @@ private:
                 for (uint32_t i = 0; i < k; ++i) dsa::Mul(sq[i * padded], z[i * D], z[i * D], D);
             }
             for (uint32_t i = 0; i < k; ++i) dsa::ReduceSum(sums[i], sq[i * padded], work, padded);
-            // invRms = 1 / sqrt(sum * invD + eps) for every row at once
-            dsa::Muls(mean, sums, invD, k);
-            dsa::Adds(mean, mean, eps, k);
-            dsa::Rsqrt(inv, mean, k);
-            Refine(k);
+            LaneInvRms(sums, mean, inv, nr, k, invD, eps);  // invRms of every row at once
             // Z *= invRms: each row's value broadcast across its repeats, never read by the scalar unit
             for (uint32_t i = 0; i < k; ++i) {
                 dsa::Brcb(bc, inv[i], padded / AdaptiveTiler::LANES, dsa::BrcbRepeatParams{1, 8});
@@ -1239,20 +1370,6 @@ private:
             for (uint32_t i = 0; i < k; ++i) {
                 if (multiply) dsa::Mul(zt[i * D], zt[i * D], p, D);
                 else dsa::Add(zt[i * D], zt[i * D], p, D);
-            }
-        }
-
-        // Newton-Raphson on the Rsqrt table value, every row at once: inv *= 1.5 - (mean / 2) inv^2,
-        // as many steps as the output's precision needs (AdaptiveTiler::NewtonSteps)
-        void Refine(uint32_t k) {
-            const uint32_t steps = AdaptiveTiler::NewtonSteps(sizeof(S));
-            if (!steps) return;
-            dsa::Muls(sums, mean, -0.5f, k);  // -mean / 2, in the lanes of the spent row sums
-            for (uint32_t i = 0; i < steps; ++i) {
-                dsa::Mul(nr, inv, inv, k);
-                dsa::Mul(nr, nr, sums, k);
-                dsa::Adds(nr, nr, 1.5f, k);
-                dsa::Mul(inv, inv, nr, k);
             }
         }
     };
