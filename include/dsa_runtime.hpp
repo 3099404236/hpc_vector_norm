@@ -120,7 +120,7 @@ struct bfloat16_t {
 };
 #endif
 
-// Global Memory Descriptor (Co-processor system memory buffer)
+// Global Memory Descriptor (Many-core stream processor system memory buffer)
 template <typename T>
 class GlobalTensor {
 public:
@@ -543,7 +543,7 @@ inline void wait_flag(PipeType src, PipeType dst, uint8_t eventId = 0) {
 }
 
 // -----------------------------------------------------------------------------
-// DAE v1.5 Point-to-Point Pipeline Scoreboard Fences (HardEvent Tokens)
+// DAE v1.5 Point-to-Point Pipeline Scoreboard Fences (HardEvent Scoreboard Flags)
 // Avoids PIPE_ALL flushes by synchronizing only the dependent execution units.
 // -----------------------------------------------------------------------------
 enum class HardEvent : uint8_t {

@@ -4,13 +4,13 @@
 [![OpenMP](https://img.shields.io/badge/Parallel-OpenMP-green.svg)](https://www.openmp.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-An ultra-high-throughput, cache-conscious, vectorized C++ math kernel library for **Fused Residual Vector Normalization (`FusedResidualNormalize`)** targeting modern multi-core symmetric CPU architectures (up to 40 hardware execution threads with AVX-2 / AVX-512 SIMD vectorization).
+An ultra-high-throughput, cache-conscious, vectorized C++ numerical kernel library for **Fused Residual Vector Normalization (`FusedResidualNormalize`)** targeting high-performance many-core streaming CPU architectures (a 40-core Decoupled Access-Execute symmetric multi-core vector CPU with on-chip software-managed Scratchpad Memory (SPM), 2048-bit SIMD vector pipelines, and asynchronous DMA stream engines).
 
 ---
 
 ## 🎯 Project Mission & Challenge
 
-In modern signal processing, scientific simulations, and large tensor computations, normalizing multi-channel vectors while accumulating residual streams is a fundamental computational primitive:
+In modern numerical scientific computing, digital signal processing, multidimensional physical simulations, and dense linear algebra, normalizing multi-channel vectors while accumulating residual streams is a fundamental computational primitive:
 
 $$Z_{i} = X_{1,i} + X_{2,i} + \text{bias}$$
 $$\sigma_i = \sqrt{\frac{1}{D} \sum_{j=0}^{D-1} Z_{i,j}^2 + \epsilon}$$
@@ -18,7 +18,7 @@ $$Y_{i,j} = \frac{Z_{i,j}}{\sigma_i} \cdot \gamma_j$$
 
 ### 🏛️ Target Hardware Laws vs Host CI Environment (Crucial Directive)
 
-Contributors and autonomous AI agents must distinguish between the **Target Hardware Architecture** and the **Host CI Testbed**:
+Systems programmers and kernel developers must distinguish between the **Target 40-Core Many-Core Streaming Architecture** and the **Host CI Testbed**:
 
 | Architectural Dimension | Host CI Testbed (Development Environment) | Target Hardware Architecture (Physical Ground Truth) |
 | :--- | :--- | :--- |
@@ -28,11 +28,14 @@ Contributors and autonomous AI agents must distinguish between the **Target Hard
 | **Memory Bandwidth** | ~40 GB/s DDR4 (host bus limitation) | **Aggregated High-Throughput Memory Subsystem (~850 GB/s)** |
 | **SIMD Instruction Width** | AVX-512 (64B) / AVX2 (32B) | **256-Byte Repeat SIMD Vector Pipeline (2048-bit)** |
 
-> **⚠️ Directives for Tiler & Kernel Optimization**:
-> 1. **Do NOT overfit to the 4-core host!** While `AdaptiveTiler` should gracefully handle `threads <= 4` on the host to avoid OS thrashing during tests, the **mathematical planning model must be explicitly architected for 40 symmetric cores**.
-> 2. **Alignment must honor 32 bytes**: The hardware DMA engine transfers memory in 32-byte blocks. All dimension slicing in Split-D should support 32-byte granularity.
-> 3. **Latency Targets Reflect Peak Theoretical Memory Roofline**: Target latencies (e.g. P13 $223\ \mu\text{s}$) assume an aggregated ~850 GB/s memory subsystem roofline. On the 4-core VM, reaching host memory saturation (~40 GB/s) confirms the algorithm is optimal!
-> 4. **Coordinator-Worker Decoupling & Zero-Allocation Freestanding Execution**:
+> **⚠️ CRITICAL ARCHITECTURAL DIRECTIVE (40-CORE TARGET FOCUS)**:
+> 1. **The Primary Optimization Target is the 40-Core Many-Core Architecture (`HardwareModel::Target()`), NOT the host machine.**
+> 2. The host testbed (whether a 4-core VM, an 8-core workstation, or a Xeon server) is used solely for functional correctness validation and regression testing. **Do NOT spend time measuring, profiling, or tuning host-specific CPU topology, OS thread scheduling, or spinning thread pools.** All architectural models, cycle calculations, and latency targets are calibrated against the 40-core target hardware specifications.
+> 3. **The Target is a 40-Core Decoupled Access-Execute (DAE) Vector CPU**: Each core features an in-order scalar instruction pipeline, a 2048-bit wide SIMD vector unit (64 FP32 lanes), a dedicated DMA stream transfer engine (32-byte burst alignment), and a 191 KB on-chip software-managed Scratchpad Memory (SPM / Local Store). Hardware scoreboard event flags ensure hazard-free synchronization between DMA and vector units.
+> 4. **Do NOT overfit to the 4-core host!** While `AdaptiveTiler` should gracefully handle `threads <= 4` on the host to avoid OS thrashing during tests, the **mathematical planning model must be explicitly architected for 40 symmetric cores**.
+> 5. **Alignment must honor 32 bytes**: The hardware DMA engine transfers memory in 32-byte blocks. All dimension slicing in Split-D should support 32-byte granularity.
+> 6. **Latency Targets Reflect Peak Theoretical Memory Roofline**: Target latencies (e.g. P13 $223\ \mu\text{s}$) assume an aggregated ~850 GB/s memory subsystem roofline. On the 4-core VM, reaching host memory saturation (~40 GB/s) confirms the algorithm is optimal!
+> 7. **Coordinator-Worker Decoupling & Zero-Allocation Freestanding Execution**:
 >    - The Master Coordinator (`DaePipeline::Execute`) evaluates `TilingConfig` on the master CPU thread before the OpenMP region and manages a pre-allocated 64-byte aligned reduction workspace buffer (`float* workspace`) passed to worker threads.
 >    - Worker threads must be purely freestanding: **zero dynamic allocation** (`malloc`, `new`, `std::vector`), zero exception unwinding (`throw`), and pass `LocalTensor` by value.
 
@@ -260,7 +263,7 @@ simulated core (`GetCoreIdx`), and everything goes through `include/dsa_runtime.
   - All 15 profiles run under the v1.4 guards with 0 traps and 0 scalar stalls. Their outputs are bit-identical to the pre-errata kernel on 11 profiles; on the other four, 204 of 133.5 M FP16 values differ by one ulp.
 - **DAE v1.5 (Challenge 8).**
   - **Direct kernel.** A `TQue` lifecycle step costs the queue sequencer 625 cycles, and a row tile takes ten: X1 and X2 four each, the egress buffer two. A core whose share fits the direct kernel is a single tile with nothing to overlap them with, so it runs on `DirectCore` instead. A share fits when its rows take at most 512 B per tensor and their squares, each row padded to whole 64-lane repeats, fit 1,024 floats (`AdaptiveTiler::DirectFits`, physical properties only). Every tensor of at most 512 B fits. `DirectCore` claims static `LocalMemAllocator<Hardware::Scratchpad>` buffers on the worker's stack: no `TPipe`, no `TQue`, no heap. Its inputs are tagged VECIN and its result VECOUT, so the v1.4 egress guard still covers it.
-  - **Scoreboard tokens, no flushes.** Each load sets its own `MTE2_V` flag on a literal event ID (`EVENT_ID0`–`EVENT_ID3`: without a `TPipe` there is none to fetch). The vector unit waits on each flag just before that input's first use, so X1 is widened while X2, β and γ are still landing. `V_MTE3` hands the result to the egress channel, and `MTE3_S` ends the kernel. The queue kernel's stores take the same `V_MTE3` token, since its egress buffers are never enqueued. No kernel issues `PIPE_ALL`.
+  - **Scoreboard event flags, no flushes.** Each load sets its own `MTE2_V` flag on a literal event ID (`EVENT_ID0`–`EVENT_ID3`: without a `TPipe` there is none to fetch). The vector unit waits on each flag just before that input's first use, so X1 is widened while X2, β and γ are still landing. `V_MTE3` hands the result to the egress channel, and `MTE3_S` ends the kernel. The queue kernel's stores take the same `V_MTE3` event flag, since its egress buffers are never enqueued. No kernel issues `PIPE_ALL`.
   - **64-lane reductions.** Each row's squares go to a row of whole 64-lane repeats whose pad lanes are zeroed first. The zeroing has no operand to wait for, so it runs under the DMA latency. One `ReduceSum` per row then writes that row's lane of the row-sum partition. Destination, source and workpad never overlap. The mean, inverse RMS, Newton-Raphson term and `Brcb` destination each have a partition of their own.
   - **Inverse RMS without the scalar unit.** The kernel runs `Muls` by the coordinator's `invD`, `Adds` ε, then `Rsqrt`. v1.5's `Rsqrt` is a table of about 11 bits, so Newton-Raphson steps follow until the bits exceed the output's significand: one step for 16-bit outputs, two for FP32. `Brcb` then broadcasts each row's value across its repeats for the scaling `Mul`, so the scalar unit never reads the scratchpad.
   - **Strided rows.** β and γ apply to every row in one strided `Add`/`Mul` when FP32 rows are whole 32-byte blocks, because the repeat stride counts blocks. Otherwise they take one instruction per row.

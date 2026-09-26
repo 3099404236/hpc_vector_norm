@@ -1,8 +1,8 @@
-# 🏛️ Architecture Challenges & Open Research Vectors
+# 🏛️ Architecture Challenges & Optimization Vectors
 
 Welcome to the `hpc_vector_norm` performance optimization project!
 
-To achieve theoretical roofline performance without hardcoding specific case branches, we have left **7 major architectural open vectors** for contributors and autonomous AI agents. You are invited to design, mathematically formulate, and implement these solutions.
+To achieve theoretical roofline performance without hardcoding specific case branches, we have established **8 core architectural challenges** for high-performance computing engineers and vector compiler architects. You are invited to design, mathematically formulate, and implement these solutions for the 40-core streaming vector processor.
 
 Each challenge below has two solutions:
 
@@ -388,7 +388,7 @@ As target hardware simulation fidelity is upgraded to reflect the physical strea
 
 5. **Point-to-Point Pipeline Scoreboard Fences vs. Global Barrier Stalls (`CrossPipe` / `SetFlag` / `WaitFlag`)**:
    - `PipeBarrier<PIPE_ALL>` forces an exhaustive drain of ALL execution pipes including the Scalar Processing Unit (SPU). Because the SPU precomputes address offsets and loop bounds ahead of the vector pipe (accounting for $\sim 49\%$ of overlapped execution time), inner-loop `PIPE_ALL` flushes destroy latency overlap.
-   - *Scoreboard Token Primitives*: Intra-core synchronization must use point-to-point hardware scoreboard events:
+   - *Scoreboard Hardware Event Flags*: Intra-core synchronization must use point-to-point hardware scoreboard events:
      - `HardEvent::MTE2_V` (DMU Ingress $\to$ VPU: data ready in scratchpad)
      - `HardEvent::V_MTE3` (VPU $\to$ DMU Egress: vector computation finished)
      - `HardEvent::MTE3_S` (DMU Egress $\to$ SPU: transfer completed)
@@ -404,12 +404,12 @@ As target hardware simulation fidelity is upgraded to reflect the physical strea
    - **Native FP16 Dual-Width ALU**: FP16 possesses native 16-bit binary addition `Add(x, x, r)`, reducing arithmetic passes from 3 to 1.5; BF16 lacks native vector binary addition and must be widened to FP32 first.
    - **Newton-Raphson Precision Refinement**: Hardware `Rsqrt` provides $\sim 11\text{-bit}$ table-lookup precision; full 24-bit FP32 precision requires 1–2 Newton-Raphson iterations (`RefineInvRms`).
 
-8. **Extended Co-Processor Microarchitectural Primitives**:
+8. **Extended Many-Core Vector Processor Microarchitectural Primitives**:
    - **Global Memory Descriptors (`GlobalTensor<T>`)**: Explicit host-to-device memory window abstraction supporting slice offset arithmetic and typed global buffer binding (`SetGlobalBuffer`).
    - **Strided & Padded DMA Descriptors (`DataCopyExtParams`, `DataCopyPadExtParams<T>`)**: First-class hardware transaction descriptors controlling 2D strided transfers and tail zero-padding without scalar loop overhead.
    - **Vector ALU Scalar Offset (`dsa::Adds`)**: Single-issue vector-scalar addition primitive for bias offsets and epsilon additions.
    - **Precision Converters (`ToFloat`, `FromFloat`, `RoundMode`)**: Hardware rounding mode controls (`RoundMode::CAST_NONE`, `RoundMode::CAST_RINT`) enabling high-precision FP32 normalization pipelines with zero register pressure.
-   - **Explicit Fine-Grained Scoreboard Flags (`pipe_barrier`, `set_flag`, `wait_flag`)**: Native co-processor point-to-point fence primitives matching hardware instruction set semantics.
+   - **Explicit Fine-Grained Scoreboard Flags (`pipe_barrier`, `set_flag`, `wait_flag`)**: Native vector processor point-to-point fence primitives matching hardware instruction set semantics.
 
 ### The Objective
 Empower the DAE execution framework to fully respect physical microarchitectural contracts:
@@ -431,7 +431,7 @@ Empower the DAE execution framework to fully respect physical microarchitectural
   - **Ordering.**
     - Each load sets its own `MTE2_V` flag on a literal event ID (`EVENT_ID0`–`EVENT_ID3`: without a `TPipe` there is none to fetch). The vector unit waits on each flag just before that input's first use.
     - `V_MTE3` precedes the store, and `MTE3_S` ends the kernel.
-    - Neither kernel issues a `PIPE_ALL` flush. The queue kernel's stores take the same `V_MTE3` token, because its egress buffers are never enqueued.
+    - Neither kernel issues a `PIPE_ALL` flush. The queue kernel's stores take the same `V_MTE3` scoreboard flag, because its egress buffers are never enqueued.
   - **Instruction sequence.** P01 takes 297 cycles:
     - widen X1 and X2, add them, then widen and add β;
     - the squares, and one `ReduceSum` per row;
@@ -460,7 +460,7 @@ Empower the DAE execution framework to fully respect physical microarchitectural
 - **Runtime fix.** `LocalMemAllocator` declared `uint8_t pool[N] alignas(64)`. Clang rejects that placement, so no file built with clang. It now reads `alignas(64) uint8_t pool[N]`, with the same layout under GCC.
 - **Open: the streaming kernel's sequencer cycles.**
   - The streaming profiles still take their queue steps: 806,250 sequencer cycles on P13's busiest core, 781,250 on P15's. The runtime keeps these off the timeline.
-  - If the sequencer is a serial unit, those cores would be bound by it rather than by DMA. Static `TBuf` rings with per-slot tokens would remove the cost without changing the timeline, at the price of the queue's lifecycle checks.
+  - If the sequencer is a serial unit, those cores would be bound by it rather than by DMA. Static `TBuf` rings with per-slot scoreboard flags would remove the cost without changing the timeline, at the price of the queue's lifecycle checks.
 
 ### CPU Implementation
 Not applicable: the host executor has no queues, scratchpad or launch frame, and does not run on `dsa_runtime`.

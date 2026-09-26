@@ -1181,7 +1181,7 @@ public:
     // X2 four each, its egress buffer two. That is 6,250 cycles per core, and a share that fits
     // DIRECT_BYTES is one tile, with no other tile to hide them behind. Such a core runs its rows
     // in one shot from static scratchpad buffers instead (LocalMemAllocator: no queue, no
-    // sequencer): scoreboard tokens order the pipes, each row's squares are zero-padded to whole
+    // sequencer): scoreboard event flags order the pipes, each row's squares are zero-padded to whole
     // 64-lane repeats for ReduceSum, and the inverse RMS stays in the vector unit (Rsqrt,
     // Newton-Raphson, Brcb) instead of crossing to the scalar unit.
     //

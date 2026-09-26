@@ -327,10 +327,10 @@ private:
 //
 // DAE v1.5 [ARCH CHALLENGE 8]: every TQue lifecycle step costs the queue sequencer 625 cycles.
 // A core whose share is a single small tile (AdaptiveTiler::DirectFits) runs DirectCore instead:
-// static LocalMemAllocator buffers and scoreboard tokens, no queue at all. Its row sums go through
+// static LocalMemAllocator buffers and scoreboard flags, no queue at all. Its row sums go through
 // the 64-lane ReduceSum on zero-padded rows and its inverse RMS stays in the vector unit (Rsqrt,
 // Newton-Raphson, Brcb). The kernel launch frame holds only 64-bit addresses and 32-bit scalars
-// (Trap #409), and every result reaches the egress channel through a V -> MTE3 token.
+// (Trap #409), and every result reaches the egress channel through a V -> MTE3 flag.
 // =============================================================================
 struct DaeStats {
     uint64_t vectorCycles = 0;  // Busiest core: vector + scalar stalls + barriers + queue sequencer
@@ -473,7 +473,7 @@ private:
         if (BlockAligned(src, n)) dsa::DataCopy(dst, src, n);
         else dsa::DataCopyPad(dst, src, Descriptor<T>(n), dsa::DataCopyPadExtParams<T>{});
     }
-    // Egress: the vector unit hands the finished buffer to the egress channel (V -> MTE3 token);
+    // Egress: the vector unit hands the finished buffer to the egress channel (V -> MTE3 flag);
     // the channel reads VECOUT buffers only
     template <class T>
     static void DmaOut(T* dst, dsa::LocalTensor<T> src, uint32_t n) {
@@ -1081,7 +1081,7 @@ private:
     // A share that fits DIRECT_BYTES per tensor is a single tile, so a queue would have nothing to
     // overlap, and its lifecycle alone (ten TQue steps, 6,250 sequencer cycles) outweighs the
     // kernel. DirectCore claims static buffers from a LocalMemAllocator (no TPipe, no TQue) and
-    // orders the pipes with scoreboard tokens on literal event IDs, since without a TPipe there is
+    // orders the pipes with scoreboard flags on literal event IDs, since without a TPipe there is
     // nothing to fetch event IDs from. Its row sums come from the 64-lane ReduceSum on zero-padded
     // rows, and the inverse RMS never leaves the vector unit: Rsqrt, Newton-Raphson, then one Brcb
     // broadcast per row instead of a 500-cycle scalar read. AdaptiveTiler::DirectTimeline replays
@@ -1159,7 +1159,7 @@ private:
             // The pad lanes of the squares are zeroed first: nothing to wait for, so this runs under
             // the DMA latency
             if (padded != D) dsa::Duplicate(sq, 0.0f, k * padded);
-            // Ingress: each transfer hands its buffer to the vector unit with a token of its own
+            // Ingress: each transfer hands its buffer to the vector unit with an event flag of its own
             DmaIn(in1, x1 + e, n);
             dsa::SetFlag<dsa::HardEvent::MTE2_V>(dsa::EVENT_ID0);
             DmaIn(in2, x2 + e, n);
