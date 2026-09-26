@@ -1,8 +1,9 @@
 // Target-side checks: the 40-core plans obey the hardware laws, the planner's vector-cycle
 // model equals the runtime's cycle count, and the DAE pipeline that executes the plans
 // (dsa_runtime, one OpenMP thread per simulated core) is exact, free of scalar stalls,
-// sanitizer-clean, claims exactly the planned scratchpad, only pads DMA transfers where a
-// row does not end on a 32-byte block, and allocates nothing but the simulator's scratchpad.
+// sanitizer-clean (DAE v1.4 errata included: no egress from VECIN, no aliased folds), claims
+// exactly the planned scratchpad, only pads DMA transfers where a row does not end on a
+// 32-byte block, and allocates nothing but the simulator's scratchpad.
 // Its workers are freestanding: a trap aborts the process (DSA_ASSERT), which the death tests
 // check, and the abort report names the run in progress.
 #include "hpc_vector_norm.hpp"
@@ -125,6 +126,10 @@ void CheckPlan(const TilingConfig& t, uint32_t M, uint32_t D, uint32_t s, const 
     Check(t.blocks >= 1 && t.blocks <= dsa::MAX_HARDWARE_CORES, msg);
     Check(t.layout.Total() <= dsa::SCRATCHPAD_SAFE_WATERLINE, msg);
     Check(t.unitElems * s % dsa::DMA_ALIGN_BYTES == 0 || t.mode == TilingMode::ROW_PARALLEL, msg);  // Split units: DMA blocks
+    // Egress buffers for every result, the fold partition, and a VECOUT record for split plans
+    Check(t.layout.out == t.layout.tile && t.layout.outDepth >= 1 && t.layout.outDepth <= 2 &&
+              t.layout.tmp == AdaptiveTiler::SCRATCH_BYTES, msg);
+    Check((t.layout.rec != 0) == (t.mode != TilingMode::ROW_PARALLEL), msg);
     uint64_t lo = ~0ull, hi = 0;  // Balanced to one unit
     for (uint32_t b = 0; b < t.blocks; ++b) {
         const uint64_t e0 = std::min(t.units * b / t.blocks * t.unitElems, total);
@@ -137,7 +142,7 @@ void CheckPlan(const TilingConfig& t, uint32_t M, uint32_t D, uint32_t s, const 
         const uint32_t p = static_cast<uint32_t>(AdaptiveTiler::RowUnit(D, s, hw) / D);
         Check(t.pitch == D && t.tileRows % p == 0 && t.headRows % p == 0 && t.tailRows % p == 0, msg);
         Check(t.headRows < t.tileRows && t.tailRows < t.tileRows && t.layout.depth >= 2 && t.layout.depth <= 4, msg);
-        Check(t.layout.Total() == AdaptiveTiler::RowLayout(t.tileRows, D, s, t.repRows, t.layout.depth).Total(), msg);
+        Check(t.layout.Total() == AdaptiveTiler::RowLayout(t.tileRows, D, s, t.repRows, t.layout.depth, t.layout.outDepth).Total(), msg);
     } else if (t.mode == TilingMode::SPLIT_COLUMNS) {  // Band: rows on the grid, band rows fit the scratch chunk
         Check(D % q == 0 && t.pitch % q == 0 && t.pitch <= AdaptiveTiler::TMP_FLOATS && t.zResident == M * t.pitch, msg);
     } else {
@@ -281,34 +286,38 @@ void RunAll(std::mt19937& rng) {
 }
 
 // A plan that fills the scratchpad to the byte must run: the kernel may claim nothing the
-// layout does not list (an unplanned 64-byte placeholder buffer once overflowed such plans)
+// layout does not list (an unplanned 64-byte placeholder buffer once overflowed such plans).
+// FP32, 72-row tiles: X1/X2 double-buffered and one egress buffer (5 x 36,864 B), 9,216 B of
+// scratch and 2,048 B of gamma/beta replicated twice
 void RunWaterlinePlan(std::mt19937& rng) {
-    const uint32_t D = 128, B = 91, M = 2 * B * dsa::MAX_HARDWARE_CORES;
+    const uint32_t D = 128, B = 72, M = 2 * B * dsa::MAX_HARDWARE_CORES;
     const HardwareModel hw = HardwareModel::Target();
     TilingConfig plan = AdaptiveTiler::Build(M, D, 4, hw, TilingMode::ROW_PARALLEL, true);
-    AdaptiveTiler::ApplyRowPipe(plan, M, D, 4, hw, {B, 0, 0, 1, 2, false, false});  // 2 tiles of 91 rows per core
+    AdaptiveTiler::ApplyRowPipe(plan, M, D, 4, hw, {B, 0, 0, 2, 2, 1, false, false});  // 2 tiles of 72 rows per core
     Check(plan.layout.Total() == dsa::SCRATCHPAD_SAFE_WATERLINE, "waterline plan is exactly 195584 bytes");
     RunPlan<F32>(M, D, plan, true, true, 0, rng, "waterline");
 }
 
-// Every scheduling choice of row tiles, forced one combination at a time: queue depth, head and
-// tail tiles, gamma/beta first or second, early X2. The kernel must follow each schedule exactly:
-// right output, and the model's cycle count and finish time (RunPlan)
+// Every scheduling choice of row tiles, forced one combination at a time: queue depth, egress
+// buffers, head and tail tiles, gamma/beta first or second, early input loads. The kernel must
+// follow each schedule exactly: right output, and the model's cycle count and finish time (RunPlan)
 template <class C>
 void RunScheduleSweep(std::mt19937& rng) {
     const HardwareModel hw = HardwareModel::Target();
     const uint32_t M = 22 * dsa::MAX_HARDWARE_CORES, D = 192, s = sizeof(typename C::S);  // 22 rows per core
     TilingConfig plan = AdaptiveTiler::Build(M, D, s, hw, TilingMode::ROW_PARALLEL, true);
     for (uint32_t depth = 2; depth <= 4; ++depth) {
-        for (const uint32_t head : {0u, 1u, 4u}) {
-            for (const uint32_t tail : {0u, 2u}) {
-                for (int order = 0; order < 4; ++order) {
-                    const bool first = order & 1, early = order & 2;
-                    AdaptiveTiler::ApplyRowPipe(plan, M, D, s, hw, {6, head, tail, 3, depth, first, early});
-                    char label[96];
-                    std::snprintf(label, sizeof label, "schedule depth=%u head=%u tail=%u paramsFirst=%d earlyX2=%d", depth, head, tail,
-                                  first, early);
-                    RunPlan<C>(M, D, plan, true, true, 0, rng, label);
+        for (const uint32_t outDepth : {1u, 2u}) {
+            for (const uint32_t head : {0u, 1u, 4u}) {
+                for (const uint32_t tail : {0u, 2u}) {
+                    for (int order = 0; order < 4; ++order) {
+                        const bool first = order & 1, early = order & 2;
+                        AdaptiveTiler::ApplyRowPipe(plan, M, D, s, hw, {6, head, tail, 3, depth, outDepth, first, early});
+                        char label[128];
+                        std::snprintf(label, sizeof label, "schedule depth=%u outDepth=%u head=%u tail=%u paramsFirst=%d earlyLoads=%d",
+                                      depth, outDepth, head, tail, first, early);
+                        RunPlan<C>(M, D, plan, true, true, 0, rng, label);
+                    }
                 }
             }
         }
@@ -330,10 +339,10 @@ void RunWidePlans(std::mt19937& rng) {
         if (c.mode == TilingMode::ROW_PARALLEL) {  // The largest double-buffered tile, up to the core's rows
             const uint32_t rows = (c.M + plan.blocks - 1) / plan.blocks;
             uint32_t B = 1;
-            while (B < rows && AdaptiveTiler::RowLayout(B + 1, c.D, sizeof(S), 1, 2).Total() <= hw.spmBytes) ++B;
-            AdaptiveTiler::ApplyRowPipe(plan, c.M, c.D, sizeof(S), hw, {B, 0, 0, 1, 2, false, false});
+            while (B < rows && AdaptiveTiler::RowLayout(B + 1, c.D, sizeof(S), 1, 2, 1).Total() <= hw.spmBytes) ++B;
+            AdaptiveTiler::ApplyRowPipe(plan, c.M, c.D, sizeof(S), hw, {B, 0, 0, 1, 2, 1, false, false});
         } else {
-            AdaptiveTiler::ApplyBandPipe(plan, c.M, c.D, sizeof(S), hw, {c.M, 1, 2});
+            AdaptiveTiler::ApplyBandPipe(plan, c.M, c.D, sizeof(S), hw, {c.M, 1, 2, 2});
         }
         char msg[160];
         std::snprintf(msg, sizeof msg, "%s wide plan M=%u D=%u mode=%s tileRows=%u", Name<C>(), c.M, c.D, ModeName(plan.mode), plan.tileRows);
@@ -350,7 +359,8 @@ void RunWidePlans(std::mt19937& rng) {
 // The coordinator's own workspace gives bit-identical results.
 // -----------------------------------------------------------------------------
 uint64_t SimulatorBuffers(const DaeLayout& L) {  // TPipe::InitBuffer blocks of one core
-    return L.depth * (L.paramQueue ? 3 : 2) + 1 + (L.z ? 1 : 0) + (L.params ? 1 : 0) + (L.resident ? 1 : 0) + (L.misc ? 1 : 0);
+    return L.depth * (L.paramQueue ? 3 : 2) + L.outDepth + 1 + (L.z ? 1 : 0) + (L.params ? 1 : 0) + (L.resident ? 1 : 0) +
+           (L.misc ? 1 : 0) + (L.rec ? 1 : 0);
 }
 
 template <class C>

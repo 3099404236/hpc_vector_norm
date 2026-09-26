@@ -81,24 +81,24 @@ For Profile 8 ($10240 \times 512$), $D=512$:
 2. Integrate the **64-element streaming reduction** so that state footprint per element drops from $20\text{B} \to 12\text{B}$, proving feasibility for $B=24 \sim 32$ for all medium row sizes.
 
 ### ✅ 40-Core Target Implementation (DAE)
-- **An exact memory model.** `DaeLayout` lists the buffers the kernel claims through `TPipe`, and the runtime traps above 195,584 B. The tests require every executed plan to claim exactly its layout, so the planner's arithmetic is checked on every run. For a row tile of $B$ rows with `depth` tiles in flight, each buffer rounded up to 32 bytes:
-  $$\text{MemoryModel}(B, D, s) = \underbrace{2 \cdot \text{depth} \cdot BDs}_{\text{X1, X2: depth tiles each}} + \underbrace{4BD\,[s < 4]}_{\text{FP32 Z tile}} + \underbrace{2 \cdot 4\,\text{rep}\,D}_{\gamma,\ \beta\ \text{(FP32, rep rows)}} + \underbrace{8192}_{\text{scratch}}$$
-- **20 B → 12 B per element.**
-  - Y has no buffer of its own: the result is cast back into the X1 slot and sent from there.
-  - $Z^2$ has no buffer either: the squares of a chunk of rows pass through the 8 KB scratch buffer. When the cost model says it is cheaper, one `BlockReduceSum` fold (8 → 1, 1 cycle per repeat) runs over the whole chunk first, and then one `VectorReduceSum` per row hands the row sum to the scalar unit without a stall. For $D = 512$ the fold leaves 64 partials per row, which is exactly the challenge's 64-element streaming accumulator. The kernel never uses the 14-cycle `WholeReduceSum`.
-  - What remains is the X1/X2 queues (4 B per element) plus the FP32 Z tile (4 B): 12 B for FP16/BF16. FP32 computes Z in place in the X1 slot, at 16 B.
-- **Closed form.** $B^*(D) = \lfloor (195{,}584 - 8{,}192 - 2 \cdot \text{Align}_{32}(4\,\text{rep}\,D)) / (bD) \rfloor$, with $b = 2 \cdot \text{depth} \cdot s + 4[s < 4]$ (12 for double-buffered 16-bit dtypes, 16 for FP32), less the 32-byte rounding of each buffer. At depth 2:
+- **An exact memory model.** `DaeLayout` lists the buffers the kernel claims through `TPipe`, and the runtime traps above 195,584 B. The tests require every executed plan to claim exactly its layout, so the planner's arithmetic is checked on every run. For a row tile of $B$ rows with `depth` tiles in flight and `outDepth` egress buffers, each buffer rounded up to 32 bytes:
+  $$\text{MemoryModel}(B, D, s) = \underbrace{2 \cdot \text{depth} \cdot BDs}_{\text{X1, X2: depth tiles each}} + \underbrace{\text{outDepth} \cdot BDs}_{\text{Y: egress (VECOUT)}} + \underbrace{4BD\,[s < 4]}_{\text{FP32 Z tile}} + \underbrace{2 \cdot 4\,\text{rep}\,D}_{\gamma,\ \beta\ \text{(FP32, rep rows)}} + \underbrace{9216}_{\text{scratch}}$$
+- **20 B → 14 B per element.**
+  - Y has one buffer of its own, in the output dtype. Until the DAE v1.4 errata it was cast back into the X1 slot and sent from there; the egress channel now reads VECOUT buffers only (Challenge 7).
+  - $Z^2$ has no buffer: the squares of a chunk of rows pass through the 8 KB scratch chunk. When the cost model says it is cheaper, one `BlockReduceSum` fold (8 → 1, 1 cycle per repeat) runs over the whole chunk first, into the 1 KB fold partition after it. Then one `VectorReduceSum` per row hands the row sum to the scalar unit without a stall. For $D = 512$ the fold leaves 64 partials per row, which is exactly the challenge's 64-element streaming accumulator. The kernel never uses the 14-cycle `WholeReduceSum`.
+  - What remains is the X1/X2 queues (4 B per element), the FP32 Z tile (4 B) and one egress buffer (2 B): 14 B for FP16/BF16. FP32 builds Z in its egress buffer, at 20 B.
+- **Closed form.** $B^*(D) = \lfloor (195{,}584 - 9{,}216 - 2 \cdot \text{Align}_{32}(4\,\text{rep}\,D)) / (bD) \rfloor$, with $b = 2 \cdot \text{depth} \cdot s + \text{outDepth} \cdot s + 4[s < 4]$ (14 for double-buffered 16-bit dtypes with one egress buffer, 20 for FP32), less the 32-byte rounding of each buffer. At depth 2 with one egress buffer:
 
   | $D$ (FP16) | 128 | 192 | 400 | 512 | 576 | 1024 |
   | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
-  | $B^*$, γ/β not replicated | 121 | 80 | 38 | 29 | 26 | 14 |
-  | $B^*$, γ/β replicated to 8 KB each | 111 | 74 | 35 | 27 | 25 | 13 |
+  | $B^*$, γ/β not replicated | 103 | 68 | 32 | 25 | 22 | 12 |
+  | $B^*$, γ/β replicated to 8 KB each | 94 | 63 | 30 | 23 | 21 | 11 |
 
 - **Spending spare scratchpad: replicated γ/β or deeper queues.** With γ/β replicated into `rep` rows, bias and γ take one instruction per `rep` rows instead of one per row. The schedule search (Challenge 3) weighs both uses of the space against tile size.
-  - **P08** could hold $B = 24 \dots 27$ rows double-buffered. The timeline showed that two such buffers leave the channel idle for 5.2 µs: each load waits for the store of the tile it replaces. P08 therefore runs four 15-row tiles in flight (60 rows) with `rep = 4`, in 178,176 B.
-  - **P14** gives up 10 of its 121 possible rows to replication, which cuts 22.5% of its vector cycles.
-- **Scalar stalls were the real batch-size problem.** The earlier kernel read every row sum back through `GetValue`, 500 cycles per row. At P08 that cost 128,000 stall cycles against 59,480 cycles of vector work. The busiest core is now at 52,591 cycles with no stalls, below its DMA time: 786 KB at 21.25 GB/s is 37.1 µs, against 52,591 cycles, which is 35.1 µs at 1.5 GHz. On the timeline P08 finishes at 37.90 µs: its streaming plus the last store's 0.8 µs latency, the least any schedule can reach.
-- **Column tiles** (rows longer than a row tile, and row-major Split-D fragments) cost $(6s + 4)$ B per element, plus the resident FP32 Z. The **column band** (P05) keeps the band's FP32 Z for all rows resident across the barrier, next to $k$-row tiles, the replicated γ/β band and the partial-sum records.
+  - **P08** could hold $B = 23 \dots 25$ rows double-buffered. The timeline showed that two such buffers leave the channel idle: each load waits for the store of the tile it replaces (5.2 µs, before the errata). P08 therefore runs four 12-row tiles in flight (48 rows), with two egress buffers and `rep = 4`, in 173,056 B.
+  - **P14** gives up 9 of its 103 possible rows to replication, which cuts 22.4% of its vector cycles.
+- **Scalar stalls were the real batch-size problem.** The earlier kernel read every row sum back through `GetValue`, 500 cycles per row. At P08 that cost 128,000 stall cycles against 59,480 cycles of vector work. The busiest core is now at 52,375 cycles with no stalls, below its DMA time: 786 KB at 21.25 GB/s is 37.1 µs, against 52,375 cycles, which is 34.9 µs at 1.5 GHz. On the timeline P08 finishes at 38.03 µs: its streaming, the last store's 0.8 µs latency, and 0.13 µs where the shared channel's order holds a load behind a store.
+- **Column tiles** (rows longer than a row tile, and row-major Split-D fragments) cost $(8s + 4)$ B per element (X1, X2, parameter chunks and egress buffers, two of each, plus FP32 Z), plus the resident FP32 Z. The **column band** (P05) keeps the band's FP32 Z for all rows resident across the barrier, next to $k$-row tiles, the replicated γ/β band and the partial-sum records.
 
 ### ✅ CPU Implementation
 - On a CPU, X1/X2/Y stream through the cache hierarchy, and the only per-element state is the FP32 Z row (4 B/element) in a per-thread 191 KB scratchpad: $\text{MemoryModel}(B, D) = 4 B D \le 195{,}584$.
@@ -127,19 +127,20 @@ In `kernel_unified.hpp`, implement a classic **Ping-Pong double-buffered asynchr
 
 ### ✅ 40-Core Target Implementation (DAE)
 - **Multi-buffering through the runtime's queues.** X1 and X2 use `TQue<VECIN, 4>`, and a plan claims `depth` = 2–4 buffers per queue.
-  - **Row tiles.** The prologue issues the loads of the first `depth` tiles and of γ/β, then widens γ/β, so every transfer is in flight before the first vector instruction and parameter loading is interleaved with input streaming, as the challenge suggests. γ/β go before tile 0 or right after it (`paramsFirst`), whichever finishes first. 16-bit γ/β are staged in the Z tile when it is larger than the scratch buffer (it is free until tile 0), so longer rows of them still widen in one instruction each. Replicating γ/β is scratchpad-to-scratchpad DMA, with no vector cycles. In the steady state, a tile's result leaves through its X1 buffer and the next X1 load is issued into it; X2 refills right after the tile's Z is built when the plan says `earlyX2`, else after the store.
-  - **Column band.** Tiles of band rows are `depth`-buffered. Sweep 2 narrows each tile into an X1 buffer other than the previous tile's, so narrowing never waits for the previous tile's stores to stream out.
+  - **Row tiles.** The prologue issues the loads of the first `depth` tiles and of γ/β, then widens γ/β, so every transfer is in flight before the first vector instruction and parameter loading is interleaved with input streaming, as the challenge suggests. γ/β go before tile 0 or right after it (`paramsFirst`), whichever finishes first. 16-bit γ/β are staged in the Z tile when it is larger than the scratch buffer (it is free until tile 0), so longer rows of them still widen in one instruction each. Replicating γ/β is scratchpad-to-scratchpad DMA, with no vector cycles. In the steady state, a tile's result leaves through the next of `outDepth` egress buffers (Challenge 7), and its X1 and X2 buffers refill right after the tile's Z is built when the plan says `earlyLoads`, else after the store.
+  - **Column band.** Tiles of band rows are `depth`-buffered. Sweep 2 narrows each tile into the next egress buffer, so narrowing never waits for the previous tile's stores to stream out.
   - **Column tiles.** X1, X2 and the β chunk of tile $k+1$ travel together before tile $k$ is processed. A resident sweep 2 streams γ chunks double-buffered, and its first chunk is issued before the `SyncAll`. Interior tile boundaries sit on the 32-byte grid.
 - **The schedule comes from the runtime's own timeline.** `include/dsa_runtime.hpp` times every operation: an in-order vector unit, one DMA channel shared by loads and stores (21.25 GB/s per core, each transfer landing 800 ns after it streamed), a unit for scratchpad copies, and a 32-byte block scoreboard between them. The planner replays each candidate schedule in the kernel's issue order under the same rules (`RowTilesTimeline`, `BandTimeline`, `ColumnTimeline`), and keeps the one whose slowest core finishes first. The replays equal the runtime's finish time on every plan the tests execute with γ and β on aligned tensors: row tiles to within 6e-15 relative, bands and column tiles exactly. For row tiles the search covers:
   - the queue depth, 2–4;
   - the body tile rows and the γ/β replication, both inside the Challenge 2 knapsack;
   - a head tile, which starts the vector unit sooner (prologue fill), and a tail tile, which lands the last store sooner (epilogue drain), each of 1, 2, 4 or 8 row units;
-  - the issue order: `paramsFirst` and `earlyX2`.
+  - the egress buffers, 1 or 2 (Challenge 7);
+  - the issue order: `paramsFirst` and `earlyLoads`.
 
-  Uniform body tiles make the replay a max-plus linear recurrence, so it jumps over whole periods once they repeat. A lower bound cuts each candidate short once it cannot win. A full-size profile plans in 0.2–2.1 ms (11 ms for P15).
+  Uniform body tiles make the replay a max-plus linear recurrence, so it jumps over whole periods once they repeat. A lower bound cuts each candidate short once it cannot win. A full-size profile plans in 0.15–3.5 ms (14 ms for P15).
 - **P04.** Each core's 20 rows run as tiles of 4 + 9 + 6 + 1 rows, three in flight, with γ/β loaded first. The vector unit starts after γ/β and a 4-row tile have landed, not a 10-row one, and the last store is one row. That is 2,362 vector cycles, more than 2 × 10 rows' 2,180, but 3.32 µs instead of 3.62 µs on the timeline (target: 3.23 µs). A vector-bound core cannot finish sooner than two DMA latencies plus its vector work: 3.17 µs for this tiling, and 3.05 µs for 2 × 10 rows, whose larger first and last tiles expose far more than that.
 - **Pipeline bubbles, measured.** `./hpc_vector_norm_bench --timeline` reports, for the core that finishes last, compute and streaming time, the bound $\max(T_\text{compute}, T_\text{DMA}) + T_\text{barrier}$, and the bubble above it split into fill, drain, mismatch and `SyncAll` wait. Over the 15 profiles, the timeline-driven schedule took the mean bubble ratio from 29.8% to 25.2% and the summed time from 1,176.3 to 1,140.0 µs. The mismatch fell from 38.3 to 7.7 µs, the fill from 8.2 to 4.1 µs and the drain from 14.1 to 12.2 µs (per-profile table in the README).
-- **Latency floor.** `TimelineSummary::LatencyFloor` replays the same program on a relaxed core with unlimited buffers and separate load and store queues. No run can finish before it, and the tests check that on every run. The excess over it, which is what buffer reuse and the shared channel's order cost, fell from 28.7 µs (2.30% mean) to 1.9 µs (0.05%), all of it on P12 and P15. What is left of the bubble is DMA latency: at least one latency on a DMA-bound core (P08–P11 and P13 have exactly 0.80 µs) and two on a vector-bound one (P01: 1.61 µs).
+- **Latency floor.** `TimelineSummary::LatencyFloor` replays the same program on a relaxed core with unlimited buffers and separate load and store queues. No run can finish before it, and the tests check that on every run. The excess over it, which is what buffer reuse and the shared channel's order cost, fell from 28.7 µs (2.30% mean) to 1.9 µs (0.05%), all of it on P12 and P15. Since the v1.4 errata it is 1.41 µs (0.06%), on P08, P12 and P15 (Challenge 7). What is left of the bubble is DMA latency: at least one latency on a DMA-bound core (P09–P11 and P13 have exactly 0.80 µs) and two on a vector-bound one (P01: 1.61 µs).
 - **The startup bubble was first scalar stalls.** P04's busiest core once spent 10,000 of its 12,692 cycles in 20 `GetValue` stalls, one per row. Without them, and with bias and γ applied once per tile, its vector work is:
   - per row: one `VectorReduceSum`, one `VectorInvRms` and one `Muls`;
   - per tile: seven tile-wide instructions (widen X1, widen X2, add, bias, squares, γ, narrow).
@@ -309,6 +310,56 @@ Refactor the DAE pipeline kernel and memory model to achieve full microarchitect
 4. **Freestanding Worker Dialect**:
    - Replace any remaining `<algorithm>` dependencies in `Core` with freestanding `dsa::Min` and `dsa::Max`.
 
+### ✅ 40-Core Target Implementation (DAE)
+- **Egress only from VECOUT.**
+  - `DaeLayout` gains `out` (one egress buffer of a tile, in the output dtype) × `outDepth`, and `rec` (the record a split plan publishes). The kernel claims them as `TQue<VECOUT, 4> qY` and `TBuf<VECOUT> bRec`.
+  - Every `DataCopy`/`DataCopyPad` to Y or to the partial-sum workspace now reads one of those buffers; none reads an input queue.
+  - **Row tiles.** 16-bit results are narrowed from the FP32 Z tile into the next egress buffer. FP32 builds Z = X1 + X2 directly in the egress buffer, so its result needs no copy.
+    - Y no longer occupies X1, so both input buffers are free as soon as Z is built. The planner can refill them right then (`earlyLoads`) instead of after the store; P11–P13 and P15 do.
+  - **Column band.** Sweep 2 narrows (16-bit) or copies (FP32, one `Muls` by 1) each tile into the next egress buffer. The record of partials is built in `bRec`.
+  - **Column tiles.** Every sweep-2 tile leaves through the next of two egress buffers, and the Split-D records through `bRec`.
+  - **Rotation.** `AllocTensor` returns the lowest free buffer, so a worker keeps each egress buffer until `outDepth − 1` later results have taken theirs (`ReleaseOut`). Results rotate through all the buffers, and a store never delays the next result's writes.
+- **Paying for the egress buffers.**
+  - A 16-bit row tile now costs `2·depth·s + outDepth·s + 4` B per element: 14 B double-buffered with one egress buffer, against 12 B before. An FP32 tile costs `(2·depth + outDepth)·4` B.
+  - The planner adds `outDepth` ∈ {1, 2} to its search and keeps whatever finishes first. All 15 profiles still fit; the largest claim is full-size P14's, 194,048 B, and at the benchmark's sizes P10's and P15's, 189,440 B.
+  - The knapsack table of Challenge 2 shrinks accordingly (29 → 25 rows at `D = 512`).
+- **No aliased folds.**
+  - The scratch buffer is 9 KB: the 8 KB chunk of squares, then a 1 KB fold partition.
+  - `BlockReduceSum(fold, tmp, n)` never writes the chunk it reads, and `VectorReduceSum` then reads the fold partition.
+  - The fold is still one instruction with the same cost, so the cycle model did not change.
+- **invD from the coordinator.**
+  - `DaePipeline::Execute` computes `invD = 1.0f / float(D)` once and passes it in `Args`.
+  - Every row's `VectorInvRms(sumSq, invD, eps)` costs 16 cycles and no stall. The deprecated `(sumSq, D, eps)` overload charged a 20-cycle scalar stall per row.
+  - All 15 profiles run with 0 scalar stalls.
+- **Freestanding dialect.** `Core`, and the planner helpers it calls (`RowSchedule::Rows`, `Range`), use `dsa::Min`/`dsa::Max`; no `<algorithm>` call is left on the worker's path. The coordinator and the planner run on the host and keep the standard library.
+- **Models kept exact.** The three timeline models mirror the new buffers:
+  - Row tiles free X1 after its first read, and make the FP32 add or the 16-bit narrowing wait until its egress buffer's last store has streamed out.
+  - The band rotates its sweep-2 tiles through the egress buffers.
+  - Column tiles rotate two egress buffers across all sweeps.
+
+  On every executed plan (γ and β present, aligned bases), the modeled finish time still equals the runtime's, and so does the vector cycle count.
+- **Results** (`./hpc_vector_norm_bench --target --timeline`):
+  - All 15 profiles run with 0 hardware traps, 0 scalar stalls and 0 padded transfers.
+  - The summed timeline goes from 1,140.00 to 1,139.53 µs; 12 profiles are unchanged.
+  - P15 is faster, 293.22 → 292.59 µs, because X1 frees before the store.
+  - P07 and P08 are slower, 31.96 → 31.99 and 37.90 → 38.03 µs: the egress buffer's scratchpad makes their tiles smaller (15 → 10 and 15 → 12 rows).
+  - The mean bubble ratio stays at 25.2%.
+- **Parity.** On the same inputs, against the pre-errata kernel:
+  - 11 of the 15 profiles are bit-identical, including every FP32 and BF16 profile.
+  - 204 of 133.5 M FP16 outputs (0.00015%) differ, each by one ulp. The causes are `invD`'s rounding where D is not a power of two, and new tile shapes that change which rows are folded 8 → 1 before their reduction.
+  - The worst error against the FP64 reference is unchanged on every profile.
+- **Verified** (`tests/test_dae_pipeline.cpp`).
+  - Every run executes under the v1.4 guards, and none fires.
+  - The plan checks require an egress buffer per tile, the 9 KB scratch buffer, and a VECOUT record exactly for split plans.
+  - The heap probe counts the new buffers.
+  - The schedule sweep adds `outDepth` ∈ {1, 2}.
+  - The waterline plan is re-sized to FP32 72-row tiles with one egress buffer, still exactly 195,584 B.
+  - Every run must show 0 scalar stalls.
+- **Not covered by v1.4's guards.** The errata also states that the ingress channel writes VECIN only. The kernel still DMAs γ/β into VECCALC buffers (FP32 straight into the resident parameter block, 16-bit into a staging buffer), and gathers the partial records into a VECCALC buffer. v1.4 checks egress only. Moving those transfers to VECIN would cost scratchpad: P10 and P15 have 6 KB to spare.
+
+### CPU Implementation
+Not applicable: the host executor has no DMA channels or scratchpad queues, and does not run on `dsa_runtime`.
+
 ---
 
 ## 📏 Cost Model & Methodology
@@ -351,18 +402,18 @@ The host constants were measured on the reference CI host, a 4-core Cascade Lake
 
 - **Crossover.** The measured T=1/T=4 crossover is 12–16K elements, which matches $\text{launch} \cdot P / ((P-1) c) \approx 15.6\text{K}$.
 - **Team size.** Resizing an OpenMP team between calls cost 70–330 µs per call. For that reason the team is always either the caller alone or all `P` threads.
-- **Planning cost.** Planning takes 60–75 ns on the host, so each thread memoizes the plan of its last shape. A full-size target plan, which replays every candidate schedule on the timeline models, takes 0.2–2.1 ms (11 ms for P15).
+- **Planning cost.** Planning takes 60–75 ns on the host, so each thread memoizes the plan of its last shape. A full-size target plan, which replays every candidate schedule on the timeline models, takes 0.15–3.5 ms (14 ms for P15).
 - **Portability.** Hosts with a different fork/join cost or core speed can re-tune these constants; the formulas stay the same.
 
 ### Tests
 
 - **`tests/test_correctness.cpp`** forces every host plan variant (Split-D, streaming, recomputed Z) with 1–40 threads against an FP64 reference. It also checks for writes outside Y and for bitwise-identical results across serpentine directions.
-- **`tests/test_dae_pipeline.cpp`** (56,098 checks):
+- **`tests/test_dae_pipeline.cpp`** (70,871 checks):
   - It checks the invariants of the 15 full-size target plans, and of 2,448 more shapes in every forced mode.
   - It runs a plan that fills the scratchpad to the byte (195,584 B).
   - It runs model-chosen, rows, row-major Split-D and column-band plans of 20 shapes through the DAE runtime: with and without γ/β, on aligned and offset bases, in FP32/FP16/BF16. It also runs plans whose tiles span several row groups.
-  - A schedule sweep forces every combination of queue depth (2–4), head tile (none, 1 or 4 rows), tail tile (none or 2 rows) and issue order (γ/β first or second, early X2 or not) onto 22-row cores, in FP32 and FP16.
-  - Every run must match an FP64 reference and leave canaries around Y intact. It must have zero scalar stalls, one `SyncAll` exactly when split, a scratchpad claim equal to the plan, the planner's cycle count, and zero padded transfers wherever rows end on 32-byte blocks.
+  - A schedule sweep forces every combination of queue depth (2–4), egress buffers (1 or 2), head tile (none, 1 or 4 rows), tail tile (none or 2 rows) and issue order (γ/β first or second, early input loads or not) onto 22-row cores, in FP32 and FP16.
+  - Every run must match an FP64 reference and leave canaries around Y intact. It must have zero scalar stalls, one `SyncAll` exactly when split, a scratchpad claim equal to the plan, the planner's cycle count, and zero padded transfers wherever rows end on 32-byte blocks. Every run executes under the DAE v1.4 guards (Challenge 7), so a store from an input buffer or an aliased fold aborts the suite.
   - Its timeline must equal the planner's modeled finish time (γ and β present, aligned bases, every mode). Its parts must add up (finish = busy + fill + drain + barrier + mismatch), and it must finish at or above both the bound and the latency floor.
   - Challenge 6 checks: a heap probe (`operator new` during `Execute`), bit-identical results from both workspace entry points, and death tests for every `DSA_ASSERT`. A trap aborts the run and reports which run was in progress.
   - Mutations it catches (failed checks):
@@ -376,10 +427,11 @@ The host constants were measured on the reference CI host, a 4-core Cascade Lake
     - the team-size `DSA_ASSERT` removed (1);
     - a cycle model without row groups (15);
     - wrong row-group offsets (18 and 6);
-    - a kernel that ignores the plan's `earlyX2` (54), `paramsFirst` (97), head and tail tiles (160), or queue depth in its prologue (112);
-    - stores that land without latency in the runtime (1,322; `test_dsa_runtime` fails too);
-    - a row-tile model without store latency (235);
-    - a latency floor one cycle too high per vector instruction (953) or per store (779; `test_dsa_runtime` fails on both).
+    - a kernel that ignores the plan's `earlyLoads` (110), `paramsFirst` (145), head and tail tiles (280), or queue depth in its prologue (208);
+    - stores that land without latency in the runtime (1,467; `test_dsa_runtime` fails too);
+    - a row-tile model without store latency (379);
+    - a latency floor one cycle too high per vector instruction (1,120) or per store (968; `test_dsa_runtime` fails on both);
+    - Challenge 7: row tiles storing from their X1 buffer (the suite aborts on Trap #401), a fold onto its own chunk (aborts on Trap #402), the worker converting D itself through the deprecated `VectorInvRms` overload (1,719: every row stalls), a layout that forgets the egress buffers (aborts on the 191 KB overflow trap), a row model that ignores a busy egress buffer (80), and a kernel that frees each egress buffer at once instead of rotating them (130).
 - **`tests/test_dsa_runtime.cpp`** (`ctest -R dsa_runtime_sanitizer`) checks every sanitizer trap, including the new queue-lifecycle, address-alignment and `DataCopyPad` checks. It also checks the timeline model:
   - a load → add → store chain finishes at exactly load + latency + add + store + latency, on its floor;
   - a second tile's load streams under the first tile's add;
