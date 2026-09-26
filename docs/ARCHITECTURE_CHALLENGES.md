@@ -404,6 +404,13 @@ As target hardware simulation fidelity is upgraded to reflect the physical strea
    - **Native FP16 Dual-Width ALU**: FP16 possesses native 16-bit binary addition `Add(x, x, r)`, reducing arithmetic passes from 3 to 1.5; BF16 lacks native vector binary addition and must be widened to FP32 first.
    - **Newton-Raphson Precision Refinement**: Hardware `Rsqrt` provides $\sim 11\text{-bit}$ table-lookup precision; full 24-bit FP32 precision requires 1–2 Newton-Raphson iterations (`RefineInvRms`).
 
+8. **Extended Co-Processor Microarchitectural Primitives**:
+   - **Global Memory Descriptors (`GlobalTensor<T>`)**: Explicit host-to-device memory window abstraction supporting slice offset arithmetic and typed global buffer binding (`SetGlobalBuffer`).
+   - **Strided & Padded DMA Descriptors (`DataCopyExtParams`, `DataCopyPadExtParams<T>`)**: First-class hardware transaction descriptors controlling 2D strided transfers and tail zero-padding without scalar loop overhead.
+   - **Vector ALU Scalar Offset (`dsa::Adds`)**: Single-issue vector-scalar addition primitive for bias offsets and epsilon additions.
+   - **Precision Converters (`ToFloat`, `FromFloat`, `RoundMode`)**: Hardware rounding mode controls (`RoundMode::CAST_NONE`, `RoundMode::CAST_RINT`) enabling high-precision FP32 normalization pipelines with zero register pressure.
+   - **Explicit Fine-Grained Scoreboard Flags (`pipe_barrier`, `set_flag`, `wait_flag`)**: Native co-processor point-to-point fence primitives matching hardware instruction set semantics.
+
 ### The Objective
 Empower the DAE execution framework to fully respect physical microarchitectural contracts:
 1. Support direct scratchpad mode (`LocalMemAllocator` / `TBufDirect`) for latency-critical micro-tiles ($M \cdot D < 1\text{K}$).
@@ -411,6 +418,7 @@ Empower the DAE execution framework to fully respect physical microarchitectural
 3. Maintain disjoint memory partitions across reduction trees (`fold`, `tmp`, `scalar`, `bcast`).
 4. Replace scalar stalls with single-cycle `Brcb` broadcasts.
 5. Flatten kernel launch signatures into primitive scalar and pointer parameters.
+6. Adopt native `ToFloat` / `FromFloat` and `DataCopyExtParams` descriptors across all execution kernels.
 
 ---
 

@@ -50,7 +50,107 @@
     } while (0)
 #endif
 
+#ifndef __gm__
+#define __gm__
+#endif
+
+#ifndef __aicore__
+#define __aicore__
+#endif
+
+using GM_ADDR = void*;
+
 namespace dsa {
+
+#ifndef DAE_HALF_DEFINED
+#define DAE_HALF_DEFINED
+struct half {
+    uint16_t data = 0;
+    half() = default;
+    half(float f) {
+        uint32_t x;
+        std::memcpy(&x, &f, 4);
+        uint32_t sign = (x >> 16) & 0x8000;
+        int32_t exp = ((x >> 23) & 0xff) - 127 + 15;
+        uint32_t mant = (x >> 13) & 0x3ff;
+        if (exp <= 0) {
+            data = static_cast<uint16_t>(sign);
+        } else if (exp >= 31) {
+            data = static_cast<uint16_t>(sign | 0x7c00);
+        } else {
+            data = static_cast<uint16_t>(sign | (exp << 10) | mant);
+        }
+    }
+    operator float() const {
+        uint32_t sign = (data & 0x8000) << 16;
+        int32_t exp = (data >> 10) & 0x1f;
+        uint32_t mant = (data & 0x3ff) << 13;
+        if (exp == 0) {
+            if (mant == 0) return (sign ? -0.0f : 0.0f);
+            exp = 1;
+            while (!(mant & 0x00800000)) { mant <<= 1; exp--; }
+            mant &= 0x007fffff;
+        } else if (exp == 31) {
+            exp = 255;
+        } else {
+            exp = exp - 15 + 127;
+        }
+        uint32_t x = sign | (static_cast<uint32_t>(exp) << 23) | mant;
+        float f;
+        std::memcpy(&f, &x, 4);
+        return f;
+    }
+    half operator+(half other) const { return half(float(*this) + float(other)); }
+    half operator*(half other) const { return half(float(*this) * float(other)); }
+    half& operator+=(half other) { *this = *this + other; return *this; }
+    half& operator*=(half other) { *this = *this * other; return *this; }
+};
+#endif
+
+#ifndef DAE_BFLOAT16_DEFINED
+#define DAE_BFLOAT16_DEFINED
+struct bfloat16_t {
+    uint16_t data = 0;
+    bfloat16_t() = default;
+    bfloat16_t(float f) {
+        uint32_t x;
+        std::memcpy(&x, &f, 4);
+        data = static_cast<uint16_t>(x >> 16);
+    }
+    operator float() const {
+        uint32_t x = static_cast<uint32_t>(data) << 16;
+        float f;
+        std::memcpy(&f, &x, 4);
+        return f;
+    }
+    bfloat16_t operator+(bfloat16_t other) const { return bfloat16_t(float(*this) + float(other)); }
+    bfloat16_t operator*(bfloat16_t other) const { return bfloat16_t(float(*this) * float(other)); }
+    bfloat16_t& operator+=(bfloat16_t other) { *this = *this + other; return *this; }
+    bfloat16_t& operator*=(bfloat16_t other) { *this = *this * other; return *this; }
+};
+#endif
+
+// Global Memory Descriptor (Co-processor system memory buffer)
+template <typename T>
+class GlobalTensor {
+public:
+    T* data = nullptr;
+
+    GlobalTensor() = default;
+    explicit GlobalTensor(T* ptr) : data(ptr) {}
+
+    void SetGlobalBuffer(T* ptr, size_t count = 0) {
+        (void)count;
+        data = ptr;
+    }
+
+    T* GetData() const { return data; }
+    operator T*() const { return data; }
+    operator const T*() const { return data; }
+    T* operator+(size_t offset) const { return data + offset; }
+    GlobalTensor<T> operator[](size_t offset) const { return GlobalTensor<T>(data + offset); }
+};
+
 
 // -----------------------------------------------------------------------------
 // Freestanding Execution Guidelines: Master Coordinator vs. Worker Threads
@@ -411,7 +511,10 @@ enum PipeType {
     PIPE_V = 0,
     PIPE_DMA_IN = 1,
     PIPE_DMA_OUT = 2,
-    PIPE_ALL = 3
+    PIPE_ALL = 3,
+    PIPE_MTE2 = 1,
+    PIPE_MTE3 = 2,
+    PIPE_S = 4
 };
 
 template <PipeType pipe>
@@ -421,6 +524,32 @@ inline void PipeBarrier() {
     #endif
     g_cycleTracker.barrierCycles += 20;
     if (pipe == PIPE_ALL) g_timeline.DrainAll();
+}
+
+inline void pipe_barrier(PipeType pipe) {
+    if (pipe == PIPE_ALL) {
+        PipeBarrier<PIPE_ALL>();
+    } else if (pipe == PIPE_V) {
+        PipeBarrier<PIPE_V>();
+    } else if (pipe == PIPE_DMA_IN) {
+        PipeBarrier<PIPE_DMA_IN>();
+    } else if (pipe == PIPE_DMA_OUT) {
+        PipeBarrier<PIPE_DMA_OUT>();
+    }
+}
+
+inline void set_flag(PipeType src, PipeType dst, uint8_t eventId = 0) {
+    (void)src; (void)dst; (void)eventId;
+    #if defined(__GNUC__) || defined(__clang__)
+    __asm__ __volatile__("" ::: "memory");
+    #endif
+}
+
+inline void wait_flag(PipeType src, PipeType dst, uint8_t eventId = 0) {
+    (void)src; (void)dst; (void)eventId;
+    #if defined(__GNUC__) || defined(__clang__)
+    __asm__ __volatile__("" ::: "memory");
+    #endif
 }
 
 // -----------------------------------------------------------------------------
@@ -491,6 +620,22 @@ inline uint32_t GetCoreNum() {
     return static_cast<uint32_t>(omp_get_num_threads());
 }
 
+inline uint32_t GetBlockIdx() {
+    return GetCoreIdx();
+}
+
+inline uint32_t GetBlockNum() {
+    return GetCoreNum();
+}
+
+inline int64_t get_ctrl() {
+    return 0;
+}
+
+inline void set_ctrl(int64_t ctrl) {
+    (void)ctrl;
+}
+
 // Standard OpenMP-style CPU thread indexing
 inline uint32_t GetThreadIdx() {
     return static_cast<uint32_t>(omp_get_thread_num());
@@ -555,6 +700,13 @@ public:
     inline const T* GetData() const { return data; }
     inline uint32_t GetSize() const { return count; }
     inline QuePosition GetPosition() const { return pos; }
+
+    template <typename U>
+    inline LocalTensor<U> ReinterpretCast() const {
+        return LocalTensor<U>(reinterpret_cast<U*>(data),
+                              (sizeof(U) > 0) ? (capacityBytes / sizeof(U)) : 0,
+                              capacityBytes, pos);
+    }
 };
 
 // -----------------------------------------------------------------------------
@@ -840,6 +992,40 @@ inline void DataCopy(T* dst, LocalTensor<T> src, uint32_t count) {
 }
 
 // -----------------------------------------------------------------------------
+// Strided & Padded DMA Parameter Descriptors
+// -----------------------------------------------------------------------------
+struct DataCopyExtParams {
+    uint16_t blockCount = 1;
+    uint32_t blockLen = 0; // Length in bytes
+    uint16_t srcStride = 0;
+    uint16_t dstStride = 0;
+    uint32_t rsv = 0;
+};
+
+template <typename T>
+struct DataCopyPadExtParams {
+    bool isPad = false;
+    uint8_t leftPadding = 0;
+    uint8_t rightPadding = 0;
+    T paddingValue = T(0);
+};
+
+struct UnaryRepeatParams {
+    uint8_t dstRepStride = 1;
+    uint8_t srcRepStride = 1;
+    uint8_t dstBlkStride = 8;
+    uint8_t srcBlkStride = 8;
+};
+
+enum class RoundMode {
+    CAST_NONE = 0,
+    CAST_RINT = 1,
+    CAST_FLOOR = 2,
+    CAST_CEIL = 3,
+    CAST_TRUNC = 4
+};
+
+// -----------------------------------------------------------------------------
 // Padded DMA for transfers that are not whole 32-byte blocks (row tails, tensor ends).
 // System memory may be at any address and length; the scratchpad side stays block
 // aligned. Loads zero-fill the rest of the last block; stores write only `count`
@@ -879,6 +1065,49 @@ inline void DataCopyPad(T* dst, LocalTensor<T> src, uint32_t count) {
     g_timeline.Store(static_cast<double>(blockBytes), SpanOf(src.GetData(), count));
 }
 
+template <typename T>
+inline void DataCopy(LocalTensor<T> dst, GlobalTensor<T> src, uint32_t count) {
+    DataCopy(dst, src.GetData(), count);
+}
+
+template <typename T>
+inline void DataCopy(GlobalTensor<T> dst, LocalTensor<T> src, uint32_t count) {
+    DataCopy(dst.GetData(), src, count);
+}
+
+template <typename T>
+inline void DataCopyPad(LocalTensor<T> dst, GlobalTensor<T> src, uint32_t count) {
+    DataCopyPad(dst, src.GetData(), count);
+}
+
+template <typename T>
+inline void DataCopyPad(GlobalTensor<T> dst, LocalTensor<T> src, uint32_t count) {
+    DataCopyPad(dst.GetData(), src, count);
+}
+
+template <typename T>
+inline void DataCopyPad(LocalTensor<T> dst, const T* src, DataCopyExtParams cp, DataCopyPadExtParams<T> pad = {}) {
+    (void)pad;
+    uint32_t count = (sizeof(T) > 0) ? (cp.blockLen / sizeof(T)) : 0;
+    DataCopyPad(dst, src, count);
+}
+
+template <typename T>
+inline void DataCopyPad(LocalTensor<T> dst, GlobalTensor<T> src, DataCopyExtParams cp, DataCopyPadExtParams<T> pad = {}) {
+    DataCopyPad(dst, src.GetData(), cp, pad);
+}
+
+template <typename T>
+inline void DataCopyPad(T* dst, LocalTensor<T> src, DataCopyExtParams cp) {
+    uint32_t count = (sizeof(T) > 0) ? (cp.blockLen / sizeof(T)) : 0;
+    DataCopyPad(dst, src, count);
+}
+
+template <typename T>
+inline void DataCopyPad(GlobalTensor<T> dst, LocalTensor<T> src, DataCopyExtParams cp) {
+    DataCopyPad(dst.GetData(), src, cp);
+}
+
 // -----------------------------------------------------------------------------
 // Direct Byte-Precise Padded Transfer Shorthands (LoadPad / StorePad)
 // Tolerates non-32B aligned element counts with hardware zero-fill.
@@ -889,8 +1118,18 @@ inline void LoadPad(LocalTensor<T> dst, const T* src, uint32_t count) {
 }
 
 template <typename T>
+inline void LoadPad(LocalTensor<T> dst, GlobalTensor<T> src, uint32_t count) {
+    DataCopyPad(dst, src.GetData(), count);
+}
+
+template <typename T>
 inline void StorePad(T* dst, LocalTensor<T> src, uint32_t count) {
     DataCopyPad(dst, src, count);
+}
+
+template <typename T>
+inline void StorePad(GlobalTensor<T> dst, LocalTensor<T> src, uint32_t count) {
+    DataCopyPad(dst.GetData(), src, count);
 }
 
 template <typename T>
@@ -942,6 +1181,17 @@ inline void Muls(LocalTensor<T> dst, LocalTensor<T> src, float scalar, uint32_t 
     g_timeline.Vector(2 * repeats + 13, SpanOf(dst.data, count), SpanOf(src.data, count));
 }
 
+template <typename T>
+inline void Adds(LocalTensor<T> dst, LocalTensor<T> src, float scalar, uint32_t count) {
+    #pragma omp simd
+    for (uint32_t i = 0; i < count; ++i) {
+        dst.data[i] = static_cast<T>(static_cast<float>(src.data[i]) + scalar);
+    }
+    uint32_t repeats = (count * sizeof(T) + SIMD_REPEAT_BYTES - 1) / SIMD_REPEAT_BYTES;
+    g_cycleTracker.vAddCycles += 2 * repeats + 13;
+    g_timeline.Vector(2 * repeats + 13, SpanOf(dst.data, count), SpanOf(src.data, count));
+}
+
 // Element-wise format conversion (e.g. FP16/BF16 <-> FP32).
 template <typename D, typename S, typename Convert>
 inline void Cast(LocalTensor<D> dst, LocalTensor<S> src, uint32_t count, Convert convert) {
@@ -952,6 +1202,41 @@ inline void Cast(LocalTensor<D> dst, LocalTensor<S> src, uint32_t count, Convert
     uint32_t repeats = static_cast<uint32_t>((count * widest + SIMD_REPEAT_BYTES - 1) / SIMD_REPEAT_BYTES);
     g_cycleTracker.vCastCycles += 2 * repeats + 13;
     g_timeline.Vector(2 * repeats + 13, SpanOf(dst.data, count), SpanOf(src.data, count));
+}
+
+template <typename D, typename S>
+inline void Cast(LocalTensor<D> dst, LocalTensor<S> src, uint32_t count) {
+    Cast(dst, src, count, [](S x) { return static_cast<D>(x); });
+}
+
+template <typename D, typename S>
+inline void Cast(LocalTensor<D> dst, LocalTensor<S> src, RoundMode mode, uint32_t count) {
+    (void)mode;
+    Cast(dst, src, count, [](S x) { return static_cast<D>(x); });
+}
+
+template <typename D, typename S>
+inline void Cast(LocalTensor<D> dst, LocalTensor<S> src, RoundMode mode, uint64_t count, uint8_t rep, UnaryRepeatParams params) {
+    (void)mode; (void)rep; (void)params;
+    Cast(dst, src, static_cast<uint32_t>(count), [](S x) { return static_cast<D>(x); });
+}
+
+template <typename T>
+inline void ToFloat(LocalTensor<float> dst, LocalTensor<T> src, uint32_t count) {
+    if constexpr (std::is_same_v<T, float>) {
+        Adds(dst, src, 0.0f, count);
+    } else {
+        Cast(dst, src, RoundMode::CAST_NONE, count);
+    }
+}
+
+template <typename T>
+inline void FromFloat(LocalTensor<T> dst, LocalTensor<float> src, uint32_t count) {
+    if constexpr (std::is_same_v<T, float>) {
+        Adds(dst, src, 0.0f, count);
+    } else {
+        Cast(dst, src, RoundMode::CAST_RINT, count);
+    }
 }
 
 template <typename T>

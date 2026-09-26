@@ -371,6 +371,70 @@ int main() {
         }
     }
 
+    // -------------------------------------------------------------------------
+    // Test 10: Extended Microarchitectural Primitives
+    // GlobalTensor, DataCopyExtParams, Adds, ToFloat/FromFloat, ReinterpretCast, half
+    // -------------------------------------------------------------------------
+    {
+        std::cout << "\n[Testing Extended Microarchitectural Primitives]...\n";
+        LocalMemAllocator<Hardware::UB> mem;
+        auto vecF = mem.Alloc<float, 64>();
+        auto vecH = mem.Alloc<half, 64>();
+        auto auxF = mem.Alloc<float, 64>();
+
+        // ReinterpretCast
+        auto reF = vecF.ReinterpretCast<float>();
+        if (reF.GetSize() != 64) {
+            std::cerr << "FAIL: ReinterpretCast size mismatch\n";
+            ok = false;
+        }
+
+        // GlobalTensor & DataCopyExtParams
+        AlignedVector<float> gBuf(64, 5.0f);
+        GlobalTensor<float> gm(gBuf.data());
+        DataCopyExtParams cp{1, 64 * sizeof(float), 0, 0, 0};
+        DataCopyPad(vecF, gm, cp);
+        if (vecF.data[0] != 5.0f || vecF.data[63] != 5.0f) {
+            std::cerr << "FAIL: GlobalTensor DataCopyPad failed\n";
+            ok = false;
+        }
+
+        // Adds
+        Adds(auxF, vecF, 3.0f, 64);
+        if (auxF.data[0] != 8.0f || auxF.data[63] != 8.0f) {
+            std::cerr << "FAIL: Adds scalar failed\n";
+            ok = false;
+        }
+
+        // ToFloat and FromFloat
+        for (int i = 0; i < 64; ++i) vecH.data[i] = half(2.5f);
+        ToFloat(auxF, vecH, 64);
+        if (std::fabs(auxF.data[0] - 2.5f) > 1e-3f) {
+            std::cerr << "FAIL: ToFloat failed\n";
+            ok = false;
+        }
+        FromFloat(vecH, auxF, 64);
+        if (std::fabs(float(vecH.data[0]) - 2.5f) > 1e-3f) {
+            std::cerr << "FAIL: FromFloat failed\n";
+            ok = false;
+        }
+
+        // Pipeline barriers & flags
+        pipe_barrier(PIPE_V);
+        set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+        wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+
+        // Core / Block indexing & ctrl
+        int64_t ctrl = get_ctrl();
+        set_ctrl(ctrl | (int64_t(1) << 48));
+        if (GetBlockIdx() != GetCoreIdx() || GetBlockNum() != GetCoreNum()) {
+            std::cerr << "FAIL: Block / Core index mismatch\n";
+            ok = false;
+        }
+
+        std::cout << "PASS: Extended Microarchitectural Primitives verified successfully\n";
+    }
+
     if (!ok) return 1;
 
     std::cout << "\n=================================================================\n";
