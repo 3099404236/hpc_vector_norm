@@ -897,7 +897,7 @@ namespace Hardware {
 template <typename TargetSpace = Hardware::UB>
 class LocalMemAllocator {
 public:
-    uint8_t pool[SCRATCHPAD_SAFE_WATERLINE] alignas(64);
+    alignas(64) uint8_t pool[SCRATCHPAD_SAFE_WATERLINE];
     size_t offset = 0;
 
     LocalMemAllocator() = default;

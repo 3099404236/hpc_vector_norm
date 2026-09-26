@@ -206,7 +206,7 @@ int main(int argc, char** argv) {
         else if (!tp.tileRows && tp.zResident) tile += " +Z";
         std::ostringstream row;
         row << std::left << std::setw(18) << tc.name
-            << std::setw(7) << (rows ? "rows" : tp.mode == hpc::TilingMode::SPLIT_D ? "split" : "band")
+            << std::setw(7) << (tp.direct ? "direct" : rows ? "rows" : tp.mode == hpc::TilingMode::SPLIT_D ? "split" : "band")
             << std::setw(6) << tp.blocks
             << std::setw(8) << (rows ? std::to_string(tp.unitElems / tc.D) + " row" : std::to_string(tp.unitElems * eb) + " B")
             << std::setw(22) << (std::to_string(busiest) + " (min " + std::to_string(std::min(busiest, lightest)) + ")")
@@ -228,14 +228,15 @@ int main(int argc, char** argv) {
                 if (std::fabs(a - t) > 1e-5 + 2.0 * relTol * std::fabs(a)) verdict = "MISMATCH";
             }
             if (verdict == "PASS" && st.spmBytes != tp.layout.Total()) verdict = "SPM != plan";
-            row << std::setw(10) << st.vectorCycles << std::setw(8) << st.scalarStalls << std::setw(9) << std::setprecision(1)
-                << st.dmaBytes / 1e6 << std::setw(6) << st.padTransfers << verdict;
+            row << std::setw(10) << st.vectorCycles << std::setw(9) << st.queueCycles << std::setw(8) << st.scalarStalls
+                << std::setw(9) << std::setprecision(1) << st.dmaBytes / 1e6 << std::setw(6) << st.padTransfers << verdict;
             if (timeline) {  // The core that finishes last, in us at the timeline clock
                 const dsa::TimelineSummary& t = st.timeline;
                 const double us = 1.0 / (dsa::CLOCK_GHZ * 1e3);
                 std::ostringstream tl;
                 tl << std::left << std::setw(18) << tc.name << std::right << std::fixed << std::setprecision(2)
-                   << std::setw(9) << t.finish * us << std::setw(10) << t.finish << std::setw(9) << t.vectorBusy * us
+                   << std::setw(9) << t.finish * us << std::setw(8) << st.queueCycles * us << std::setw(10) << t.finish
+                   << std::setw(9) << t.vectorBusy * us
                    << std::setw(9) << t.dmaBusy * us << std::setw(8) << t.syncCycles * us << std::setw(9) << t.LowerBound() * us
                    << std::setw(8) << t.fill * us << std::setw(8) << t.drain * us << std::setw(10) << t.mismatch * us
                    << std::setw(8) << (t.barrier - t.syncCycles) * us << std::setw(9) << t.Bubble() * us << std::setw(8)
@@ -251,39 +252,46 @@ int main(int argc, char** argv) {
     }
 
     std::cout << std::string(104, '=') << "\n";
-    const size_t width = simulateTarget ? 158 : 125;
+    const size_t width = simulateTarget ? 167 : 125;
     std::cout << "\nTarget deployment plan (HardwareModel::Target(): 40 cores, 32-byte DMA blocks, 191 KB scratchpad/core;"
               << " model at " << hpc::HardwareModel::Target().clockGHz << " GHz, busiest core)"
               << (simulateTarget ? ", executed on the DAE simulation" : "") << "\n";
     std::cout << std::left << std::setw(18) << "Case Name" << std::setw(7) << "Mode" << std::setw(6) << "Cores"
               << std::setw(8) << "Unit" << std::setw(22) << "Busiest core (elems)" << std::setw(16) << "Tile"
               << std::setw(8) << "SPM KB" << std::setw(10) << "Model cyc" << std::setw(10) << "Model us"
-              << (simulateTarget ? "Cycles    Stalls  DMA MB   Pads  Sanitizer / result" : "") << "\n";
+              << (simulateTarget ? "Cycles    Queue    Stalls  DMA MB   Pads  Sanitizer / result" : "") << "\n";
     std::cout << std::string(width, '-') << "\n";
     for (const auto& r : targetRows) std::cout << r << "\n";
+    if (simulateTarget) {
+        std::cout << "Cycles: the busiest core's vector, scalar-stall, barrier and queue sequencer cycles. Queue: the most TQue\n"
+                  << "sequencer cycles of any core (625 per lifecycle step; the direct kernel takes none).\n";
+    }
     std::cout << std::string(width, '=') << "\n";
     if (timeline) {
         std::cout << "\nTarget timeline (core that finishes last; us at " << dsa::CLOCK_GHZ << " GHz; bound = max(compute, stream) + sync;"
                   << " bubble = total - bound = fill + drain + mismatch + wait)\n";
-        std::cout << std::left << std::setw(18) << "Case Name" << std::right << std::setw(9) << "Total" << std::setw(10) << "Cycles"
+        std::cout << std::left << std::setw(18) << "Case Name" << std::right << std::setw(9) << "Total" << std::setw(8) << "Queue"
+                  << std::setw(10) << "Cycles"
                   << std::setw(9) << "Compute" << std::setw(9) << "Stream" << std::setw(8) << "Sync" << std::setw(9) << "Bound"
                   << std::setw(8) << "Fill" << std::setw(8) << "Drain" << std::setw(10) << "Mismatch" << std::setw(8) << "Wait"
                   << std::setw(9) << "Bubble" << std::setw(9) << "Ratio" << std::setw(6) << "Crit" << std::setw(9) << "Floor"
                   << std::setw(8) << "Excess" << std::setw(10) << "Model us" << "\n";
-        std::cout << std::string(167, '-') << "\n";
+        std::cout << std::string(175, '-') << "\n";
         for (const auto& r : timelineRows) std::cout << r << "\n";
-        std::cout << std::string(167, '-') << "\n";
+        std::cout << std::string(175, '-') << "\n";
         std::cout << "Mean bubble ratio: " << std::fixed << std::setprecision(1) << 100.0 * bubbleSum / timelineRows.size()
                   << "%   Mean excess over the latency floor: " << std::setprecision(2) << 100.0 * excessSum / timelineRows.size() << "%\n";
         std::cout << "Compute: vector pipe busy. Stream: system-memory channel busy (loads and stores share "
                   << dsa::DMA_BYTES_PER_CYCLE * dsa::CLOCK_GHZ << " GB/s per core; " << dsa::DMA_LATENCY_CYCLES / dsa::CLOCK_GHZ
                   << " ns latency per transfer, overlapped when pipelined).\n"
+                  << "Queue: TQue sequencer time of the busiest core, which the runtime counts but keeps off the timeline. A core with a\n"
+                  << "single tile has nothing to overlap it with (latency = Total + Queue); shares of <= 512 B run direct (Queue 0).\n"
                   << "Fill / Drain: the critical unit (Crit) idle before its first / after its last operation. Mismatch: idle in between.\n"
                   << "Wait: SyncAll time beyond its own " << dsa::SYNC_ALL_CYCLES << " cycles. Model us: the planner's estimate.\n"
                   << "Floor: the same program replayed with unlimited buffers and stores off the load queue (dsa::TimelineSummary::LatencyFloor):\n"
                   << "its DMA latency and dependencies alone; no run finishes sooner. Excess = Total - Floor: the cost of buffer reuse, the shared\n"
                   << "channel's order and SyncAll waits.\n";
-        std::cout << std::string(167, '=') << "\n";
+        std::cout << std::string(175, '=') << "\n";
     }
     std::cout << "All benchmark tests completed successfully.\n";
     return 0;

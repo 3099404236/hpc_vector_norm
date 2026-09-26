@@ -420,6 +420,51 @@ Empower the DAE execution framework to fully respect physical microarchitectural
 5. Flatten kernel launch signatures into primitive scalar and pointer parameters.
 6. Adopt native `ToFloat` / `FromFloat` and `DataCopyExtParams` descriptors across all execution kernels.
 
+### ✅ 40-Core Target Implementation (DAE)
+- **Direct kernel for single-tile shares (Objective 1).**
+  - **Why.** A row tile takes ten `TQue` lifecycle steps: `AllocTensor`, `EnQue`, `DeQue` and `FreeTensor` for each of X1 and X2, and `AllocTensor` and `FreeTensor` for its egress buffer. At 625 sequencer cycles each, that is 6,250 cycles. A share that fits one tile has no other tile to hide them behind.
+  - **Rule** (`AdaptiveTiler::DirectFits`, physical properties only). The busiest core's rows must take at most 512 B per tensor, and their squares, each row zero-padded to whole 64-lane repeats, must fit 1,024 floats. The tests plan all 3,577 tensors of at most 512 bytes, FP32 and 16-bit, and every one runs direct. So does a larger tensor whose share per core is that small: 40 × 64 FP16 gives each core one 128-byte row. P02's 800-byte rows do not qualify.
+  - **Kernel** (`DaePipeline::DirectCore`).
+    - It claims static buffers from a `LocalMemAllocator<Hardware::Scratchpad>` on the worker's stack: 13,056 B for 16-bit data, 8,448 B for FP32 (`DirectLayout`).
+    - There is no `TPipe` and no `TQue`, so it has no sequencer cycles, and no heap: the allocation probe counts 0.
+    - Inputs are tagged VECIN and Y VECOUT, so the v1.4 egress guard still applies. A mutation that stores from X1 aborts on Trap #401.
+  - **Ordering.**
+    - Each load sets its own `MTE2_V` flag on a literal event ID (`EVENT_ID0`–`EVENT_ID3`: without a `TPipe` there is none to fetch). The vector unit waits on each flag just before that input's first use.
+    - `V_MTE3` precedes the store, and `MTE3_S` ends the kernel.
+    - Neither kernel issues a `PIPE_ALL` flush. The queue kernel's stores take the same `V_MTE3` token, because its egress buffers are never enqueued.
+  - **Instruction sequence.** P01 takes 297 cycles:
+    - widen X1 and X2, add them, then widen and add β;
+    - the squares, and one `ReduceSum` per row;
+    - `Muls` by `invD`, `Adds` ε, `Rsqrt`, and one Newton-Raphson step (a setup and four vector operations);
+    - `Brcb` and a `Mul` per row;
+    - widen and multiply γ, then narrow into the egress buffer.
+  - **Result.** P01 finishes in 1.81 µs with 0 queue cycles. On the queue kernel it took 1.73 µs plus 6,250 sequencer cycles, 5.90 µs in total. Its total cycles fall from 6,433 to 297.
+- **64-lane reductions, disjoint partitions (Objectives 2 and 3).**
+  - Each row's squares land in a row of whole 64-lane repeats. One `Duplicate`, issued before the loads, zeroes the pad lanes, so it runs under the DMA latency. For example, 1 × 200 FP16 pads its row to 256 lanes.
+  - `ReduceSum(sums[i], sq[i·padded], work, padded)` keeps destination, source and workpad in three disjoint buffers. The row sums, mean, inverse RMS and Newton-Raphson term each have a 64-lane partition of their own. So does the `Brcb` destination, which holds whole 64-lane bursts (Trap #410).
+  - The streaming kernel keeps `VectorReduceSum`. It hands each sum to the scalar unit at the same 2 cycles per repeat + 15 and has no lane constraint. Its folds keep their Challenge 7 partition.
+- **Brcb instead of scalar reads (Objective 4).** The direct kernel's row sums never reach the scalar unit. Every run in the tests has 0 scalar stalls.
+- **Flat launch (Objective 5).**
+  - `DaePipeline::Launch` passes 64-bit addresses and 32-bit scalars only, and the plan travels as the address of its tiling data. The old `Args` aggregate is gone.
+  - A `static_assert` rejects any other argument type at compile time; passing the plan by value fails to build. `ValidateLaunchArgs` also checks every argument at run time.
+- **Descriptors and converters (Objective 6).**
+  - Both kernels' padded transfers carry a `DataCopyExtParams` descriptor.
+  - `ToFloat`/`FromFloat` are not adopted, because the simulator's converters are not exact. `dsa::half`'s conversion to float corrupts all 2,046 FP16 subnormals (it never re-biases their exponent). `FromFloat` truncates instead of rounding, and flushes subnormals to zero.
+  - The kernels widen and narrow with the runtime's `Cast` and the codec's exact converters, at the same cycle cost.
+- **Precision.** All 3,577 tiny tensors ran through both the direct kernel and the queue kernel.
+  - The direct kernel's worst error against FP64 is no worse: FP32 3.3e-7 against 3.7e-7; FP16 (4.9e-4) and BF16 (3.9e-3) equal.
+  - FP16 and BF16 outputs differ in 9 and 2 of 204,852 values. 23% of FP32 values differ in their last bits: `Rsqrt` plus Newton-Raphson in FP32 replaces the double-precision `VectorInvRms`.
+- **Models kept exact.** `DirectTimeline` replays `DirectCore::Run` instruction by instruction. On every direct run, its finish time and cycle count equal the runtime's.
+  - A dump of 41,611 plans changes 2,445, all of them direct row plans for tiny shares.
+  - Host plans are unchanged, and P01 is the only profile that changes.
+- **Runtime fix.** `LocalMemAllocator` declared `uint8_t pool[N] alignas(64)`. Clang rejects that placement, so no file built with clang. It now reads `alignas(64) uint8_t pool[N]`, with the same layout under GCC.
+- **Open: the streaming kernel's sequencer cycles.**
+  - The streaming profiles still take their queue steps: 806,250 sequencer cycles on P13's busiest core, 781,250 on P15's. The runtime keeps these off the timeline.
+  - If the sequencer is a serial unit, those cores would be bound by it rather than by DMA. Static `TBuf` rings with per-slot tokens would remove the cost without changing the timeline, at the price of the queue's lifecycle checks.
+
+### CPU Implementation
+Not applicable: the host executor has no queues, scratchpad or launch frame, and does not run on `dsa_runtime`.
+
 ---
 
 ## 📏 Cost Model & Methodology
@@ -428,7 +473,7 @@ Empower the DAE execution framework to fully respect physical microarchitectural
 
 - **Decomposition.** The planner keeps the candidate whose slowest core finishes first. On the host the candidates are inline, rows and row-major Split-D, costed as launch + barrier + elements · `elemNs`. On the target, the column band is a fourth candidate, and each is costed by its slowest core's finish time on the timeline models below, `SyncAll` included.
 - **Vector cycles.** The planner counts every instruction the kernel issues with the runtime's own costs (`DaeIsa`). The tests require the count to equal the runtime's cycle tracker on every executed plan, and it does.
-- **Timeline.** `RowTilesTimeline`, `BandTimeline` and `ColumnTimeline` replay a core's operations in the kernel's issue order under the runtime's timeline rules: an in-order vector unit, one DMA channel shared by loads and stores, a local copy unit, and 32-byte block dependencies. Their finish time is the runtime's, which the tests check on every executed plan with γ and β on aligned tensors.
+- **Timeline.** `RowTilesTimeline`, `BandTimeline`, `ColumnTimeline` and `DirectTimeline` replay a core's operations in the kernel's issue order under the runtime's timeline rules: an in-order vector unit, one DMA channel shared by loads and stores, a local copy unit, and 32-byte block dependencies. Their finish time is the runtime's, which the tests check on every executed plan with γ and β on aligned tensors.
 - **Schedule.** The tile rows, queue depth, head and tail tiles, γ/β replication and issue order whose replay finishes first (Challenge 3).
 - **Scratchpad.** The `DaeLayout` knapsack bounds every candidate.
 
@@ -439,7 +484,7 @@ Empower the DAE execution framework to fully respect physical microarchitectural
 | `cores`, `quantumBytes`, `spmBytes` | 40, 32 B, 195,584 B | `include/dsa_runtime.hpp`: `MAX_HARDWARE_CORES`, `DMA_ALIGN_BYTES`, `SCRATCHPAD_SAFE_WATERLINE` |
 | `launchNs` | 0 | README: zero fork/join cost on the target |
 | `byteNs` | 40 / 850 ns | ~850 GB/s aggregate, shared by 40 cores. It reproduces the P13 target: the busiest core streams 786,432 elements × 6 B at 21.25 GB/s = 222.0 µs, against a target of 223 µs |
-| Vector work | `DaeIsa` | The runtime's instruction costs: `Add`, `Mul`, `Muls`, `Cast` cost 2 cycles per 256-byte repeat + 13; `BlockReduceSum` costs 1 per repeat + 14; `VectorReduceSum` costs 2 per repeat + 15; `Duplicate` costs 1 per repeat + 18; `VectorInvRms` costs 16. The kernel never issues `GetValue` (500) or `WholeReduceSum` (14 per repeat + 14) |
+| Vector work | `DaeIsa` | The runtime's instruction costs: `Add`, `Adds`, `Mul`, `Muls`, `Cast` (and the strided multi-row `Add`/`Mul`) cost 2 cycles per 256-byte repeat + 13; `BlockReduceSum` costs 1 per repeat + 14; `VectorReduceSum` and `ReduceSum` cost 2 per repeat + 15; `Rsqrt` costs 2 per repeat + 14; `Brcb` costs 1 per 64-lane repeat + 8; `Duplicate` costs 1 per repeat + 18; `VectorInvRms` costs 16. The kernel never issues `GetValue` (500) or `WholeReduceSum` (14 per repeat + 14). A `TQue` lifecycle step costs 625 sequencer cycles, which the runtime counts but keeps off the timeline |
 | `clockGHz` | 1.5 | `dsa::CLOCK_GHZ`, assumed. It converts cycles to time, and it sets how many vector cycles a DMA byte and the DMA latency are worth. For the 15 profiles, every clock from 1.0 to 4.0 GHz picks the same decomposition; the tile schedule is re-tuned for each clock |
 | `syncNs` | 7500 cycles / clock = 5000 ns | `SyncAll` (`dsa::SYNC_ALL_CYCLES`). P05 still splits: whole rows finish at 19.45 µs, the column band at 10.83 µs |
 | `latencyNs` | 800 ns | `dsa::DMA_LATENCY_CYCLES` = 1200 cycles: a transfer's data lands this long after it streamed. P01–P03 move one small tile per core, so their targets are one fill and one drain around very little work. The P01 and P02 targets (1.47 and 2.06 µs) imply 0.66 and 0.89 µs per latency |
@@ -468,15 +513,22 @@ The host constants were measured on the reference CI host, a 4-core Cascade Lake
 ### Tests
 
 - **`tests/test_correctness.cpp`** forces every host plan variant (Split-D, streaming, recomputed Z) with 1–40 threads against an FP64 reference. It also checks for writes outside Y and for bitwise-identical results across serpentine directions.
-- **`tests/test_dae_pipeline.cpp`** (70,871 checks):
-  - It checks the invariants of the 15 full-size target plans, and of 2,448 more shapes in every forced mode.
+- **`tests/test_dae_pipeline.cpp`** (100,619 checks):
+  - It checks the invariants of the 15 full-size target plans, of 2,448 more shapes in every forced mode, and of all 3,577 tensors of at most 512 bytes (each must plan direct). The plan checks recompute the direct rule from the spec (512 B per tensor, padded squares within 1,024 floats) rather than calling the planner's.
   - It runs a plan that fills the scratchpad to the byte (195,584 B).
   - It runs model-chosen, rows, row-major Split-D and column-band plans of 20 shapes through the DAE runtime: with and without γ/β, on aligned and offset bases, in FP32/FP16/BF16. It also runs plans whose tiles span several row groups.
   - A schedule sweep forces every combination of queue depth (2–4), egress buffers (1 or 2), head tile (none, 1 or 4 rows), tail tile (none or 2 rows) and issue order (γ/β first or second, early input loads or not) onto 22-row cores, in FP32 and FP16.
-  - Every run must match an FP64 reference and leave canaries around Y intact. It must have zero scalar stalls, one `SyncAll` exactly when split, a scratchpad claim equal to the plan, the planner's cycle count, and zero padded transfers wherever rows end on 32-byte blocks. Every run executes under the DAE v1.4 guards (Challenge 7), so a store from an input buffer or an aliased fold aborts the suite.
+  - A direct-kernel sweep (Challenge 8) runs every direct shape among 11 widths (1 to 256 columns) × 7 row counts, in FP32, FP16 and BF16. That covers 1 to 16 rows per core, rows padded to 64 lanes or not, rows on and off the 32-byte grid, and 1 to 40 cores. Each shape runs with and without γ/β, on aligned and offset bases. It also runs on its queued twin, which must finish later once its sequencer cycles count.
+  - P01 must finish under 2.0 µs with no queue step, and its queued twin must take exactly ten.
+  - Every run must match an FP64 reference and leave canaries around Y intact. It must also have:
+    - zero scalar stalls, and one `SyncAll` exactly when split;
+    - no queue step on a direct plan, and some on every other plan;
+    - a scratchpad claim equal to the plan, and the planner's cycle count;
+    - zero padded transfers wherever rows end on 32-byte blocks.
+  - Every run executes under the DAE v1.4 and v1.5 guards. A store from an input buffer, an aliased fold or workpad, an unpadded `ReduceSum` or an undersized `Brcb` destination aborts the suite.
   - Its timeline must equal the planner's modeled finish time (γ and β present, aligned bases, every mode). Its parts must add up (finish = busy + fill + drain + barrier + mismatch), and it must finish at or above both the bound and the latency floor.
   - Challenge 6 checks: a heap probe (`operator new` during `Execute`), bit-identical results from both workspace entry points, and death tests for every `DSA_ASSERT`. A trap aborts the run and reports which run was in progress.
-  - Mutations it catches (failed checks):
+  - Mutations it catches (failed checks). The round-5, Challenge 7 and Challenge 8 counts are on the current suite; the others were counted when each was introduced:
     - an unplanned 64-byte buffer (the waterline plan aborts with the runtime's overflow trap; 483 without that plan);
     - one `GetValue` per row (1,431);
     - a wrong gather tree (270);
@@ -487,12 +539,25 @@ The host constants were measured on the reference CI host, a 4-core Cascade Lake
     - the team-size `DSA_ASSERT` removed (1);
     - a cycle model without row groups (15);
     - wrong row-group offsets (18 and 6);
-    - a kernel that ignores the plan's `earlyLoads` (110), `paramsFirst` (145), head and tail tiles (280), or queue depth in its prologue (208);
-    - stores that land without latency in the runtime (1,467; `test_dsa_runtime` fails too);
-    - a row-tile model without store latency (379);
-    - a latency floor one cycle too high per vector instruction (1,120) or per store (968; `test_dsa_runtime` fails on both);
-    - Challenge 7: row tiles storing from their X1 buffer (the suite aborts on Trap #401), a fold onto its own chunk (aborts on Trap #402), the worker converting D itself through the deprecated `VectorInvRms` overload (1,719: every row stalls), a layout that forgets the egress buffers (aborts on the 191 KB overflow trap), a row model that ignores a busy egress buffer (80), and a kernel that frees each egress buffer at once instead of rotating them (130).
-- **`tests/test_dsa_runtime.cpp`** (`ctest -R dsa_runtime_sanitizer`) checks every sanitizer trap, including the new queue-lifecycle, address-alignment and `DataCopyPad` checks. It also checks the timeline model:
+    - a kernel that ignores the plan's `earlyLoads` (110), `paramsFirst` (137), head and tail tiles (280), or queue depth in its prologue (208);
+    - stores that land without latency in the runtime (2,981; `test_dsa_runtime` fails too);
+    - a row-tile model without store latency (536);
+    - a latency floor one cycle too high per vector instruction (2,634) or per store (2,482; `test_dsa_runtime` fails on both);
+    - Challenge 7: row tiles storing from their X1 buffer (the suite aborts on Trap #401), a fold onto its own chunk (aborts on Trap #402), the worker converting D itself through the deprecated `VectorInvRms` overload (1,792: every row stalls), a layout that forgets the egress buffers (aborts on the 191 KB overflow trap), a row model that ignores a busy egress buffer (80), and a kernel that frees each egress buffer at once instead of rotating them (130);
+    - Challenge 8, all caught:
+      - `ReduceSum` over the unpadded row (aborts on Trap #408);
+      - its workpad aliasing the squares (aborts on Trap #402);
+      - a 32-byte `Brcb` destination (aborts on Trap #410);
+      - the direct kernel storing from its X1 buffer (aborts on Trap #401);
+      - a direct plan dispatched to the queue kernel (aborts on a `DSA_ASSERT`);
+      - no zero padding, in kernel and model alike (992: stale pad lanes corrupt the sums);
+      - a planner that never runs direct (5,565);
+      - a direct rule that ignores the padded squares (38);
+      - a model without Newton-Raphson (367);
+      - a model that treats rows off the 32-byte grid as one strided instruction (130);
+      - the plan passed by value at launch (does not compile: the `static_assert` fires).
+    - One Challenge 8 mutation is equivalent: a model that reduces unpadded rows counts the same repeats as the padded ones, so no check can differ.
+- **`tests/test_dsa_runtime.cpp`** (`ctest -R dsa_runtime_sanitizer`) checks every sanitizer trap, including the queue-lifecycle, address-alignment and `DataCopyPad` checks and the v1.4/v1.5 traps (#401, #402, #408, #409, #410). It also checks the timeline model:
   - a load → add → store chain finishes at exactly load + latency + add + store + latency, on its floor;
   - a second tile's load streams under the first tile's add;
   - `SyncAll` releases every core 7500 cycles after the last arrival, each core's floor after its own.

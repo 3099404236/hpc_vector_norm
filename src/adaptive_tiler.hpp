@@ -31,10 +31,12 @@ struct DaeIsa {
     static constexpr uint64_t Repeats(uint64_t floats) {
         return (floats * sizeof(float) + dsa::SIMD_REPEAT_BYTES - 1) / dsa::SIMD_REPEAT_BYTES;
     }
-    static constexpr uint64_t Op(uint64_t n) { return 2 * Repeats(n) + 13; }      // Add, Mul, Muls, Cast
+    static constexpr uint64_t Op(uint64_t n) { return 2 * Repeats(n) + 13; }      // Add, Adds, Mul, Muls, Cast
     static constexpr uint64_t Fold(uint64_t n) { return Repeats(n) + 14; }        // BlockReduceSum (8 -> 1)
-    static constexpr uint64_t Reduce(uint64_t n) { return 2 * Repeats(n) + 15; }  // VectorReduceSum
+    static constexpr uint64_t Reduce(uint64_t n) { return 2 * Repeats(n) + 15; }  // VectorReduceSum, ReduceSum
     static constexpr uint64_t Fill(uint64_t n) { return Repeats(n) + 18; }        // Duplicate
+    static constexpr uint64_t Rsqrt(uint64_t n) { return 2 * Repeats(n) + 14; }   // Rsqrt
+    static constexpr uint64_t Brcb(uint64_t repeats) { return repeats + 8; }      // Brcb: 64 lanes per repeat
     static constexpr uint64_t kInvRms = 16;                                       // VectorInvRms
     // Sum `runs` runs of `len` squares: one 8 -> 1 fold first when that is cheaper
     static constexpr bool FoldFirst(uint64_t runs, uint64_t len) {
@@ -132,6 +134,7 @@ struct TilingConfig {
     bool streamStores;       // Non-temporal Y stores: working set overflows the last-level cache
     bool serpentine;         // Reverse the chunk order on every other call
     // Target DAE pipeline (per core)
+    bool direct;             // Row tiles: each core runs its rows in one shot from static buffers, no queues
     uint32_t tileRows;       // Rows per tile: row tiles and column bands (0: column tiles)
     uint32_t headRows;       // Row tiles: rows of a core's first tile (0: tileRows)
     uint32_t tailRows;       // Row tiles: rows of a core's last tile (0: what is left)
@@ -184,6 +187,13 @@ public:
     static constexpr uint32_t REP_FLOATS = 2048;         // DAE replicated gamma (and beta): <= 8 KB each
     static constexpr uint32_t ROW_GROUP = 128;           // DAE row sums in flight at once: a worker's fixed per-row arrays
     static constexpr double CHUNK_BYTES = 64 * 1024;     // Host serpentine chunk (prefetch-friendly run)
+    // Direct kernel [ARCH CHALLENGE 8]: static buffers sized for a share of at most DIRECT_BYTES per
+    // tensor; ReduceSum runs on whole 64-lane repeats, so each row's squares are zero-padded to
+    // LANES and the padded rows of a share fit DIRECT_FLOATS (at most 16 rows)
+    static constexpr uint32_t DIRECT_BYTES = 512;
+    static constexpr uint32_t LANES = dsa::SIMD_REPEAT_BYTES / sizeof(float);
+    static constexpr uint32_t DIRECT_FLOATS = 1024;
+    static constexpr uint32_t RSQRT_BITS = 11;           // Rsqrt table precision (DAE v1.5): Newton-Raphson refines it
 
     static inline CoreRange Range(const TilingConfig& cfg, uint32_t M, uint32_t D, uint32_t t, uint32_t n) {
         CoreRange r;
@@ -345,6 +355,42 @@ public:
         return {Align32(tile * s), Align32(tile * 4), SCRATCH_BYTES, 0u, Align32(resident * 4), misc, true, 2, Align32(tile * s), 2, rec};
     }
 
+    // ReduceSum's rows: whole 64-lane repeats (a count off the lanes hangs the reduction: Trap #408)
+    static constexpr uint32_t LanePad(uint64_t n) { return static_cast<uint32_t>((n + LANES - 1) / LANES * LANES); }
+
+    // A core's rows fit the direct kernel's static buffers: X1, X2 and Y of the share, and its
+    // zero-padded squares
+    static inline bool DirectFits(uint64_t rows, uint32_t D, uint32_t s) {
+        return rows >= 1 && D >= 1 && rows * D * s <= DIRECT_BYTES && rows * LanePad(D) <= DIRECT_FLOATS;
+    }
+
+    // Newton-Raphson steps after Rsqrt: each doubles the bits, until they exceed the output's
+    // significand (16-bit outputs: one step, FP32: two)
+    static inline uint32_t NewtonSteps(uint32_t s) {
+        uint32_t steps = 0;
+        for (uint32_t bits = RSQRT_BITS; bits <= (s == 4 ? 24u : 11u); bits *= 2) ++steps;
+        return steps;
+    }
+
+    // The direct kernel's static buffers (DaePipeline::DirectCore claims exactly these, so their
+    // total is its claim): X1 and X2 (`tile`, one each), one egress buffer (FP32 builds Z in it)
+    // and gamma/beta, at most DIRECT_BYTES each; for 16-bit data FP32 Z, widened X2 and widened
+    // gamma/beta; the padded squares, the ReduceSum workpad, four 64-lane partitions of row scalars
+    // (sums, mean, inverse RMS, Newton-Raphson term) and the Brcb destination. Every reduction
+    // operand has a partition of its own.
+    static inline DaeLayout DirectLayout(uint32_t s) {
+        const uint32_t wide = s < 4 ? DIRECT_BYTES / s * 4 : 0u;  // A share in FP32 (16-bit data)
+        DaeLayout L{};
+        L.tile = DIRECT_BYTES;
+        L.depth = 1;
+        L.out = DIRECT_BYTES;
+        L.outDepth = 1;
+        L.z = wide;
+        L.params = 2 * DIRECT_BYTES + 2 * wide;
+        L.tmp = wide + DIRECT_FLOATS * 4 + LANES * 4 + 4 * LANES * 4 + LanePad(DIRECT_BYTES / s) * 4;
+        return L;
+    }
+
     static inline size_t LastLevelCacheBytes() {
         static const size_t bytes = [] {
             long v = -1;
@@ -473,6 +519,7 @@ public:
             finish = std::max(finish, x.finish);
             vector = std::max(vector, x.vector);
         }
+        cfg.direct = false;
         cfg.tileRows = pp.B;
         cfg.tileElems = pp.B * D;
         cfg.headRows = pp.head;
@@ -1128,12 +1175,96 @@ public:
         cfg.modelNs = t.finish / hw.clockGHz;
     }
 
+    // -------------------------------------------------------------------------
+    // Direct kernel [ARCH CHALLENGE 8]. Every TQue lifecycle step (AllocTensor, EnQue, DeQue,
+    // FreeTensor) costs the queue sequencer 625 cycles, and a row tile takes ten of them: X1 and
+    // X2 four each, its egress buffer two. That is 6,250 cycles per core, and a share that fits
+    // DIRECT_BYTES is one tile, with no other tile to hide them behind. Such a core runs its rows
+    // in one shot from static scratchpad buffers instead (LocalMemAllocator: no queue, no
+    // sequencer): scoreboard tokens order the pipes, each row's squares are zero-padded to whole
+    // 64-lane repeats for ReduceSum, and the inverse RMS stays in the vector unit (Rsqrt,
+    // Newton-Raphson, Brcb) instead of crossing to the scalar unit.
+    //
+    // Timeline of a core with k rows, replaying DirectCore::Run with dsa::CoreTimeline's rules:
+    // the loads stream back to back (X1, X2, beta, gamma), the vector unit waits for each input
+    // as it lands, and the store follows the last vector instruction. The zero padding has no
+    // operand to wait for: it runs under the DMA latency.
+    // -------------------------------------------------------------------------
+    static inline RowTimeline DirectTimeline(uint64_t k, uint32_t D, uint32_t s, const HardwareModel& hw) {
+        using I = DaeIsa;
+        const double bw = hw.BytesPerCycle(), L = hw.LatencyCycles();
+        const uint64_t n = k * D, padded = LanePad(D);
+        // + beta and * gamma: one strided instruction for all rows when FP32 rows are whole 32-byte
+        // blocks (the repeat stride counts blocks), else one per row
+        const uint64_t perRow = D % 8 == 0 ? I::Op(n) : k * I::Op(D);
+        RowTimeline out{0.0, 0.0, 0.0};
+        double ch = 0, vec = 0;
+        auto load = [&](uint64_t bytes) {
+            const double occupied = Align32(bytes) / bw;
+            ch += occupied;
+            out.dma += occupied;
+            return ch + L;
+        };
+        auto compute = [&](double ready, uint64_t cycles) {
+            vec = std::max(vec, ready) + static_cast<double>(cycles);
+            out.vector += static_cast<double>(cycles);
+        };
+        if (padded != D) compute(0, I::Fill(k * padded));  // Zero padding of the squares
+        const double x1 = load(n * s), x2 = load(n * s), beta = load(uint64_t(D) * s), gamma = load(uint64_t(D) * s);
+        if (s == 4) {
+            compute(std::max(x1, x2), I::Op(n));  // Z = X1 + X2
+            compute(beta, perRow);                // + beta
+        } else {
+            compute(x1, I::Op(n));                // Widen X1 into Z
+            compute(x2, I::Op(n));                // Widen X2
+            compute(0, I::Op(n));                 // Z += X2
+            compute(beta, I::Op(D) + perRow);     // Widen beta, + beta
+        }
+        compute(0, padded == D ? I::Op(n) : k * I::Op(D));  // Squares
+        compute(0, k * I::Reduce(padded));                  // ReduceSum per row
+        compute(0, 2 * I::Op(k) + I::Rsqrt(k));             // mean = sum * invD + eps, Rsqrt
+        const uint32_t steps = NewtonSteps(s);
+        compute(0, steps ? (1 + 4 * steps) * I::Op(k) : 0);  // Newton-Raphson
+        compute(0, k * (I::Brcb(padded / LANES) + I::Op(D)));  // Broadcast and scale, per row
+        compute(gamma, (s < 4 ? I::Op(D) : 0) + perRow);    // (Widen gamma), * gamma
+        if (s < 4) compute(0, I::Op(n));                    // Narrow into the egress buffer
+        const double occupied = Align32(n * s) / bw, start = std::max(ch, vec);
+        ch = start + occupied;
+        out.dma += occupied;
+        out.finish = ch + L;
+        return out;
+    }
+
+    // A direct plan: every core with rows runs them in one shot. The core with the most rows is the
+    // slowest (the timeline grows with the rows), so its time and vector cycles are the plan's.
+    static inline void ApplyDirect(TilingConfig& cfg, uint32_t M, uint32_t D, uint32_t s, const HardwareModel& hw) {
+        uint32_t most = 0;
+        for (uint32_t t = 0; t < cfg.blocks; ++t) {
+            const CoreRange r = Range(cfg, M, D, t, cfg.blocks);
+            most = std::max(most, r.rowZ - r.rowA);
+        }
+        const RowTimeline x = DirectTimeline(most, D, s, hw);
+        cfg.direct = true;
+        cfg.tileRows = most;
+        cfg.tileElems = most * D;
+        cfg.headRows = cfg.tailRows = 0;
+        cfg.pitch = D;
+        cfg.repRows = 1;
+        cfg.paramsFirst = cfg.earlyLoads = false;
+        cfg.zResident = 0;
+        cfg.layout = DirectLayout(s);
+        cfg.modelCycles = static_cast<uint64_t>(x.vector + 0.5);
+        cfg.modelNs = x.finish / hw.clockGHz;
+    }
+
 private:
     // -------------------------------------------------------------------------
     // (3) DAE tiles [ARCH CHALLENGE 2/3, pipeline bubbles]. Every candidate schedule is replayed
-    // on the timeline models above (RowTilesTimeline, BandTimeline, ColumnTimeline), which equal
-    // the runtime's timeline cycle for cycle, and the one whose slowest core finishes first wins.
+    // on the timeline models above (RowTilesTimeline, BandTimeline, ColumnTimeline;
+    // DirectTimeline for direct shares), which equal the runtime's timeline cycle for cycle, and
+    // the one whose slowest core finishes first wins.
     // The 191 KB layout bounds each candidate (the Challenge 2 knapsack):
+    //   direct        a share of at most DIRECT_BYTES per tensor: static buffers, no queues (Challenge 8)
     //   row tiles     depth x 2 x B D s bytes of X1/X2 tiles, outDepth x B D s of egress buffers,
     //                 4 B D more for the FP32 Z tile at 16 bits, the replicated gamma/beta and the
     //                 9 KB scratch (the 8 KB chunk and its fold partition)
@@ -1168,6 +1299,13 @@ private:
     static inline bool PlanRowTiles(TilingConfig& cfg, uint32_t M, uint32_t D, uint32_t s, const HardwareModel& hw, double bound) {
         const uint64_t total = static_cast<uint64_t>(M) * D;
         const uint64_t rows = (MaxLoad(total, cfg.unitElems, cfg.blocks) + D - 1) / D;
+        // A share of at most DIRECT_BYTES per tensor is one tile: its queue lifecycle (6,250 sequencer
+        // cycles) would cost more than the whole direct kernel, so it runs direct [ARCH CHALLENGE 8]
+        if (DirectFits(rows, D, s)) {
+            ApplyDirect(cfg, M, D, s, hw);
+            if (cfg.modelNs * hw.clockGHz >= bound) cfg.modelNs = std::numeric_limits<double>::infinity();
+            return true;
+        }
         const uint32_t p = static_cast<uint32_t>(RowUnit(D, s, hw) / D);
         const uint32_t repMax = D % 8 == 0 ? std::max<uint32_t>(1, REP_FLOATS / D) : 1;  // 32-byte FP32 rows
         const uint32_t most = static_cast<uint32_t>((rows + p - 1) / p * p);             // Rows worth one tile

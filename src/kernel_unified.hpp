@@ -306,15 +306,15 @@ private:
 // =============================================================================
 // Target DAE pipeline: a HardwareModel::Target() plan executed the way the 40-core
 // target processor runs it, through include/dsa_runtime.hpp. One OpenMP thread is one
-// simulated core (GetCoreIdx). Every scratchpad buffer is claimed through TPipe
-// (191 KB trap); every system-memory transfer is a 32-byte DataCopy, or a counted
-// DataCopyPad where a transfer does not end on a DMA block. The scalar unit never
-// reads the scratchpad (GetValue: a 500-cycle V->S stall): row sums reach it through
-// VectorReduceSum, and Split-D partials are combined by vector adds.
+// simulated core (GetCoreIdx). Every scratchpad buffer is claimed through TPipe, or
+// LocalMemAllocator for the direct kernel (191 KB trap); every system-memory transfer is a
+// 32-byte DataCopy, or a counted DataCopyPad where a transfer does not end on a DMA block. The
+// scalar unit never reads the scratchpad (GetValue: a 500-cycle V->S stall): row sums reach it
+// through VectorReduceSum, and Split-D partials are combined by vector adds.
 //
 // Coordinator and workers [ARCH CHALLENGE 6]: DaePipeline::Execute runs on the calling
 // thread. It takes a finished plan, owns the 64-byte-aligned reduction workspace and
-// dispatches one Core per simulated core with POD arguments. A Core is freestanding: it
+// launches one worker per simulated core with flat arguments. A worker is freestanding: it
 // allocates nothing (per-row state lives in fixed arrays on its stack), throws nothing (a
 // broken invariant is a DSA_ASSERT trap), passes LocalTensor views by value and uses dsa::Min
 // and dsa::Max, not <algorithm>.
@@ -323,10 +323,18 @@ private:
 // result and every published record leaves from a VECOUT buffer (qY, bRec), never from the VECIN
 // input queues; an 8 -> 1 fold never writes the chunk it reads (it lands in the scratch buffer's
 // fold partition); and the worker has no scalar integer-to-float unit, so the coordinator
-// passes invD = 1 / D in Args.
+// passes invD = 1 / D at launch.
+//
+// DAE v1.5 [ARCH CHALLENGE 8]: every TQue lifecycle step costs the queue sequencer 625 cycles.
+// A core whose share is a single small tile (AdaptiveTiler::DirectFits) runs DirectCore instead:
+// static LocalMemAllocator buffers and scoreboard tokens, no queue at all. Its row sums go through
+// the 64-lane ReduceSum on zero-padded rows and its inverse RMS stays in the vector unit (Rsqrt,
+// Newton-Raphson, Brcb). The kernel launch frame holds only 64-bit addresses and 32-bit scalars
+// (Trap #409), and every result reaches the egress channel through a V -> MTE3 token.
 // =============================================================================
 struct DaeStats {
-    uint64_t vectorCycles = 0;  // Busiest core: vector + scalar stalls + barriers
+    uint64_t vectorCycles = 0;  // Busiest core: vector + scalar stalls + barriers + queue sequencer
+    uint64_t queueCycles = 0;   // Most TQue sequencer cycles of any core (0: direct kernel)
     uint64_t dmaBytes = 0;      // All cores
     uint64_t dmaTransfers = 0;
     uint64_t padTransfers = 0;  // Transfers that were not whole 32-byte blocks
@@ -361,19 +369,16 @@ public:
                    "[DaePipeline]: the reduction workspace must be 64-byte aligned and WorkspaceBytes() long");
         if (need) std::memset(workspace, 0, need);  // A core without units publishes nothing: its records read 0
         const float invD = 1.0f / static_cast<float>(D);  // Converted here: the worker has no scalar int-to-float unit
-        const Args args{x1, x2, gamma, bias, y, M, D, eps, invD, &plan, workspace, Cores(plan)};
+        const uint32_t cores = Cores(plan);
         CoreResult results[AdaptiveTiler::MAX_THREADS];
-        #pragma omp parallel num_threads(args.cores)
-        {
-            Core core(args, dsa::GetCoreIdx());
-            core.Execute(dsa::GetCoreNum(), results[core.b]);
-        }
-        for (uint32_t b = 0; b < args.cores; ++b) {
+        Launch(cores, x1, x2, gamma, bias, y, workspace, &plan, results, M, D, eps, invD);
+        for (uint32_t b = 0; b < cores; ++b) {
             const dsa::HardwareCycleTracker& t = results[b].cycles;
             if (t.GetTotalVectorCycles() >= stats.vectorCycles) {
                 stats.vectorCycles = t.GetTotalVectorCycles();
                 stats.busiest = t;
             }
+            stats.queueCycles = std::max(stats.queueCycles, t.queueSequencerCycles);
             stats.scalarStalls += t.scalarStallCount;
             stats.dmaBytes += t.dmaBytesMoved;
             stats.dmaTransfers += t.dmaTransfers;
@@ -407,24 +412,40 @@ private:
         return buf.p;
     }
 
-    // Everything a worker receives: plain pointers and sizes, shared read-only
-    struct Args {
-        const S *x1, *x2, *gamma, *bias;
-        S* y;
-        uint32_t M, D;
-        float eps;
-        float invD;        // 1 / D, precomputed by the coordinator
-        const TilingConfig* plan;
-        float* workspace;  // Partial-sum records: the only memory the cores share besides X1/X2/Y
-        uint32_t cores;    // Simulated cores the plan was made for
-    };
-
     // One core's outcome, written once by its worker
     struct alignas(64) CoreResult {
         dsa::HardwareCycleTracker cycles;
         dsa::TimelineSummary timeline;
         size_t spmBytes;
     };
+
+    // Kernel launch [ARCH CHALLENGE 8]: the constant frame holds 64-bit addresses and 32-bit
+    // scalars only, since an aggregate over 32 bytes overflows it (Trap #409). The plan travels as
+    // the address of its tiling data, like any other buffer.
+    template <class... A>
+    static void Launch(uint32_t cores, A... args) {
+        static_assert(((std::is_pointer<A>::value || std::is_arithmetic<A>::value) && ...),
+                      "kernel launch arguments must be flat scalars and addresses");
+        (dsa::ValidateLaunchArgs(args), ...);
+        #pragma omp parallel num_threads(cores)
+        Kernel(args..., cores);
+    }
+
+    // The kernel on one simulated core. workspace: the partial-sum records, the only memory the
+    // cores share besides X1/X2/Y; invD = 1 / D, precomputed by the coordinator; cores: the
+    // simulated cores the plan was made for.
+    static void Kernel(const S* x1, const S* x2, const S* gamma, const S* bias, S* y, float* workspace,
+                       const TilingConfig* plan, CoreResult* results, uint32_t M, uint32_t D, float eps, float invD,
+                       uint32_t cores) {
+        const uint32_t b = dsa::GetBlockIdx();
+        if (plan->direct) {
+            DirectCore core(x1, x2, gamma, bias, y, *plan, M, D, eps, invD, cores, b);
+            core.Execute(dsa::GetBlockNum(), results[b]);
+            return;
+        }
+        Core core(x1, x2, gamma, bias, y, *plan, workspace, M, D, eps, invD, cores, b);
+        core.Execute(dsa::GetBlockNum(), results[b]);
+    }
 
     static float ToF32(S v) {
         if constexpr (std::is_same<C, F32>::value) return v;
@@ -441,24 +462,34 @@ private:
     static bool BlockAligned(const T* p, uint64_t n) {
         return reinterpret_cast<uintptr_t>(p) % dsa::DMA_ALIGN_BYTES == 0 && n * sizeof(T) % dsa::DMA_ALIGN_BYTES == 0;
     }
+    // One contiguous transfer. One that does not end on a 32-byte block is a padded transfer,
+    // described by its DataCopyExtParams (a load zero-fills the rest of its last block).
+    template <class T>
+    static dsa::DataCopyExtParams Descriptor(uint32_t n) {
+        return {1, static_cast<uint32_t>(n * sizeof(T)), 0, 0, 0};
+    }
     template <class T>
     static void DmaIn(dsa::LocalTensor<T> dst, const T* src, uint32_t n) {
         if (BlockAligned(src, n)) dsa::DataCopy(dst, src, n);
-        else dsa::DataCopyPad(dst, src, n);
+        else dsa::DataCopyPad(dst, src, Descriptor<T>(n), dsa::DataCopyPadExtParams<T>{});
     }
+    // Egress: the vector unit hands the finished buffer to the egress channel (V -> MTE3 token);
+    // the channel reads VECOUT buffers only
     template <class T>
     static void DmaOut(T* dst, dsa::LocalTensor<T> src, uint32_t n) {
+        dsa::CrossPipe<dsa::HardEvent::V_MTE3>(dsa::EVENT_ID0);
         if (BlockAligned(dst, n)) dsa::DataCopy(dst, src, n);
-        else dsa::DataCopyPad(dst, src, n);
+        else dsa::DataCopyPad(dst, src, Descriptor<T>(n));
     }
 
     struct Cols { uint32_t off, len; };  // A band row's own columns inside its tile row
 
     // ---- Worker: one simulated core ------------------------------------------------------------
     struct Core {
-        Core(const Args& a, uint32_t core)
-            : x1(a.x1), x2(a.x2), gamma(a.gamma), bias(a.bias), y(a.y), M(a.M), D(a.D), eps(a.eps), invD(a.invD), plan(*a.plan),
-              workspace(a.workspace), cores(a.cores), b(core) {}
+        Core(const S* x1, const S* x2, const S* gamma, const S* bias, S* y, const TilingConfig& plan, float* workspace,
+             uint32_t M, uint32_t D, float eps, float invD, uint32_t cores, uint32_t core)
+            : x1(x1), x2(x2), gamma(gamma), bias(bias), y(y), M(M), D(D), eps(eps), invD(invD), plan(plan),
+              workspace(workspace), cores(cores), b(core) {}
 
         const S *x1, *x2, *gamma, *bias;
         S* y;
@@ -750,7 +781,7 @@ private:
                 }
                 if (row + plan.layout.depth * B < r.rowZ) load(row + plan.layout.depth * B);
             }
-            dsa::DataCopy(workspace + size_t(b) * R, rec, R);  // Egress from VECOUT
+            DmaOut(workspace + size_t(b) * R, rec, R);  // Egress from VECOUT
         }
 
         void BandPhase2(const CoreRange& r, uint32_t nb) {
@@ -829,7 +860,7 @@ private:
                 dsa::Duplicate(rec, 0.0f, 16);
                 if (r.nFrag > 0) rec.SetValue(0, fragSum[0]);
                 if (r.nFrag > 1) rec.SetValue(8, fragSum[1]);
-                dsa::DataCopy(workspace + size_t(b) * 16, rec, 16);
+                DmaOut(workspace + size_t(b) * 16, rec, 16);
             }
             for (uint32_t row = r.rowA; row < r.rowZ; ++row) {
                 const size_t mark = used;
@@ -1044,6 +1075,182 @@ private:
         bool primed = false;
         dsa::LocalTensor<float> fragZ[2];  // The fragments' resident Z (empty: recomputed)
         float fragSum[2] = {0.0f, 0.0f};
+    };
+
+    // ---- Direct kernel [ARCH CHALLENGE 8]: a core's rows in one shot, no queues ----------------
+    // A share that fits DIRECT_BYTES per tensor is a single tile, so a queue would have nothing to
+    // overlap, and its lifecycle alone (ten TQue steps, 6,250 sequencer cycles) outweighs the
+    // kernel. DirectCore claims static buffers from a LocalMemAllocator (no TPipe, no TQue) and
+    // orders the pipes with scoreboard tokens on literal event IDs, since without a TPipe there is
+    // nothing to fetch event IDs from. Its row sums come from the 64-lane ReduceSum on zero-padded
+    // rows, and the inverse RMS never leaves the vector unit: Rsqrt, Newton-Raphson, then one Brcb
+    // broadcast per row instead of a 500-cycle scalar read. AdaptiveTiler::DirectTimeline replays
+    // exactly this sequence.
+    struct DirectCore {
+        static constexpr bool kF32 = std::is_same<C, F32>::value;
+        static constexpr uint32_t SHARE = AdaptiveTiler::DIRECT_BYTES / sizeof(S);  // Elements in a share's buffer
+        using Scratchpad = dsa::LocalMemAllocator<dsa::Hardware::Scratchpad>;
+
+        DirectCore(const S* x1, const S* x2, const S* gamma, const S* bias, S* y, const TilingConfig& plan, uint32_t M,
+                   uint32_t D, float eps, float invD, uint32_t cores, uint32_t core)
+            : x1(x1), x2(x2), gamma(gamma), bias(bias), y(y), M(M), D(D), eps(eps), invD(invD), plan(plan), cores(cores), b(core) {}
+
+        const S *x1, *x2, *gamma, *bias;
+        S* y;
+        uint32_t M, D;
+        float eps, invD;
+        const TilingConfig& plan;
+        uint32_t cores, b;
+
+        dsa::LocalTensor<S> in1, in2, gam, bet, out;          // X1, X2, gamma, beta (VECIN); Y (VECOUT)
+        dsa::LocalTensor<float> z, xw, gw, bw;                // FP32 Z, widened X2, gamma, beta (FP32: aliases)
+        dsa::LocalTensor<float> sq, work, sums, mean, inv, nr, bc;  // Reduction and broadcast partitions
+
+        void Execute(uint32_t numCores, CoreResult& res) {
+            DSA_ASSERT(numCores == cores, "[DaePipeline]: the OpenMP team does not have the plan's core count");
+            dsa::g_cycleTracker.Reset();
+            dsa::g_timeline.Reset();  // A new kernel on this core: without a TPipe, the kernel marks its start
+            alignas(64) Scratchpad spm;  // On the worker's stack; the pool is not initialized
+            Claim(spm);
+            const CoreRange r = AdaptiveTiler::Range(plan, M, D, b, numCores);
+            if (r.rowZ > r.rowA) Run(r.rowA, r.rowZ - r.rowA);
+            res.cycles = dsa::g_cycleTracker;
+            res.timeline = dsa::g_timeline.Summary();
+            res.spmBytes = spm.offset;
+        }
+
+        // The static buffers of AdaptiveTiler::DirectLayout. Inputs are tagged VECIN and the result
+        // VECOUT, so the v1.4 egress guard (Trap #401) covers this kernel as well.
+        void Claim(Scratchpad& spm) {
+            in1 = Tag(spm.template Alloc<S, SHARE>(), dsa::QuePosition::VECIN);
+            in2 = Tag(spm.template Alloc<S, SHARE>(), dsa::QuePosition::VECIN);
+            out = Tag(spm.template Alloc<S, SHARE>(), dsa::QuePosition::VECOUT);
+            gam = Tag(spm.template Alloc<S, SHARE>(), dsa::QuePosition::VECIN);
+            bet = Tag(spm.template Alloc<S, SHARE>(), dsa::QuePosition::VECIN);
+            if constexpr (kF32) {
+                z = out;  // FP32: Z is built in the egress buffer, and the parameters are used as loaded
+                gw = gam;
+                bw = bet;
+            } else {
+                z = spm.template Alloc<float, SHARE>();
+                xw = spm.template Alloc<float, SHARE>();
+                gw = spm.template Alloc<float, SHARE>();
+                bw = spm.template Alloc<float, SHARE>();
+            }
+            sq = spm.template Alloc<float, AdaptiveTiler::DIRECT_FLOATS>();  // Squares, rows padded to 64 lanes
+            work = spm.template Alloc<float, AdaptiveTiler::LANES>();        // ReduceSum workpad
+            sums = spm.template Alloc<float, AdaptiveTiler::LANES>();        // One lane per row
+            mean = spm.template Alloc<float, AdaptiveTiler::LANES>();
+            inv = spm.template Alloc<float, AdaptiveTiler::LANES>();
+            nr = spm.template Alloc<float, AdaptiveTiler::LANES>();
+            bc = spm.template Alloc<float, AdaptiveTiler::LanePad(SHARE)>();  // Brcb: whole 64-lane bursts
+        }
+
+        template <class T>
+        static dsa::LocalTensor<T> Tag(dsa::LocalTensor<T> t, dsa::QuePosition pos) {
+            t.pos = pos;
+            return t;
+        }
+
+        void Run(uint32_t rA, uint32_t k) {
+            DSA_ASSERT(AdaptiveTiler::DirectFits(k, D, sizeof(S)), "[DaePipeline]: a direct plan's rows exceed its static scratchpad tiles");
+            const uint32_t n = k * D, padded = AdaptiveTiler::LanePad(D);
+            const uint64_t e = uint64_t(rA) * D;
+            // The pad lanes of the squares are zeroed first: nothing to wait for, so this runs under
+            // the DMA latency
+            if (padded != D) dsa::Duplicate(sq, 0.0f, k * padded);
+            // Ingress: each transfer hands its buffer to the vector unit with a token of its own
+            DmaIn(in1, x1 + e, n);
+            dsa::SetFlag<dsa::HardEvent::MTE2_V>(dsa::EVENT_ID0);
+            DmaIn(in2, x2 + e, n);
+            dsa::SetFlag<dsa::HardEvent::MTE2_V>(dsa::EVENT_ID1);
+            if (bias) {
+                DmaIn(bet, bias, D);
+                dsa::SetFlag<dsa::HardEvent::MTE2_V>(dsa::EVENT_ID2);
+            }
+            if (gamma) {
+                DmaIn(gam, gamma, D);
+                dsa::SetFlag<dsa::HardEvent::MTE2_V>(dsa::EVENT_ID3);
+            }
+            // Z = X1 + X2 + beta in FP32, each input used as soon as it has landed
+            dsa::WaitFlag<dsa::HardEvent::MTE2_V>(dsa::EVENT_ID0);
+            if constexpr (kF32) {
+                dsa::WaitFlag<dsa::HardEvent::MTE2_V>(dsa::EVENT_ID1);
+                dsa::Add(z, in1, in2, n);
+            } else {
+                dsa::Cast(z, in1, n, ToF32);
+                dsa::WaitFlag<dsa::HardEvent::MTE2_V>(dsa::EVENT_ID1);
+                dsa::Cast(xw, in2, n, ToF32);
+                dsa::Add(z, z, xw, n);
+            }
+            if (bias) {
+                dsa::WaitFlag<dsa::HardEvent::MTE2_V>(dsa::EVENT_ID2);
+                EachRow(z, Widen(bw, bet), k, false);
+            }
+            // Row sums: squares on whole 64-lane repeats, then one ReduceSum per row into its own
+            // lane of `sums`; destination, source and workpad are disjoint partitions
+            if (padded == D) {
+                dsa::Mul(sq, z, z, n);
+            } else {
+                for (uint32_t i = 0; i < k; ++i) dsa::Mul(sq[i * padded], z[i * D], z[i * D], D);
+            }
+            for (uint32_t i = 0; i < k; ++i) dsa::ReduceSum(sums[i], sq[i * padded], work, padded);
+            // invRms = 1 / sqrt(sum * invD + eps) for every row at once
+            dsa::Muls(mean, sums, invD, k);
+            dsa::Adds(mean, mean, eps, k);
+            dsa::Rsqrt(inv, mean, k);
+            Refine(k);
+            // Z *= invRms: each row's value broadcast across its repeats, never read by the scalar unit
+            for (uint32_t i = 0; i < k; ++i) {
+                dsa::Brcb(bc, inv[i], padded / AdaptiveTiler::LANES, dsa::BrcbRepeatParams{1, 8});
+                dsa::Mul(z[i * D], z[i * D], bc, D);
+            }
+            if (gamma) {
+                dsa::WaitFlag<dsa::HardEvent::MTE2_V>(dsa::EVENT_ID3);
+                EachRow(z, Widen(gw, gam), k, true);
+            }
+            if constexpr (!kF32) dsa::Cast(out, z, n, FromF32);  // Narrow into the egress buffer
+            DmaOut(y + e, out, n);
+            dsa::CrossPipe<dsa::HardEvent::MTE3_S>(dsa::EVENT_ID0);  // The kernel ends once Y has landed
+        }
+
+        // gamma or beta in FP32: 16-bit parameters are widened into their FP32 buffer
+        dsa::LocalTensor<float> Widen(dsa::LocalTensor<float> wide, dsa::LocalTensor<S> p) {
+            if constexpr (!kF32) dsa::Cast(wide, p, D, ToF32);
+            else (void)p;
+            return wide;
+        }
+
+        // z (+|*)= a parameter row on each of k rows. When FP32 rows are whole 32-byte blocks this is
+        // one strided instruction: its 8-bit repeat stride counts blocks, D / 8 <= 32 here. Otherwise
+        // it is one instruction per row.
+        void EachRow(dsa::LocalTensor<float> zt, dsa::LocalTensor<float> p, uint32_t k, bool multiply) {
+            if (D % 8 == 0) {
+                const uint8_t stride = static_cast<uint8_t>(D / 8);
+                const dsa::BinaryRepeatParams rep{stride, stride, 0, 1, 1, 1};  // The same parameter row every repeat
+                if (multiply) dsa::Mul(zt, zt, p, D, static_cast<uint8_t>(k), rep);
+                else dsa::Add(zt, zt, p, D, static_cast<uint8_t>(k), rep);
+                return;
+            }
+            for (uint32_t i = 0; i < k; ++i) {
+                if (multiply) dsa::Mul(zt[i * D], zt[i * D], p, D);
+                else dsa::Add(zt[i * D], zt[i * D], p, D);
+            }
+        }
+
+        // Newton-Raphson on the Rsqrt table value, every row at once: inv *= 1.5 - (mean / 2) inv^2,
+        // as many steps as the output's precision needs (AdaptiveTiler::NewtonSteps)
+        void Refine(uint32_t k) {
+            const uint32_t steps = AdaptiveTiler::NewtonSteps(sizeof(S));
+            if (!steps) return;
+            dsa::Muls(sums, mean, -0.5f, k);  // -mean / 2, in the lanes of the spent row sums
+            for (uint32_t i = 0; i < steps; ++i) {
+                dsa::Mul(nr, inv, inv, k);
+                dsa::Mul(nr, nr, sums, k);
+                dsa::Adds(nr, nr, 1.5f, k);
+                dsa::Mul(inv, inv, nr, k);
+            }
+        }
     };
 };
 
