@@ -310,6 +310,67 @@ int main() {
         BlockReduceSum(t, t, 64);
     });
 
+    // -------------------------------------------------------------------------
+    // Test 10: DAE v1.5 Microarchitecture Invariants & Direct Primitives
+    // -------------------------------------------------------------------------
+    std::cout << "\n[Testing DAE v1.5 Microarchitectural Invariants & Traps]...\n";
+    
+    // Trap #408: ReduceSum unaligned lane fault (count % 64 != 0)
+    ok &= ExpectTrap("ReduceSum unaligned SIMD lane fault (count=200, Trap #408)", [&] {
+        TPipe p;
+        TBuf<QuePosition::VECCALC> bDst, bSrc, bWork;
+        p.InitBuffer(bDst, 32);
+        p.InitBuffer(bSrc, 1024);
+        p.InitBuffer(bWork, 1024);
+        ReduceSum(bDst.Get<float>(), bSrc.Get<float>(), bWork.Get<float>(), 200);
+    });
+
+    // Trap #402: ReduceSum workspace aliasing
+    ok &= ExpectTrap("ReduceSum workspace aliasing (dst == work, Trap #402)", [&] {
+        TPipe p;
+        TBuf<QuePosition::VECCALC> bDst, bSrc;
+        p.InitBuffer(bDst, 1024);
+        p.InitBuffer(bSrc, 1024);
+        ReduceSum(bDst.Get<float>(), bSrc.Get<float>(), bDst.Get<float>(), 64);
+    });
+
+    // Trap #410: Brcb buffer overrun (capacity < 64 floats)
+    ok &= ExpectTrap("Brcb destination buffer undersized (capacity < 64 floats, Trap #410)", [&] {
+        TPipe p;
+        TBuf<QuePosition::VECCALC> bDst, bSrc;
+        p.InitBuffer(bDst, 32); // only 8 floats
+        p.InitBuffer(bSrc, 32);
+        bSrc.Get<float>().data[0] = 3.14f;
+        Brcb(bDst.Get<float>(), bSrc.Get<float>());
+    });
+
+    // Trap #409: Host-to-Device argument frame overflow (> 32 bytes)
+    ok &= ExpectTrap("Launch arguments frame overflow (> 32 bytes, Trap #409)", [&] {
+        struct BigPlanningStruct {
+            uint64_t fields[5]; // 40 bytes
+        } s{};
+        ValidateLaunchArgs(s);
+    });
+
+    // Brcb valid broadcast verification & LocalMemAllocator
+    {
+        LocalMemAllocator<Hardware::UB> mem;
+        auto scalar = mem.Alloc<float, 8>();
+        auto bcast = mem.Alloc<float, 64>();
+        scalar.data[0] = 42.0f;
+        Brcb(bcast, scalar);
+        bool brcbOk = true;
+        for (uint32_t i = 0; i < 64; ++i) {
+            if (bcast.data[i] != 42.0f) brcbOk = false;
+        }
+        if (brcbOk) {
+            std::cout << "PASS: Brcb broadcasts scalar across all 64 SIMD lanes\n";
+        } else {
+            std::cerr << "FAIL: Brcb did not broadcast correctly\n";
+            ok = false;
+        }
+    }
+
     if (!ok) return 1;
 
     std::cout << "\n=================================================================\n";

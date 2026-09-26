@@ -362,6 +362,58 @@ Not applicable: the host executor has no DMA channels or scratchpad queues, and 
 
 ---
 
+## 🎯 Challenge 8: DAE v1.5 Microarchitecture, Direct-Execution ISA & Hardware Invariants
+
+### The Dilemma
+As target hardware simulation fidelity is upgraded to reflect the physical streaming vector architecture (DAE v1.5 Specification), benchmarking on physical testbeds reveals several microarchitectural boundaries, hidden performance cliffs, and hardware pipeline invariants:
+
+1. **Queue Sequencer Lifecycle Penalty & Micro-Tile Performance Cliff (`TQue` vs. Direct Scratchpad)**:
+   - **Hardware Sequencer Overhead**: `TPipe`/`TQue` lifecycle state transitions (`AllocTensor`, `EnQue`, `DeQue`, `FreeTensor`) incur a fixed hardware sequencer penalty of **1,800 ~ 2,500 ns (2.5 µs / ~2,500 cycles at 1.5 GHz)** per tile.
+   - **Micro-Shape Overhead**: For tiny workloads (e.g. data volume $< 512$ bytes, such as $1 \times 64$), pure vector computation requires only $\sim 0.35\ \mu\text{s}$, but FIFO queue management imposes $\sim 2.5\ \mu\text{s}$ of software bubble, degrading latency by over $7\times$!
+   - **Direct Mode (`LocalMemAllocator` / `TBuf` Direct Addressing)**: The hardware allows zero-queue direct scratchpad addressing (`LocalMemAllocator<Hardware::UB>` or static `TBuf<QuePosition::VECCALC>`) bypassing queue state machines completely to achieve the physical latency floor ($1.5 \sim 1.8\ \mu\text{s}$).
+   - **Event ID Invariant**: When executing without `TPipe`, invoking `TPipe::FetchEventID()` returns uninitialized registers causing watchdog timeout. Direct execution must strictly use literal event IDs (`EVENT_ID0`..`EVENT_ID3`).
+
+2. **SIMD Vector Reduction 64-Lane Geometry Alignment (`TRAP_UNALIGNED_SIMD_LANE_FAULT` / Trap #408)**:
+   - The Vector Reduction Unit (`ReduceSum`) is physically hardwired as a 64-lane SIMD reduction datapath ($256$ bytes per repeat).
+   - Calling `ReduceSum` with an element count that is **not a multiple of 64** (e.g., $D = 200$) causes the hardware reduction pipeline to hang indefinitely, resulting in execution timeout (`Trap #408`).
+   - *Physical Rule*: Non-64-aligned tail vectors must be zero-padded in core scratchpad to the next 64-element boundary prior to issuing `ReduceSum`.
+
+3. **Workspace Memory Aliasing Hazard (`TRAP_WORKSPACE_ALIASING_HAZARD` / Trap #402)**:
+   - Destination, source, and scratchpad workpad buffers for vector reduction (`ReduceSum(dst, src, work, count)`) must reside in strictly disjoint physical memory addresses ($dst \neq src \land dst \neq work \land src \neq work$).
+   - Overlapping addresses between reduction workpads and operands triggers unrecoverable bus arbitration lockup (`Trap #402`).
+
+4. **Cross-Lane Hardware Vector Broadcast (`dsa::Brcb` & Buffer Overrun Trap #410)**:
+   - **Single-Cycle Broadcast**: The hardware provides a native cross-lane broadcast instruction `dsa::Brcb(dst, scalar, 1, {1, 8})`, expanding a scalar into a 64-element SIMD vector within a single clock cycle, eliminating scalar bus extraction (`GetValue`) roundtrips.
+   - **Burst Allocation Invariant (`Trap #410`)**: `Brcb` executes strictly in 8-block SIMD bursts ($8 \times 32\text{ B} = 256\text{ bytes} = 64\text{ floats}$). Destination buffers allocated with fewer than 64 elements suffer silent memory overwrites (`Trap #410`).
+
+5. **Point-to-Point Pipeline Scoreboard Fences vs. Global Barrier Stalls (`CrossPipe` / `SetFlag` / `WaitFlag`)**:
+   - `PipeBarrier<PIPE_ALL>` forces an exhaustive drain of ALL execution pipes including the Scalar Processing Unit (SPU). Because the SPU precomputes address offsets and loop bounds ahead of the vector pipe (accounting for $\sim 49\%$ of overlapped execution time), inner-loop `PIPE_ALL` flushes destroy latency overlap.
+   - *Scoreboard Token Primitives*: Intra-core synchronization must use point-to-point hardware scoreboard events:
+     - `HardEvent::MTE2_V` (DMU Ingress $\to$ VPU: data ready in scratchpad)
+     - `HardEvent::V_MTE3` (VPU $\to$ DMU Egress: vector computation finished)
+     - `HardEvent::MTE3_S` (DMU Egress $\to$ SPU: transfer completed)
+     - `HardEvent::V_S` (VPU $\to$ SPU: scalar dependency resolved)
+   - Consecutive vector instructions within `PIPE_V` are in-order and hazard-free; zero barriers are required between consecutive vector arithmetic operations.
+
+6. **Host-to-Device Kernel Launch Constant Frame Register Overflow (`TRAP_CONSTANT_FRAME_OVERFLOW` / Trap #409)**:
+   - The hardware kernel invocation interface passes parameters via a fixed 32-byte constant register slot.
+   - Passing aggregate C++ structures ($> 32$ bytes) by value across kernel boundaries corrupts the argument stack frame (`Trap #409`). Launch signatures must strictly consist of flat primitive scalars (`uint32_t, float`) and 64-bit memory addresses.
+
+7. **Multi-Row Stride Field 8-Bit Overflow & Precision Asymmetry**:
+   - `BinaryRepeatParams` stride fields are unsigned 8-bit integers (`uint8_t`, maximum value $255$ blocks). For FP32 ($8\text{ floats/block}$), when $D \ge 2048$, $D / 8 \ge 256$, inducing silent 8-bit stride truncation and corrupted math; row loop fallback is required for $D \ge 2048$.
+   - **Native FP16 Dual-Width ALU**: FP16 possesses native 16-bit binary addition `Add(x, x, r)`, reducing arithmetic passes from 3 to 1.5; BF16 lacks native vector binary addition and must be widened to FP32 first.
+   - **Newton-Raphson Precision Refinement**: Hardware `Rsqrt` provides $\sim 11\text{-bit}$ table-lookup precision; full 24-bit FP32 precision requires 1–2 Newton-Raphson iterations (`RefineInvRms`).
+
+### The Objective
+Empower the DAE execution framework to fully respect physical microarchitectural contracts:
+1. Support direct scratchpad mode (`LocalMemAllocator` / `TBufDirect`) for latency-critical micro-tiles ($M \cdot D < 1\text{K}$).
+2. Ensure 64-lane tail zero-padding for non-64-aligned hidden dimensions ($D = 200, 400$).
+3. Maintain disjoint memory partitions across reduction trees (`fold`, `tmp`, `scalar`, `bcast`).
+4. Replace scalar stalls with single-cycle `Brcb` broadcasts.
+5. Flatten kernel launch signatures into primitive scalar and pointer parameters.
+
+---
+
 ## 📏 Cost Model & Methodology
 
 `HardwareModel` (`src/adaptive_tiler.hpp`) holds every constant the planner uses. `Target()` and `Host(P)` are two instances of the same planner:

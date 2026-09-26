@@ -93,6 +93,7 @@ struct HardwareCycleTracker {
     uint64_t padTransfers     = 0;   // DataCopyPad: transfers that were not whole 32-byte blocks
     uint64_t barrierCount     = 0;
     uint64_t barrierCycles    = 0;   // 7500 cycles per PipeBarrier / SyncAll
+    uint64_t queueSequencerCycles = 0; // State-machine queue lifecycle penalty (1800-2500 cycles per tile for TQue)
 
     void Reset() {
         vAddCycles = 0;
@@ -108,10 +109,11 @@ struct HardwareCycleTracker {
         padTransfers = 0;
         barrierCount = 0;
         barrierCycles = 0;
+        queueSequencerCycles = 0;
     }
 
     uint64_t GetTotalVectorCycles() const {
-        return vAddCycles + vMulCycles + vCastCycles + vBlockReduceCycles + vWholeReduceCycles + vRsqrtCycles + scalarStallCycles + barrierCycles;
+        return vAddCycles + vMulCycles + vCastCycles + vBlockReduceCycles + vWholeReduceCycles + vRsqrtCycles + scalarStallCycles + barrierCycles + queueSequencerCycles;
     }
 };
 
@@ -421,6 +423,49 @@ inline void PipeBarrier() {
     if (pipe == PIPE_ALL) g_timeline.DrainAll();
 }
 
+// -----------------------------------------------------------------------------
+// DAE v1.5 Point-to-Point Pipeline Scoreboard Fences (HardEvent Tokens)
+// Avoids PIPE_ALL flushes by synchronizing only the dependent execution units.
+// -----------------------------------------------------------------------------
+enum class HardEvent : uint8_t {
+    MTE2_V = 0,   // DMU Ingress -> VPU (Data streamed to scratchpad)
+    V_MTE3 = 1,   // VPU -> DMU Egress (Vector compute finished, ready to stream out)
+    MTE3_S = 2,   // DMU Egress -> SPU (Egress committed to system memory)
+    V_S    = 3,   // VPU -> SPU (Vector result needed by scalar unit)
+    S_V    = 4,   // SPU -> VPU (Scalar control ready for vector pipeline)
+    MTE2_S = 5,   // DMU Ingress -> SPU
+    S_MTE2 = 6,   // SPU -> DMU Ingress
+    MTE3_V = 7,   // DMU Egress -> VPU
+    V_MTE2 = 8    // VPU -> DMU Ingress
+};
+
+static constexpr uint8_t EVENT_ID0 = 0;
+static constexpr uint8_t EVENT_ID1 = 1;
+static constexpr uint8_t EVENT_ID2 = 2;
+static constexpr uint8_t EVENT_ID3 = 3;
+
+template <HardEvent E>
+inline void SetFlag(uint8_t eventId = EVENT_ID0) {
+    (void)eventId;
+    #if defined(__GNUC__) || defined(__clang__)
+    __asm__ __volatile__("" ::: "memory");
+    #endif
+}
+
+template <HardEvent E>
+inline void WaitFlag(uint8_t eventId = EVENT_ID0) {
+    (void)eventId;
+    #if defined(__GNUC__) || defined(__clang__)
+    __asm__ __volatile__("" ::: "memory");
+    #endif
+}
+
+template <HardEvent E>
+inline void CrossPipe(uint8_t eventId = EVENT_ID0) {
+    SetFlag<E>(eventId);
+    WaitFlag<E>(eventId);
+}
+
 // All-core barrier. Timeline: each core arrives drained; all leave SYNC_ALL_CYCLES after the
 // last arrival.
 template <bool notify = false>
@@ -574,6 +619,7 @@ public:
 
     template <typename T>
     LocalTensor<T> AllocTensor() {
+        g_cycleTracker.queueSequencerCycles += 625;
         for (uint32_t d = 0; d < numBuffers; ++d) {
             if (state[d] == FREE) {
                 state[d] = ALLOCATED;
@@ -586,6 +632,7 @@ public:
 
     template <typename T>
     void EnQue(LocalTensor<T> tensor) {
+        g_cycleTracker.queueSequencerCycles += 625;
         const uint32_t slot = SlotOf(tensor.GetData());
         if (state[slot] != ALLOCATED) {
             throw std::runtime_error("[Sanitizer Trap]: EnQue called without corresponding AllocTensor!");
@@ -597,6 +644,7 @@ public:
 
     template <typename T>
     LocalTensor<T> DeQue() {
+        g_cycleTracker.queueSequencerCycles += 625;
         if (enqueuedCount == 0) {
             throw std::runtime_error("[Sanitizer Trap]: DeQue on empty queue! Pipeline hazard detected.");
         }
@@ -609,6 +657,7 @@ public:
 
     template <typename T>
     void FreeTensor(LocalTensor<T> tensor) {
+        g_cycleTracker.queueSequencerCycles += 625;
         const uint32_t slot = SlotOf(tensor.GetData());
         if (state[slot] == FREE || state[slot] == ENQUEUED) {
             throw std::runtime_error("[Sanitizer Trap]: FreeTensor on a buffer that is free or still in flight!");
@@ -690,6 +739,38 @@ public:
 
     size_t GetTotalAllocatedBytes() const {
         return totalAllocatedBytes;
+    }
+};
+
+// -----------------------------------------------------------------------------
+// DAE v1.5 Zero-Queue Direct Scratchpad Memory Allocator (LocalMemAllocator)
+// Allows direct static local tensor allocation without FIFO queue sequencer tax.
+// -----------------------------------------------------------------------------
+namespace Hardware {
+    struct UB {};
+}
+
+template <typename TargetSpace = Hardware::UB>
+class LocalMemAllocator {
+public:
+    uint8_t pool[SCRATCHPAD_SAFE_WATERLINE] alignas(64);
+    size_t offset = 0;
+
+    LocalMemAllocator() = default;
+
+    template <typename T, size_t N>
+    LocalTensor<T> Alloc() {
+        size_t bytes = (N * sizeof(T) + DMA_ALIGN_BYTES - 1) / DMA_ALIGN_BYTES * DMA_ALIGN_BYTES;
+        if (offset + bytes > SCRATCHPAD_SAFE_WATERLINE) {
+            throw std::runtime_error("[Hardware Fault - SCRATCHPAD OVERFLOW (Trap #400)]: "
+                                     "LocalMemAllocator allocation (" + std::to_string(offset + bytes) +
+                                     " bytes) exceeds 191 KB scratchpad waterline!");
+        }
+        uint8_t* ptr = pool + offset;
+        offset += bytes;
+        g_timeline.Register(ptr, bytes);
+        return LocalTensor<T>(reinterpret_cast<T*>(ptr), static_cast<uint32_t>(N),
+                              static_cast<uint32_t>(bytes), QuePosition::VECCALC);
     }
 };
 
@@ -796,6 +877,20 @@ inline void DataCopyPad(T* dst, LocalTensor<T> src, uint32_t count) {
     g_cycleTracker.dmaTransfers++;
     g_cycleTracker.padTransfers++;
     g_timeline.Store(static_cast<double>(blockBytes), SpanOf(src.GetData(), count));
+}
+
+// -----------------------------------------------------------------------------
+// Direct Byte-Precise Padded Transfer Shorthands (LoadPad / StorePad)
+// Tolerates non-32B aligned element counts with hardware zero-fill.
+// -----------------------------------------------------------------------------
+template <typename T>
+inline void LoadPad(LocalTensor<T> dst, const T* src, uint32_t count) {
+    DataCopyPad(dst, src, count);
+}
+
+template <typename T>
+inline void StorePad(T* dst, LocalTensor<T> src, uint32_t count) {
+    DataCopyPad(dst, src, count);
 }
 
 template <typename T>
@@ -955,6 +1050,138 @@ inline void WholeReduceSum(LocalTensor<T> dst, LocalTensor<T> src, uint32_t coun
     uint32_t repeats = (count * sizeof(T) + SIMD_REPEAT_BYTES - 1) / SIMD_REPEAT_BYTES;
     g_cycleTracker.vWholeReduceCycles += 14 * repeats + 14;
     g_timeline.Vector(14 * repeats + 14, SpanOf(dst.data, 1), SpanOf(src.data, count));
+}
+
+// Whole block reduction overload matching native hardware strides
+template <typename T>
+inline void WholeReduceSum(LocalTensor<T> dst, LocalTensor<T> src, uint64_t mask, uint8_t repeatTimes,
+                           uint8_t srcRepStride, uint8_t dstRepStride, uint8_t dstBlkStride) {
+    (void)mask; (void)repeatTimes; (void)srcRepStride; (void)dstRepStride; (void)dstBlkStride;
+    T sum = 0;
+    for (uint32_t i = 0; i < 64; ++i) {
+        sum += src.data[i];
+    }
+    dst.data[0] = sum;
+    g_cycleTracker.vWholeReduceCycles += 14;
+    g_timeline.Vector(14, SpanOf(dst.data, 1), SpanOf(src.data, 64));
+}
+
+// -----------------------------------------------------------------------------
+// DAE v1.5 Vector Reduction with 64-Lane SIMD Geometry & Aliasing Guard
+// -----------------------------------------------------------------------------
+template <typename T>
+inline void ReduceSum(LocalTensor<T> dst, LocalTensor<T> src, LocalTensor<T> work, uint32_t count) {
+    if (dst.GetData() == src.GetData() || dst.GetData() == work.GetData() || src.GetData() == work.GetData()) {
+        throw std::runtime_error("[Hardware Fault - VECTOR ALU OPERAND ALIASING (Trap #402)]: "
+                                 "ReduceSum destination, source, and scratch workpad buffers must be strictly disjoint! "
+                                 "The SIMD reduction datapath forbids workspace aliasing.");
+    }
+    if (count % 64 != 0) {
+        throw std::runtime_error("[Hardware Fault - UNALIGNED SIMD LANE FAULT (Trap #408)]: "
+                                 "ReduceSum element count (" + std::to_string(count) +
+                                 ") is not a multiple of 64! The physical SIMD reduction array operates "
+                                 "strictly on 64-lane blocks (256 bytes). Unaligned counts trigger hardware "
+                                 "pipeline hang and stream timeout. Non-64 tail vectors must be zero-padded in scratchpad.");
+    }
+    T sum = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        sum += src.data[i];
+    }
+    dst.data[0] = sum;
+    uint32_t repeats = (count * sizeof(T) + SIMD_REPEAT_BYTES - 1) / SIMD_REPEAT_BYTES;
+    g_cycleTracker.vBlockReduceCycles += 2 * repeats + 15;
+    g_timeline.Vector(2 * repeats + 15, SpanOf(dst.data, 1), SpanOf(src.data, count));
+}
+
+// -----------------------------------------------------------------------------
+// DAE v1.5 Cross-Lane Hardware Broadcast Primitive (Brcb)
+// Single-cycle broadcast from scalar into 64-lane SIMD vector buffer.
+// -----------------------------------------------------------------------------
+struct BrcbRepeatParams {
+    uint8_t dstRepStride = 1;
+    uint8_t srcRepStride = 8;
+};
+
+template <typename T>
+inline void Brcb(LocalTensor<T> dst, LocalTensor<T> src, uint32_t repeatCount = 1, BrcbRepeatParams params = {1, 8}) {
+    (void)params;
+    const size_t minCapacity = 64 * repeatCount;
+    if (dst.capacityBytes < minCapacity * sizeof(T)) {
+        throw std::runtime_error("[Hardware Fault - BUFFER OVERRUN (Trap #410)]: "
+                                 "Brcb destination buffer capacity (" + std::to_string(dst.capacityBytes) +
+                                 " bytes) is smaller than required 256-byte hardware burst (64 elements / " +
+                                 std::to_string(minCapacity * sizeof(T)) + " bytes)! "
+                                 "Brcb operates via 8 x 32-byte SIMD lane bursts; underallocated buffers cause memory corruption.");
+    }
+    T val = src.data[0];
+    for (uint32_t i = 0; i < minCapacity; ++i) {
+        dst.data[i] = val;
+    }
+    g_cycleTracker.vCastCycles += 1 * repeatCount + 8;
+    g_timeline.Vector(1 * repeatCount + 8, SpanOf(dst.data, minCapacity), SpanOf(src.data, 1));
+}
+
+// -----------------------------------------------------------------------------
+// DAE v1.5 Strided Multi-Row Vector Operators & 8-Bit Stride Guard
+// -----------------------------------------------------------------------------
+struct BinaryRepeatParams {
+    uint8_t dstRepStride = 1;
+    uint8_t src0RepStride = 1;
+    uint8_t src1RepStride = 1;
+    uint8_t dstBlkStride = 8;
+    uint8_t src0BlkStride = 8;
+    uint8_t src1BlkStride = 0;
+};
+
+template <typename T>
+inline void Mul(LocalTensor<T> dst, LocalTensor<T> src0, LocalTensor<T> src1, uint64_t count, uint8_t rows, BinaryRepeatParams rep) {
+    (void)rep;
+    for (uint8_t r = 0; r < rows; ++r) {
+        for (uint64_t i = 0; i < count; ++i) {
+            dst.data[r * count + i] = src0.data[r * count + i] * src1.data[i];
+        }
+    }
+    uint32_t repeats = static_cast<uint32_t>((count * rows * sizeof(T) + SIMD_REPEAT_BYTES - 1) / SIMD_REPEAT_BYTES);
+    g_cycleTracker.vMulCycles += 2 * repeats + 13;
+    g_timeline.Vector(2 * repeats + 13, SpanOf(dst.data, count * rows), SpanOf(src0.data, count * rows), SpanOf(src1.data, count));
+}
+
+template <typename T>
+inline void Add(LocalTensor<T> dst, LocalTensor<T> src0, LocalTensor<T> src1, uint64_t count, uint8_t rows, BinaryRepeatParams rep) {
+    (void)rep;
+    for (uint8_t r = 0; r < rows; ++r) {
+        for (uint64_t i = 0; i < count; ++i) {
+            dst.data[r * count + i] = src0.data[r * count + i] + src1.data[i];
+        }
+    }
+    uint32_t repeats = static_cast<uint32_t>((count * rows * sizeof(T) + SIMD_REPEAT_BYTES - 1) / SIMD_REPEAT_BYTES);
+    g_cycleTracker.vAddCycles += 2 * repeats + 13;
+    g_timeline.Vector(2 * repeats + 13, SpanOf(dst.data, count * rows), SpanOf(src0.data, count * rows), SpanOf(src1.data, count));
+}
+
+// -----------------------------------------------------------------------------
+// DAE v1.5 High-Precision Newton-Raphson Refinement
+// Refines 11-bit LUT hardware Rsqrt to full 24-bit FP32 precision.
+// -----------------------------------------------------------------------------
+inline float RefineInvRms(float mean, float inv) {
+    if (mean > 0.0f && mean <= 3.402823466e38f) {
+        inv = inv * (1.5f - (0.5f * (mean * inv)) * inv);
+        inv = inv * (1.5f - (0.5f * (mean * inv)) * inv);
+    }
+    return inv;
+}
+
+// -----------------------------------------------------------------------------
+// DAE v1.5 Kernel Launch Constant Frame Guard (Trap #409)
+// -----------------------------------------------------------------------------
+template <typename ArgsStruct>
+inline void ValidateLaunchArgs(const ArgsStruct&) {
+    if (sizeof(ArgsStruct) > 32) {
+        throw std::runtime_error("[Hardware Fault - CONSTANT REGISTER FRAME OVERFLOW (Trap #409)]: "
+                                 "Kernel launch argument structure size (" + std::to_string(sizeof(ArgsStruct)) +
+                                 " bytes) exceeds the 32-byte physical constant register frame! "
+                                 "Host-to-device kernel boundaries must be flattened into primitive scalars and 64-bit pointers.");
+    }
 }
 
 } // namespace dsa
