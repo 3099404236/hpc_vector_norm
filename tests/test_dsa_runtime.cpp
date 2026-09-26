@@ -228,12 +228,15 @@ int main() {
         AlignedVector<float> src(1024, 1.0f), dst(1024, 0.0f);
         {
             TPipe p;
-            TQue<QuePosition::VECIN, 2> q;
-            p.InitBuffer(q, 2, 1024 * sizeof(float));
-            LocalTensor<float> t = q.AllocTensor<float>();
-            DataCopy(t, src.data(), 1024);  // 4 KB
-            Add(t, t, t, 1024);             // 16 repeats: 45 cycles
-            DataCopy(dst.data(), t, 1024);
+            TQue<QuePosition::VECIN, 1> qIn;
+            TQue<QuePosition::VECOUT, 1> qOut;
+            p.InitBuffer(qIn, 1, 1024 * sizeof(float));
+            p.InitBuffer(qOut, 1, 1024 * sizeof(float));
+            LocalTensor<float> tIn = qIn.AllocTensor<float>();
+            LocalTensor<float> tOut = qOut.AllocTensor<float>();
+            DataCopy(tIn, src.data(), 1024);  // 4 KB
+            Add(tOut, tIn, tIn, 1024);        // 16 repeats: 45 cycles
+            DataCopy(dst.data(), tOut, 1024);
             const TimelineSummary s = g_timeline.Summary();
             const double load = 4096 / bw, add = 2 * 16 + 13, expect = load + L + add + load + L;
             ok &= near(s.finish, expect) && near(s.vectorBusy, add) && near(s.dmaBusy, 2 * load) && near(s.loadBusy, load);
@@ -241,7 +244,8 @@ int main() {
             ok &= s.finish >= s.LowerBound();
             ok &= near(s.LatencyFloor(), expect);  // One chain, load -> add -> store: nothing to overlap
             if (!ok) std::cerr << "FAIL: single-tile timeline " << s.finish << " (floor " << s.LatencyFloor() << ") != " << expect << "\n";
-            q.FreeTensor(t);
+            qIn.FreeTensor(tIn);
+            qOut.FreeTensor(tOut);
         }
         {
             TPipe p;
@@ -286,6 +290,25 @@ int main() {
         }
         if (ok) std::cout << "PASS: load/compute/store latency, double-buffer overlap, SyncAll release, latency floor\n";
     }
+
+    // -------------------------------------------------------------------------
+    // Test 9: Sanitizer Trapping Asymmetric Egress & ALU Pipeline Aliasing
+    // -------------------------------------------------------------------------
+    std::cout << "\n[Testing Sanitizer Guard: Egress Channel & ALU Aliasing Defense]...\n";
+    ok &= ExpectTrap("DataCopy egress from QuePosition::VECIN", [&] {
+        TPipe p;
+        TQue<QuePosition::VECIN, 1> q;
+        p.InitBuffer(q, 1, 256);
+        LocalTensor<float> t = q.AllocTensor<float>();
+        DataCopy(output.data(), t, 64);
+    });
+    ok &= ExpectTrap("BlockReduceSum in-place buffer aliasing (dst == src)", [&] {
+        TPipe p;
+        TBuf<QuePosition::VECCALC> b;
+        p.InitBuffer(b, 256);
+        LocalTensor<float> t = b.Get<float>();
+        BlockReduceSum(t, t, 64);
+    });
 
     if (!ok) return 1;
 

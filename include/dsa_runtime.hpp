@@ -455,6 +455,17 @@ inline uint32_t GetThreadNum() {
     return static_cast<uint32_t>(omp_get_num_threads());
 }
 
+// Freestanding mathematical primitives (Zero libc/STL dependencies for device workers)
+template <typename T>
+constexpr const T& Min(const T& a, const T& b) {
+    return (b < a) ? b : a;
+}
+
+template <typename T>
+constexpr const T& Max(const T& a, const T& b) {
+    return (a < b) ? b : a;
+}
+
 // -----------------------------------------------------------------------------
 // LocalTensor<T> Implementation for Core-Local Scratchpad
 // -----------------------------------------------------------------------------
@@ -464,20 +475,21 @@ public:
     T* data = nullptr;
     uint32_t count = 0;
     uint32_t capacityBytes = 0;
+    QuePosition pos = QuePosition::TOTAL_POSITIONS;
 
     LocalTensor() = default;
-    LocalTensor(T* ptr, uint32_t numElems, uint32_t capBytes)
-        : data(ptr), count(numElems), capacityBytes(capBytes) {}
+    LocalTensor(T* ptr, uint32_t numElems, uint32_t capBytes, QuePosition p = QuePosition::TOTAL_POSITIONS)
+        : data(ptr), count(numElems), capacityBytes(capBytes), pos(p) {}
 
     // Sub-tensor slicing operator: tensor[offset] returns sliced sub-tensor view
     inline LocalTensor<T> operator[](uint32_t offset) const {
         return LocalTensor<T>(data + offset, (count > offset) ? (count - offset) : 0, 
-                              (capacityBytes > offset * sizeof(T)) ? (capacityBytes - offset * sizeof(T)) : 0);
+                              (capacityBytes > offset * sizeof(T)) ? (capacityBytes - offset * sizeof(T)) : 0, pos);
     }
 
     inline LocalTensor<T> operator+(uint32_t offset) const {
         return LocalTensor<T>(data + offset, (count > offset) ? (count - offset) : 0, 
-                              (capacityBytes > offset * sizeof(T)) ? (capacityBytes - offset * sizeof(T)) : 0);
+                              (capacityBytes > offset * sizeof(T)) ? (capacityBytes - offset * sizeof(T)) : 0, pos);
     }
 
     // Scalar read/write with hardware V->S pipeline stall telemetry
@@ -497,6 +509,7 @@ public:
     inline T* GetData() { return data; }
     inline const T* GetData() const { return data; }
     inline uint32_t GetSize() const { return count; }
+    inline QuePosition GetPosition() const { return pos; }
 };
 
 // -----------------------------------------------------------------------------
@@ -519,7 +532,7 @@ public:
         uintptr_t raw = reinterpret_cast<uintptr_t>(bufferPool.data());
         uint8_t* base = reinterpret_cast<uint8_t*>((raw + 63) & ~uintptr_t(63));
         return LocalTensor<T>(reinterpret_cast<T*>(base), static_cast<uint32_t>(elementBytes / sizeof(T)),
-                              static_cast<uint32_t>(elementBytes));
+                              static_cast<uint32_t>(elementBytes), pos);
     }
 };
 
@@ -613,7 +626,7 @@ private:
     template <typename T>
     LocalTensor<T> View(uint32_t slot) {
         return LocalTensor<T>(reinterpret_cast<T*>(Base(slot)), static_cast<uint32_t>(elementBytes / sizeof(T)),
-                              static_cast<uint32_t>(elementBytes));
+                              static_cast<uint32_t>(elementBytes), pos);
     }
 
     uint32_t SlotOf(const void* data) {
@@ -723,6 +736,22 @@ inline void DataCopy(T* dst, LocalTensor<T> src, uint32_t count) {
     }
     CheckDmaAddress(dst, src.GetData());
 
+    // -------------------------------------------------------------------------
+    // Hardware Guard: DMA Egress Routing Channel Verification (PIPE_DMA_OUT)
+    // Destination is system memory (egress transfer). The target streaming DMA
+    // engine routes egress transfers strictly through Channel DMA_OUT
+    // (PIPE_DMA_OUT), which is wired to QuePosition::VECOUT. Egress via VECIN
+    // causes crossbar interconnect deadlock and pipeline stall.
+    // -------------------------------------------------------------------------
+    if (src.pos == QuePosition::VECIN) {
+        throw std::runtime_error("[Hardware Fault - INVALID DMA EGRESS CHANNEL]: "
+                                 "DataCopy egress to system memory attempted from QuePosition::VECIN! "
+                                 "The stream processor features asymmetric DMA routing: Ingress streams "
+                                 "system memory -> VECIN (PIPE_DMA_IN), while Egress strictly routes "
+                                 "VECOUT -> system memory (PIPE_DMA_OUT). Egress via VECIN causes "
+                                 "crossbar interconnect deadlock and pipeline timeout (Trap #401).");
+    }
+
     std::memcpy(dst, src.GetData(), copyBytes);
     g_cycleTracker.dmaBytesMoved += copyBytes;
     g_cycleTracker.dmaTransfers++;
@@ -755,6 +784,11 @@ inline void DataCopyPad(T* dst, LocalTensor<T> src, uint32_t count) {
     const size_t copyBytes = count * sizeof(T);
     if (reinterpret_cast<uintptr_t>(src.GetData()) % DMA_ALIGN_BYTES != 0) {
         throw std::runtime_error("[Hardware Fault - DMA UNALIGNED]: DataCopyPad scratchpad side must be 32-byte aligned!");
+    }
+    if (src.pos == QuePosition::VECIN) {
+        throw std::runtime_error("[Hardware Fault - INVALID DMA EGRESS CHANNEL]: "
+                                 "DataCopyPad egress to system memory attempted from QuePosition::VECIN! "
+                                 "Egress transfers strictly require QuePosition::VECOUT (Trap #401).");
     }
     std::memcpy(dst, src.GetData(), copyBytes);
     const size_t blockBytes = (copyBytes + DMA_ALIGN_BYTES - 1) / DMA_ALIGN_BYTES * DMA_ALIGN_BYTES;
@@ -851,6 +885,13 @@ inline void Rsqrt(LocalTensor<T> dst, LocalTensor<T> src, uint32_t count) {
 // -----------------------------------------------------------------------------
 template <typename T>
 inline void BlockReduceSum(LocalTensor<T> dst, LocalTensor<T> src, uint32_t count) {
+    if (dst.GetData() == src.GetData()) {
+        throw std::runtime_error("[Hardware Fault - VECTOR ALU OPERAND ALIASING]: "
+                                 "BlockReduceSum destination buffer aliases source buffer (dst == src)! "
+                                 "The 256-bit SIMD vector pipeline forbids in-place folding within the "
+                                 "same buffer due to lack of sub-vector RAW forwarding across 256-bit "
+                                 "burst lanes. Intra-row folding must ping-pong across disjoint buffers (Trap #402).");
+    }
     uint32_t outCount = count / 8;
     for (uint32_t i = 0; i < outCount; ++i) {
         T sum = 0;
@@ -882,14 +923,22 @@ inline float VectorReduceSum(LocalTensor<T> src, uint32_t count) {
 }
 
 // -----------------------------------------------------------------------------
-// Pure Vector InvRms with Newton-Raphson Iteration (VectorInvRms)
+// Pure Vector InvRms with Coordinator-Precomputed Invariant Scale (invD)
 // -----------------------------------------------------------------------------
-inline float VectorInvRms(float sumSq, uint32_t D, float eps) {
-    float x = sumSq / static_cast<float>(D) + eps;
+inline float VectorInvRms(float sumSq, float invD, float eps) {
+    float x = sumSq * invD + eps;
     float inv = static_cast<float>(1.0 / std::sqrt(static_cast<double>(x)));
     g_cycleTracker.vRsqrtCycles += 2 + 14;
     g_timeline.Vector(2 + 14, {});
     return inv;
+}
+
+// Deprecated overload: Worker core performing scalar integer-to-float conversion
+[[deprecated("Worker core lacks scalar integer-to-float conversion unit. Pass precomputed invD from Coordinator.")]]
+inline float VectorInvRms(float sumSq, uint32_t D, float eps) {
+    g_cycleTracker.scalarStallCycles += 20; // 20-cycle scalar conversion penalty
+    g_cycleTracker.scalarStallCount++;
+    return VectorInvRms(sumSq, 1.0f / static_cast<float>(D), eps);
 }
 
 // -----------------------------------------------------------------------------

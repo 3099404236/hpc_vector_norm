@@ -2,7 +2,7 @@
 
 Welcome to the `hpc_vector_norm` performance optimization project!
 
-To achieve theoretical roofline performance without hardcoding specific case branches, we have left **6 major architectural open vectors** for contributors and autonomous AI agents. You are invited to design, mathematically formulate, and implement these solutions.
+To achieve theoretical roofline performance without hardcoding specific case branches, we have left **7 major architectural open vectors** for contributors and autonomous AI agents. You are invited to design, mathematically formulate, and implement these solutions.
 
 Each challenge below has two solutions:
 
@@ -261,6 +261,53 @@ Refactor the inner `Core` execution into a freestanding worker routine:
   - Batch sums and Split-D partials are fixed arrays (`double sums[64]`, and `RowPartial parts[40]` on the caller).
   - Nothing in the parallel region throws.
   - The resident-Z scratchpad (191 KB) is allocated once per thread, on that thread's first call, and reused afterwards.
+
+---
+
+## 🎯 Challenge 7: Asymmetric Ingress/Egress Queue Isolation, Non-Aliasing Vector Accumulation, and Precomputed Invariant Scaling
+
+### The Dilemma
+As target hardware simulation fidelity is upgraded to reflect the physical streaming vector architecture (DAE v1.4 Errata), strict hardware pipeline invariants and channel routing laws have been introduced:
+
+1. **Asymmetric DMA Egress Routing (`TRAP_EGRESS_DMA_CHANNEL_INVALID`)**:
+   The streaming processor separates inbound and outbound DMA traffic across decoupled physical channels:
+   - **Ingress Engine (Channel DMA_IN / PIPE_DMA_IN)**: Exclusively routes System Memory $\to$ `QuePosition::VECIN`.
+   - **Egress Engine (Channel DMA_OUT / PIPE_DMA_OUT)**: Exclusively routes `QuePosition::VECOUT` $\to$ System Memory.
+   Attempting an egress `DataCopy` or `DataCopyPad` back to system memory (`dst`) from a buffer residing in `QuePosition::VECIN` (such as casting results back into the `qX1` slot) violates the unidirectional crossbar interconnect. In hardware, this induces channel contention, crossbar deadlock, and stream synchronization timeouts (`ERR_DMA_CHANNEL_LOCKUP`). Egress transfers must strictly source from buffers bound to `QuePosition::VECOUT`.
+
+2. **Vector ALU Register Pipeline RAW Aliasing (`TRAP_ALU_OPERAND_ALIASING`)**:
+   The 256-bit SIMD vector execution unit processes 256-byte bursts in a multi-stage execution pipeline without intra-instruction sub-vector forwarding.
+   For vector reduction and accumulation primitives (specifically `BlockReduceSum(dst, src, count)`), the destination buffer address range $[dst, dst + outBytes)$ MUST NOT overlap or alias the source buffer address range $[src, src + inBytes)$.
+   In-place folding within the same buffer (`BlockReduceSum(tmp, tmp, n)`) causes write-after-read (RAW) corruption across vector lanes, corrupting up to $63/64$ of elements ($0.015625$ partial accuracy on 64-element vectors). Intra-tile reduction and tree folding must ping-pong between disjoint scratchpad regions (e.g. two separate buffers or non-overlapping slices within `bTmp` / `bMisc`).
+
+3. **Core Scalar FPU Absence & Coordinator Invariant Precomputation (`TRAP_CORE_SCALAR_FPU_ABSENT`)**:
+   The streaming DAE worker core is a pure numerical execution engine equipped with an integer AGU (Address Generation Unit) and vector floating-point pipe, but lacks on-core scalar integer-to-float conversion instructions (`static_cast<float>(D)` or per-row division `1.0f / D` stalls the scalar pipe and incurs compiler diagnostics).
+   Per-tensor/per-row invariant scaling factors—such as the reciprocal row dimension $\text{invD} = 1.0f / \text{float}(D)$—MUST be precomputed once by the Master Coordinator (`DaePipeline::Execute`) and passed inside `Args` to the worker core, so that `Core::Execute` evaluates RMS via $Z^2 \cdot \text{args.invD} + \text{eps}$ without runtime integer-to-float conversions.
+
+4. **Freestanding Worker Dialect Compliance (`TRAP_HOST_LIBC_DEPENDENCY`)**:
+   Device worker execution must be strictly freestanding and cannot depend on host libc `<algorithm>` functions (`std::min`, `std::max`). Worker routines must strictly use freestanding `dsa::Min` and `dsa::Max`.
+
+### 💥 Hardware Simulator Telemetry & Diagnostic Traps (DAE v1.4 Errata)
+Running the hardware sanitizer suite (`./test_dsa_runtime`) verifies these guards:
+```
+[Testing Sanitizer Guard: Egress Channel & ALU Aliasing Defense]...
+PASS: DataCopy egress from QuePosition::VECIN:
+  --> [Hardware Fault - INVALID DMA EGRESS CHANNEL]: DataCopy egress to system memory attempted from QuePosition::VECIN! The stream processor features asymmetric DMA routing: Ingress streams system memory -> VECIN (PIPE_DMA_IN), while Egress strictly routes VECOUT -> system memory (PIPE_DMA_OUT). Egress via VECIN causes crossbar interconnect deadlock and pipeline timeout (Trap #401).
+PASS: BlockReduceSum in-place buffer aliasing (dst == src):
+  --> [Hardware Fault - VECTOR ALU OPERAND ALIASING]: BlockReduceSum destination buffer aliases source buffer (dst == src)! The 256-bit SIMD vector pipeline forbids in-place folding within the same buffer due to lack of sub-vector RAW forwarding across 256-bit burst lanes. Intra-row folding must ping-pong across disjoint buffers (Trap #402).
+```
+
+### The Objective
+Refactor the DAE pipeline kernel and memory model to achieve full microarchitectural compliance:
+1. **Dedicated Egress Channel (`QuePosition::VECOUT`)**:
+   - Update `AdaptiveTiler` knapsack memory model (`DaeLayout`) to account for an egress queue or buffer bound to `QuePosition::VECOUT` (e.g. `TQue<QuePosition::VECOUT, depth> qY` or dedicated egress buffer), ensuring total scratchpad stays under the 191 KB ($195{,}584\text{ B}$) waterline.
+   - Route all output stores (`y + ...`) exclusively through `QuePosition::VECOUT`.
+2. **Ping-Pong Non-Aliasing Intra-Tile Reductions**:
+   - For all reduction and folding operations (`BlockReduceSum`), ensure source and destination buffers never alias ($dst \neq src$). Ping-pong between disjoint scratchpad partitions.
+3. **Coordinator Invariant Precomputation**:
+   - Precompute `invD = 1.0f / float(D)` inside the Master Coordinator (`DaePipeline::Execute`), pass `invD` via `Args`, and invoke `dsa::VectorInvRms(sumSq, args.invD, eps)` on the worker core with zero scalar stalls.
+4. **Freestanding Worker Dialect**:
+   - Replace any remaining `<algorithm>` dependencies in `Core` with freestanding `dsa::Min` and `dsa::Max`.
 
 ---
 
