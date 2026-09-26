@@ -133,10 +133,10 @@ void CheckPlan(const TilingConfig& t, uint32_t M, uint32_t D, uint32_t s, const 
               t.layout.tmp == (t.direct ? AdaptiveTiler::DirectLayout(s).tmp : AdaptiveTiler::SCRATCH_BYTES), msg);
     Check((t.layout.rec != 0) == (t.mode != TilingMode::ROW_PARALLEL), msg);
     // Rows run direct exactly when the busiest core's share fits the direct kernel's static buffers
-    // [Challenge 8]: at most 512 bytes of X1 (X2, Y), and its squares, each row padded to whole
+    // [Challenge 8]: at most 1,024 bytes of X1 (X2, Y), and its squares, each row padded to whole
     // 64-lane repeats, at most 1,024 floats
     const uint64_t rows = (AdaptiveTiler::MaxLoad(total, t.unitElems, t.blocks) + D - 1) / D;
-    const bool fits = rows * D * s <= 512 && rows * ((D + 63) / 64 * 64) <= 1024;
+    const bool fits = rows * D * s <= 1024 && rows * ((D + 63) / 64 * 64) <= 1024;
     Check(t.direct == (t.mode == TilingMode::ROW_PARALLEL && fits), msg);
     uint64_t lo = ~0ull, hi = 0;  // Balanced to one unit
     for (uint32_t b = 0; b < t.blocks; ++b) {
@@ -183,10 +183,11 @@ void CheckProfilePlans() {
     // P08: >= 24 rows in flight within 191 KB (Challenges 2 and 3)
     const TilingConfig p4 = AdaptiveTiler::Plan(768, 192, 2, hw), p8 = AdaptiveTiler::Plan(10240, 512, 2, hw);
     Check(p4.tileRows < 20 && p4.layout.depth >= 2, "P04 pipelined tiles");
-    // P01: one 128-byte row on one core runs direct, modeled under 2.0 us (Challenge 8); P02's
-    // 800-byte rows exceed the direct kernel's 512-byte tiles
+    // P01: one 128-byte row on one core runs direct, modeled under 2.0 us (Challenge 8); P02: one
+    // 800-byte row on each of 7 cores runs direct too, modeled under its 2.06 us target
     const TilingConfig p1 = AdaptiveTiler::Plan(1, 64, 2, hw), p2 = AdaptiveTiler::Plan(7, 200, 4, hw);
-    Check(p1.direct && p1.blocks == 1 && p1.modelNs < 2000.0 && !p2.direct, "P01 direct kernel under 2.0 us");
+    Check(p1.direct && p1.blocks == 1 && p1.modelNs < 2000.0, "P01 direct kernel under 2.0 us");
+    Check(p2.direct && p2.blocks == 7 && p2.tileRows == 1 && p2.modelNs < 2060.0, "P02 direct kernel under 2.06 us");
     Check(p8.tileRows * p8.layout.depth >= 24 && p8.layout.Total() <= dsa::SCRATCHPAD_SAFE_WATERLINE, "P08 rows in flight");
 }
 
@@ -194,7 +195,7 @@ void CheckProfilePlans() {
 // say so (tileElems == 0) instead of overflowing
 void CheckPlannerScan() {
     const HardwareModel hw = HardwareModel::Target();
-    // Every tensor of at most 512 bytes runs on the direct kernel, whatever its shape [Challenge 8]
+    // Every tensor of at most 1,024 bytes runs on the direct kernel, whatever its shape [Challenge 8]
     for (uint32_t s : {2u, 4u}) {
         for (uint32_t D = 1; D * s <= AdaptiveTiler::DIRECT_BYTES; ++D) {
             for (uint32_t M = 1; M * D * s <= AdaptiveTiler::DIRECT_BYTES; ++M) {
@@ -390,17 +391,17 @@ TilingConfig QueuedTwin(uint32_t M, uint32_t D, uint32_t s, const TilingConfig& 
     return queued;
 }
 
-// Direct kernel [ARCH CHALLENGE 8]: every kind of share it takes (1 to 16 rows, rows padded to 64
-// lanes or not, rows on and off the 32-byte grid, one core or many), with and without gamma/beta, on
-// aligned and offset bases: RunPlan holds each run to the reference, the model and zero queue steps.
-// The same shape through the queue kernel is slower once its sequencer cycles count, which is why
-// the planner takes the direct kernel whenever the share fits.
+// Direct kernel [ARCH CHALLENGE 8]: every kind of share it takes (1 to 16 rows, rows of up to 1,024
+// bytes, padded to 64 lanes or not, on and off the 32-byte grid, one core or many), with and without
+// gamma/beta, on aligned and offset bases: RunPlan holds each run to the reference, the model and zero
+// queue steps. The same shape through the queue kernel is slower once its sequencer cycles count,
+// which is why the planner takes the direct kernel whenever the share fits.
 template <class C>
 void RunDirectSweep(std::mt19937& rng) {
     const uint32_t s = sizeof(typename C::S);
     const HardwareModel hw = HardwareModel::Target();
     uint32_t shapes = 0;
-    for (const uint32_t D : {1u, 7u, 8u, 24u, 60u, 64u, 65u, 100u, 128u, 200u, 256u}) {
+    for (const uint32_t D : {1u, 7u, 8u, 24u, 60u, 64u, 65u, 100u, 128u, 200u, 256u, 400u, 512u}) {
         for (const uint32_t M : {1u, 2u, 3u, 5u, 16u, 40u, 100u}) {
             const TilingConfig plan = AdaptiveTiler::Plan(M, D, s, hw);
             if (!plan.direct) continue;
@@ -423,19 +424,27 @@ void RunDirectSweep(std::mt19937& rng) {
     Check(shapes >= 20, "direct sweep covers its shapes");
 }
 
-// P01 (1 x 64 FP16): the direct kernel finishes under 2.0 us with no queue step; the queue kernel
-// finishes its timeline in 1.73 us but needs 6,250 sequencer cycles on top (10 lifecycle steps)
-void CheckDirectLatency(std::mt19937& rng) {
+// P01 (1 x 64 FP16) and P02 (7 x 200 FP32, one row per core): the direct kernel finishes under
+// `boundUs` with no queue step; the queue kernel's timeline is about as short, but it needs 6,250
+// sequencer cycles on top (10 lifecycle steps)
+template <class C>
+void CheckDirectLatency(const char* name, uint32_t M, uint32_t D, double boundUs, std::mt19937& rng) {
     const HardwareModel hw = HardwareModel::Target();
-    const TilingConfig plan = AdaptiveTiler::Plan(1, 64, 2, hw), queued = QueuedTwin(1, 64, 2, plan);
-    const DaeStats d = RunPlan<F16>(1, 64, plan, true, true, 0, rng, "P01 direct");
-    const DaeStats q = RunPlan<F16>(1, 64, queued, true, true, 0, rng, "P01 queued");
+    const uint32_t s = sizeof(typename C::S);
+    const TilingConfig plan = AdaptiveTiler::Plan(M, D, s, hw), queued = QueuedTwin(M, D, s, plan);
+    char label[96];
+    std::snprintf(label, sizeof label, "%s direct", name);
+    const DaeStats d = RunPlan<C>(M, D, plan, true, true, 0, rng, label);
+    std::snprintf(label, sizeof label, "%s queued", name);
+    const DaeStats q = RunPlan<C>(M, D, queued, true, true, 0, rng, label);
     const double us = 1.0 / (dsa::CLOCK_GHZ * 1e3);
-    std::printf("P01 direct: %.2f us, %llu queue cycles; queue kernel: %.2f us + %llu queue cycles = %.2f us\n",
+    std::printf("%s direct: %.2f us, %llu queue cycles; queue kernel: %.2f us + %llu queue cycles = %.2f us\n", name,
                 d.timeline.finish * us, (unsigned long long)d.queueCycles, q.timeline.finish * us,
                 (unsigned long long)q.queueCycles, (q.timeline.finish + q.queueCycles) * us);
-    Check(plan.direct && d.queueCycles == 0 && d.timeline.finish * us < 2.0, "P01 direct kernel under 2.0 us");
-    Check(!queued.direct && q.queueCycles == 10 * 625, "P01 queue kernel: ten lifecycle steps");
+    std::snprintf(label, sizeof label, "%s direct kernel under %.2f us", name, boundUs);
+    Check(plan.direct && d.queueCycles == 0 && d.timeline.finish * us < boundUs, label);
+    std::snprintf(label, sizeof label, "%s queue kernel: ten lifecycle steps", name);
+    Check(!queued.direct && q.queueCycles == 10 * 625, label);
 }
 
 // -----------------------------------------------------------------------------
@@ -566,7 +575,8 @@ int main(int argc, char** argv) {
     RunWidePlans<F32>(rng);
     RunWidePlans<F16>(rng);
     RunWidePlans<BF16>(rng);
-    CheckDirectLatency(rng);
+    CheckDirectLatency<F16>("P01", 1, 64, 2.0, rng);
+    CheckDirectLatency<F32>("P02", 7, 200, 2.06, rng);  // Its world-record target
     RunDirectSweep<F32>(rng);
     RunDirectSweep<F16>(rng);
     RunDirectSweep<BF16>(rng);

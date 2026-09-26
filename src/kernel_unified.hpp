@@ -1089,6 +1089,10 @@ private:
     struct DirectCore {
         static constexpr bool kF32 = std::is_same<C, F32>::value;
         static constexpr uint32_t SHARE = AdaptiveTiler::DIRECT_BYTES / sizeof(S);  // Elements in a share's buffer
+        // The strided Add/Mul's 8-bit fields: a repeat stride of one FP32 row's 32-byte blocks
+        // (D / 8 <= SHARE / 8) and one repeat per row (each row pads to at least one 64-lane repeat)
+        static_assert(SHARE / 8 <= 255 && AdaptiveTiler::DIRECT_FLOATS / AdaptiveTiler::LANES <= 255,
+                      "a direct share's rows must fit the 8-bit repeat fields of the strided Add/Mul");
         using Scratchpad = dsa::LocalMemAllocator<dsa::Hardware::Scratchpad>;
 
         DirectCore(const S* x1, const S* x2, const S* gamma, const S* bias, S* y, const TilingConfig& plan, uint32_t M,
@@ -1222,8 +1226,8 @@ private:
         }
 
         // z (+|*)= a parameter row on each of k rows. When FP32 rows are whole 32-byte blocks this is
-        // one strided instruction: its 8-bit repeat stride counts blocks, D / 8 <= 32 here. Otherwise
-        // it is one instruction per row.
+        // one strided instruction: its 8-bit repeat stride counts blocks, D / 8 <= SHARE / 8 (64 for
+        // 16-bit data) here. Otherwise it is one instruction per row.
         void EachRow(dsa::LocalTensor<float> zt, dsa::LocalTensor<float> p, uint32_t k, bool multiply) {
             if (D % 8 == 0) {
                 const uint8_t stride = static_cast<uint8_t>(D / 8);

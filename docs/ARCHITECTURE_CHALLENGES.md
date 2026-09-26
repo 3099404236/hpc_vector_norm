@@ -423,9 +423,11 @@ Empower the DAE execution framework to fully respect physical microarchitectural
 ### ✅ 40-Core Target Implementation (DAE)
 - **Direct kernel for single-tile shares (Objective 1).**
   - **Why.** A row tile takes ten `TQue` lifecycle steps: `AllocTensor`, `EnQue`, `DeQue` and `FreeTensor` for each of X1 and X2, and `AllocTensor` and `FreeTensor` for its egress buffer. At 625 sequencer cycles each, that is 6,250 cycles. A share that fits one tile has no other tile to hide them behind.
-  - **Rule** (`AdaptiveTiler::DirectFits`, physical properties only). The busiest core's rows must take at most 512 B per tensor, and their squares, each row zero-padded to whole 64-lane repeats, must fit 1,024 floats. The tests plan all 3,577 tensors of at most 512 bytes, FP32 and 16-bit, and every one runs direct. So does a larger tensor whose share per core is that small: 40 × 64 FP16 gives each core one 128-byte row. P02's 800-byte rows do not qualify.
+  - **Rule** (`AdaptiveTiler::DirectFits`, physical properties only). The busiest core's rows must take at most 1,024 B per tensor, and their squares, each row zero-padded to whole 64-lane repeats, must fit 1,024 floats. The tests plan all 8,026 tensors of at most 1,024 bytes, FP32 and 16-bit, and every one runs direct: none has more than 16 rows on a core or more than 1,024 padded squares. So does a larger tensor whose share per core is that small: 40 × 64 FP16 gives each core one 128-byte row, and P02 (7 × 200 FP32) one 800-byte row.
+    - The threshold was 512 B, which left P02 on the queue kernel. At 2,048 B, 542 16-bit shapes of at most 2 KB would need more than 1,024 padded squares (up to 2,048) and up to 32 rows per core, and no other profile would qualify.
   - **Kernel** (`DaePipeline::DirectCore`).
-    - It claims static buffers from a `LocalMemAllocator<Hardware::Scratchpad>` on the worker's stack: 13,056 B for 16-bit data, 8,448 B for FP32 (`DirectLayout`).
+    - It claims static buffers from a `LocalMemAllocator<Hardware::Scratchpad>` on the worker's stack: 20,736 B for 16-bit data, 11,520 B for FP32 (`DirectLayout`).
+    - A `static_assert` keeps a share's rows within the strided `Add`/`Mul`'s 8-bit repeat fields: a stride of at most 64 blocks (a 512-column 16-bit row, widened to FP32) and at most 16 rows.
     - There is no `TPipe` and no `TQue`, so it has no sequencer cycles, and no heap: the allocation probe counts 0.
     - Inputs are tagged VECIN and Y VECOUT, so the v1.4 egress guard still applies. A mutation that stores from X1 aborts on Trap #401.
   - **Ordering.**
@@ -439,6 +441,7 @@ Empower the DAE execution framework to fully respect physical microarchitectural
     - `Brcb` and a `Mul` per row;
     - widen and multiply γ, then narrow into the egress buffer.
   - **Result.** P01 finishes in 1.81 µs with 0 queue cycles. On the queue kernel it took 1.73 µs plus 6,250 sequencer cycles, 5.90 µs in total. Its total cycles fall from 6,433 to 297.
+  - **P02.** 1.95 µs with 0 queue cycles, under its 2.06 µs target. On the queue kernel it took 1.87 µs plus 6,250 sequencer cycles, 6.04 µs in total. Its total cycles fall from 6,394 to 343. The timeline is 0.08 µs longer than the queue kernel's: an FP32 output needs two Newton-Raphson steps, and with their setup they take 135 of the 343 cycles.
 - **64-lane reductions, disjoint partitions (Objectives 2 and 3).**
   - Each row's squares land in a row of whole 64-lane repeats. One `Duplicate`, issued before the loads, zeroes the pad lanes, so it runs under the DMA latency. For example, 1 × 200 FP16 pads its row to 256 lanes.
   - `ReduceSum(sums[i], sq[i·padded], work, padded)` keeps destination, source and workpad in three disjoint buffers. The row sums, mean, inverse RMS and Newton-Raphson term each have a 64-lane partition of their own. So does the `Brcb` destination, which holds whole 64-lane bursts (Trap #410).
@@ -451,12 +454,15 @@ Empower the DAE execution framework to fully respect physical microarchitectural
   - Both kernels' padded transfers carry a `DataCopyExtParams` descriptor.
   - `ToFloat`/`FromFloat` are not adopted, because the simulator's converters are not exact. `dsa::half`'s conversion to float corrupts all 2,046 FP16 subnormals (it never re-biases their exponent). `FromFloat` truncates instead of rounding, and flushes subnormals to zero.
   - The kernels widen and narrow with the runtime's `Cast` and the codec's exact converters, at the same cycle cost.
-- **Precision.** All 3,577 tiny tensors ran through both the direct kernel and the queue kernel.
+- **Precision.** All 3,577 tensors of at most 512 bytes ran through both the direct kernel and the queue kernel.
   - The direct kernel's worst error against FP64 is no worse: FP32 3.3e-7 against 3.7e-7; FP16 (4.9e-4) and BF16 (3.9e-3) equal.
   - FP16 and BF16 outputs differ in 9 and 2 of 204,852 values. 23% of FP32 values differ in their last bits: `Rsqrt` plus Newton-Raphson in FP32 replaces the double-precision `VectorInvRms`.
+  - With the 1,024-byte threshold, all 8,026 tensors of at most 1,024 bytes ran through both kernels again. Each kernel's worst error against FP64 equals the other's in every dtype (FP32 1.2e-6, FP16 1.9e-3, BF16 1.4e-2 on these inputs). FP16 and BF16 outputs differ in 32 and 7 of 906,857 values, and FP32 in 46,575 of 204,852 (23%).
 - **Models kept exact.** `DirectTimeline` replays `DirectCore::Run` instruction by instruction. On every direct run, its finish time and cycle count equal the runtime's.
   - A dump of 41,611 plans changes 2,445, all of them direct row plans for tiny shares.
   - Host plans are unchanged, and P01 is the only profile that changes.
+  - The 1,024-byte threshold, on a dump of 17,070 plans (every FP32 and 16-bit shape of at most 2 KB, and 16 row counts × 102 widths for the target and a 4-core host): 1,900 row plans go direct, every one a share of 514 to 1,024 bytes. The 7,209 plans that were already direct claim the larger static buffers and keep their schedule, cycles and time. Nothing else changes, host plans included. Among the profiles, P02 goes direct and P01 claims 20,736 B instead of 13,056 B.
+  - Every one of the 8,026 tensors of at most 1,024 bytes runs with the model's cycle count and finish time, and finishes sooner than its queued twin once the twin's sequencer cycles count.
 - **Runtime fix.** `LocalMemAllocator` declared `uint8_t pool[N] alignas(64)`. Clang rejects that placement, so no file built with clang. It now reads `alignas(64) uint8_t pool[N]`, with the same layout under GCC.
 - **Open: the streaming kernel's sequencer cycles.**
   - The streaming profiles still take their queue steps: 806,250 sequencer cycles on P13's busiest core, 781,250 on P15's. The runtime keeps these off the timeline.
@@ -513,13 +519,13 @@ The host constants were measured on the reference CI host, a 4-core Cascade Lake
 ### Tests
 
 - **`tests/test_correctness.cpp`** forces every host plan variant (Split-D, streaming, recomputed Z) with 1–40 threads against an FP64 reference. It also checks for writes outside Y and for bitwise-identical results across serpentine directions.
-- **`tests/test_dae_pipeline.cpp`** (100,619 checks):
-  - It checks the invariants of the 15 full-size target plans, of 2,448 more shapes in every forced mode, and of all 3,577 tensors of at most 512 bytes (each must plan direct). The plan checks recompute the direct rule from the spec (512 B per tensor, padded squares within 1,024 floats) rather than calling the planner's.
+- **`tests/test_dae_pipeline.cpp`** (129,577 checks):
+  - It checks the invariants of the 15 full-size target plans, of 2,448 more shapes in every forced mode, and of all 8,026 tensors of at most 1,024 bytes (each must plan direct). The plan checks recompute the direct rule from the spec (1,024 B per tensor, padded squares within 1,024 floats) rather than calling the planner's.
   - It runs a plan that fills the scratchpad to the byte (195,584 B).
   - It runs model-chosen, rows, row-major Split-D and column-band plans of 20 shapes through the DAE runtime: with and without γ/β, on aligned and offset bases, in FP32/FP16/BF16. It also runs plans whose tiles span several row groups.
   - A schedule sweep forces every combination of queue depth (2–4), egress buffers (1 or 2), head tile (none, 1 or 4 rows), tail tile (none or 2 rows) and issue order (γ/β first or second, early input loads or not) onto 22-row cores, in FP32 and FP16.
-  - A direct-kernel sweep (Challenge 8) runs every direct shape among 11 widths (1 to 256 columns) × 7 row counts, in FP32, FP16 and BF16. That covers 1 to 16 rows per core, rows padded to 64 lanes or not, rows on and off the 32-byte grid, and 1 to 40 cores. Each shape runs with and without γ/β, on aligned and offset bases. It also runs on its queued twin, which must finish later once its sequencer cycles count.
-  - P01 must finish under 2.0 µs with no queue step, and its queued twin must take exactly ten.
+  - A direct-kernel sweep (Challenge 8) runs every direct shape among 13 widths (1 to 512 columns) × 7 row counts, in FP32, FP16 and BF16. That covers 1 to 16 rows per core, rows of up to 1,024 bytes, rows padded to 64 lanes or not, rows on and off the 32-byte grid, and 1 to 40 cores. Each shape runs with and without γ/β, on aligned and offset bases. It also runs on its queued twin, which must finish later once its sequencer cycles count.
+  - P01 must finish under 2.0 µs and P02 under its 2.06 µs target, both with no queue step, and each queued twin must take exactly ten.
   - Every run must match an FP64 reference and leave canaries around Y intact. It must also have:
     - zero scalar stalls, and one `SyncAll` exactly when split;
     - no queue step on a direct plan, and some on every other plan;
@@ -528,7 +534,7 @@ The host constants were measured on the reference CI host, a 4-core Cascade Lake
   - Every run executes under the DAE v1.4 and v1.5 guards. A store from an input buffer, an aliased fold or workpad, an unpadded `ReduceSum` or an undersized `Brcb` destination aborts the suite.
   - Its timeline must equal the planner's modeled finish time (γ and β present, aligned bases, every mode). Its parts must add up (finish = busy + fill + drain + barrier + mismatch), and it must finish at or above both the bound and the latency floor.
   - Challenge 6 checks: a heap probe (`operator new` during `Execute`), bit-identical results from both workspace entry points, and death tests for every `DSA_ASSERT`. A trap aborts the run and reports which run was in progress.
-  - Mutations it catches (failed checks). The round-5, Challenge 7 and Challenge 8 counts are on the current suite; the others were counted when each was introduced:
+  - Mutations it catches (failed checks). The round-5, Challenge 7 and Challenge 8 counts are on Challenge 8's 100,619-check suite, the direct-threshold counts on the current one; the others were counted when each was introduced:
     - an unplanned 64-byte buffer (the waterline plan aborts with the runtime's overflow trap; 483 without that plan);
     - one `GetValue` per row (1,431);
     - a wrong gather tree (270);
@@ -556,6 +562,10 @@ The host constants were measured on the reference CI host, a 4-core Cascade Lake
       - a model without Newton-Raphson (367);
       - a model that treats rows off the 32-byte grid as one strided instruction (130);
       - the plan passed by value at launch (does not compile: the `static_assert` fires).
+    - The direct threshold, all caught:
+      - the former 512 bytes (363: P02 and the shape scan);
+      - 2,048 bytes (2,848, including 542 16-bit shapes of at most 2 KB that cannot plan direct: their padded squares exceed 1,024 floats);
+      - 4,096 bytes, whose 16-bit rows overflow the 8-bit repeat stride (does not compile: the `static_assert` fires).
     - One Challenge 8 mutation is equivalent: a model that reduces unpadded rows counts the same repeats as the padded ones, so no check can differ.
 - **`tests/test_dsa_runtime.cpp`** (`ctest -R dsa_runtime_sanitizer`) checks every sanitizer trap, including the queue-lifecycle, address-alignment and `DataCopyPad` checks and the v1.4/v1.5 traps (#401, #402, #408, #409, #410). It also checks the timeline model:
   - a load → add → store chain finishes at exactly load + latency + add + store + latency, on its floor;

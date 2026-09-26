@@ -188,9 +188,10 @@ public:
     static constexpr uint32_t ROW_GROUP = 128;           // DAE row sums in flight at once: a worker's fixed per-row arrays
     static constexpr double CHUNK_BYTES = 64 * 1024;     // Host serpentine chunk (prefetch-friendly run)
     // Direct kernel [ARCH CHALLENGE 8]: static buffers sized for a share of at most DIRECT_BYTES per
-    // tensor; ReduceSum runs on whole 64-lane repeats, so each row's squares are zero-padded to
-    // LANES and the padded rows of a share fit DIRECT_FLOATS (at most 16 rows)
-    static constexpr uint32_t DIRECT_BYTES = 512;
+    // tensor (P02's 800-byte FP32 rows fit); ReduceSum runs on whole 64-lane repeats, so each row's
+    // squares are zero-padded to LANES and the padded rows of a share fit DIRECT_FLOATS (at most 16
+    // rows). Every tensor of at most DIRECT_BYTES fits both.
+    static constexpr uint32_t DIRECT_BYTES = 1024;
     static constexpr uint32_t LANES = dsa::SIMD_REPEAT_BYTES / sizeof(float);
     static constexpr uint32_t DIRECT_FLOATS = 1024;
     static constexpr uint32_t RSQRT_BITS = 11;           // Rsqrt table precision (DAE v1.5): Newton-Raphson refines it

@@ -211,12 +211,12 @@ plan byte for byte, so the runtime's 191 KB trap checks the planner's arithmetic
 - **Column band** (`SPLIT_COLUMNS`). Tiles hold `k` band rows at the band's pitch. The band's FP32 Z for all `M` rows stays resident across the barrier, next to the replicated γ/β band and the partial-sum records.
 - **Column tiles** (row-major Split-D fragments, and rows too long for a row tile). X1, X2, a γ/β chunk and the egress buffer are double-buffered, plus FP32 Z: `8s + 4` B per element. The segment's FP32 Z stays resident when it fits, so the normalize sweep reads nothing from main memory a second time.
 
-- **Direct kernel** (Challenge 8). A share of at most 512 B per tensor runs from fixed static buffers: 13,056 B for 16-bit data, 8,448 B for FP32.
+- **Direct kernel** (Challenge 8). A share of at most 1,024 B per tensor runs from fixed static buffers: 20,736 B for 16-bit data, 11,520 B for FP32.
 
 The full-size target plans are below; `./hpc_vector_norm_bench` prints them. Tiles lists the busiest core's tiles in rows
 (head + body + tail). Model cycles are the slowest core's vector cycles (the barrier excluded), and model µs is its finish time on
 the timeline at 1.5 GHz. `tests/test_dae_pipeline.cpp` checks that every plan obeys the rules below: these 15, 2,448 other shapes
-(each also forced into every mode), and every tensor of at most 512 bytes. Every plan:
+(each also forced into every mode), and every tensor of at most 1,024 bytes. Every plan:
 
 - uses at most 40 cores and at most 195,584 B per core;
 - balances the cores to within one unit;
@@ -225,8 +225,8 @@ the timeline at 1.5 GHz. `tests/test_dae_pipeline.cpp` checks that every plan ob
 
 | Profile | Mode | Cores | Unit | Busiest core (elements) | Tiles (rows) | Depth | Out | `rep` | SPM / core | Model cycles | Model µs |
 | :--- | :---: | ---: | :---: | ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
-| P01 1×64 FP16 | **direct** | 1 | 1 row | 64 | 1 | — | 1 | — | 13,056 B | 297 | 1.81 |
-| P02 7×200 FP32 | rows | 7 | 1 row | 200 | 1 | 2 | 1 | 1 | 14,816 B | 144 | 1.87 |
+| P01 1×64 FP16 | **direct** | 1 | 1 row | 64 | 1 | — | 1 | — | 20,736 B | 297 | 1.81 |
+| P02 7×200 FP32 | **direct** | 7 | 1 row | 200 | 1 | — | 1 | — | 11,520 B | 343 | 1.95 |
 | P03 128×256 FP32 | rows | 40 | 1 row | 1,024 (min 768) | 4 × 1 | 4 | 2 | 1 | 21,504 B | 576 | 2.23 |
 | P04 768×192 FP16 | rows | 40 | 1 row | 3,840 (min 3,648) | 4 + 9 + 6 + 1 | 3 | 1 | 9 | 54,144 B | 2,362 | 3.32 |
 | P05 8×32768 FP16 | **band** | 40 | 32 B | 6,560 (min 6,544) | 4 × 2 (× 832 columns) | 4 | 2 | 2 | 83,744 B | 2,917 + 7,500 | 10.83 |
@@ -262,7 +262,7 @@ simulated core (`GetCoreIdx`), and everything goes through `include/dsa_runtime.
   - The worker uses `dsa::Min`/`dsa::Max`, not `<algorithm>`.
   - All 15 profiles run under the v1.4 guards with 0 traps and 0 scalar stalls. Their outputs are bit-identical to the pre-errata kernel on 11 profiles; on the other four, 204 of 133.5 M FP16 values differ by one ulp.
 - **DAE v1.5 (Challenge 8).**
-  - **Direct kernel.** A `TQue` lifecycle step costs the queue sequencer 625 cycles, and a row tile takes ten: X1 and X2 four each, the egress buffer two. A core whose share fits the direct kernel is a single tile with nothing to overlap them with, so it runs on `DirectCore` instead. A share fits when its rows take at most 512 B per tensor and their squares, each row padded to whole 64-lane repeats, fit 1,024 floats (`AdaptiveTiler::DirectFits`, physical properties only). Every tensor of at most 512 B fits. `DirectCore` claims static `LocalMemAllocator<Hardware::Scratchpad>` buffers on the worker's stack: no `TPipe`, no `TQue`, no heap. Its inputs are tagged VECIN and its result VECOUT, so the v1.4 egress guard still covers it.
+  - **Direct kernel.** A `TQue` lifecycle step costs the queue sequencer 625 cycles, and a row tile takes ten: X1 and X2 four each, the egress buffer two. A core whose share fits the direct kernel is a single tile with nothing to overlap them with, so it runs on `DirectCore` instead. A share fits when its rows take at most 1,024 B per tensor and their squares, each row padded to whole 64-lane repeats, fit 1,024 floats (`AdaptiveTiler::DirectFits`, physical properties only). Every tensor of at most 1,024 B fits, and so does P02's 800-byte row per core. `DirectCore` claims static `LocalMemAllocator<Hardware::Scratchpad>` buffers on the worker's stack: no `TPipe`, no `TQue`, no heap. Its inputs are tagged VECIN and its result VECOUT, so the v1.4 egress guard still covers it.
   - **Scoreboard event flags, no flushes.** Each load sets its own `MTE2_V` flag on a literal event ID (`EVENT_ID0`–`EVENT_ID3`: without a `TPipe` there is none to fetch). The vector unit waits on each flag just before that input's first use, so X1 is widened while X2, β and γ are still landing. `V_MTE3` hands the result to the egress channel, and `MTE3_S` ends the kernel. The queue kernel's stores take the same `V_MTE3` event flag, since its egress buffers are never enqueued. No kernel issues `PIPE_ALL`.
   - **64-lane reductions.** Each row's squares go to a row of whole 64-lane repeats whose pad lanes are zeroed first. The zeroing has no operand to wait for, so it runs under the DMA latency. One `ReduceSum` per row then writes that row's lane of the row-sum partition. Destination, source and workpad never overlap. The mean, inverse RMS, Newton-Raphson term and `Brcb` destination each have a partition of their own.
   - **Inverse RMS without the scalar unit.** The kernel runs `Muls` by the coordinator's `invD`, `Adds` ε, then `Rsqrt`. v1.5's `Rsqrt` is a table of about 11 bits, so Newton-Raphson steps follow until the bits exceed the output's significand: one step for 16-bit outputs, two for FP32. `Brcb` then broadcasts each row's value across its repeats for the scaling `Mul`, so the scalar unit never reads the scratchpad.
@@ -270,6 +270,7 @@ simulated core (`GetCoreIdx`), and everything goes through `include/dsa_runtime.
   - **Flat launch.** The coordinator launches the kernel with 64-bit addresses and 32-bit scalars only; the plan travels as the address of its tiling data. A `static_assert` rejects any other argument at compile time, and `ValidateLaunchArgs` checks each argument at run time (Trap #409).
   - **Descriptors and converters.** Padded transfers carry a `DataCopyExtParams` descriptor. Widening and narrowing stay on the runtime's `Cast` with the codec's exact converters, at the same cycle cost. The simulator's `dsa::half` converts all 2,046 FP16 subnormals to garbage, and its `FromFloat` truncates instead of rounding.
   - **P01:** 1.81 µs with no queue step. The queue kernel took 1.73 µs on the timeline plus 6,250 sequencer cycles, 5.90 µs end to end. Its total cycle count goes from 6,433 to 297.
+  - **P02:** 1.95 µs with no queue step, under its 2.06 µs target. The queue kernel took 1.87 µs on the timeline plus 6,250 sequencer cycles, 6.04 µs end to end. Its total cycle count goes from 6,394 to 343.
 - **Column band.**
   - Each core loads its band one whole-block DMA per row and keeps the band's Z resident.
   - After sweep 1 it publishes one record of `M` partials in 32-byte blocks and passes the single `SyncAll`.
@@ -376,6 +377,12 @@ benchmark shows them in its Queue columns. P01's single tile paid ten steps: 1.7
 `ReduceSum`, `Rsqrt`, one Newton-Raphson step and `Brcb` replace `VectorReduceSum` and `VectorInvRms`. The other 14 profiles are
 unchanged. The 15 sum to 1,139.6 µs, and the mean bubble ratio is 24.9%.
 
+**Since the direct kernel takes 1 KB shares**, P02's 800-byte FP32 rows run direct as well: 1.95 µs and no queue step, against
+1.87 µs on the timeline plus 6,250 sequencer cycles, 6.04 µs end to end. Its timeline is 0.08 µs longer for P01's reason: 343
+vector cycles against 144, 135 of them the Newton-Raphson setup and the two steps an FP32 output needs. It now sits on its latency
+floor, vector-bound. The other 14 profiles are unchanged, though P01's static buffers grow from 13,056 to 20,736 B. The 15 sum to
+1,139.7 µs on the timeline, and the mean bubble ratio is 24.8%.
+
 The streaming profiles still take their queue steps, up to 806,250 sequencer cycles on P13's busiest core. The runtime keeps them
 off the timeline, so how much of that a multi-tile core hides is not modeled.
 
@@ -384,8 +391,8 @@ heads the channel's queue while the next loads wait behind it. P15's 191 KB hold
 else the timeline is its program's latency floor, and what remains is DMA latency:
 
 - **A DMA-bound core keeps at least one latency of bubble:** its last store lands 800 ns after the channel's last byte. P09–P11 and P13 are exactly there (0.80 µs).
-- **A vector-bound core keeps at least two:** it computes nothing until its first load lands, and its last result lands 800 ns after it. P01 is there (1.61 µs), P04 is 0.15 µs above (3.32 µs against a 3.23 µs world-record target).
-- **The small profiles have too little work to hide either latency.** P01–P04 move less data per core than streams in two latencies, which is why their ratios stay above 50%. A P02 core's single row must land, be computed and be stored before the channel has anything else to do (mismatch 0.88 µs).
+- **A vector-bound core keeps at least two:** it computes nothing until its first load lands, and its last result lands 800 ns after it. P01 is there (1.61 µs). P02 is 0.12 µs above, the streaming of its 800-byte transfers (1.95 µs against a 2.06 µs world-record target), and P04 is 0.15 µs above (3.32 µs against a 3.23 µs world-record target).
+- **The small profiles have too little work to hide either latency.** P01–P04 move less data per core than streams in two latencies, which is why their ratios stay above 50%. A P02 core's vector unit zeroes its padding lanes, then waits for its single row to land (mismatch 0.88 µs).
 
 The candidates left each gain under 1% on the large profiles:
 
@@ -429,7 +436,7 @@ The runtime also gains:
 
 Size, in lines of code (neither blank nor comment): `adaptive_tiler.hpp` is 1,221. That includes the instruction-level cycle
 model, the three streaming timeline models (628), the direct kernel's rule, layout and timeline (80) and the schedule search (159).
-`kernel_unified.hpp` is 1,002: the host executor is 248 and the DAE executor is 754, 140 of them the direct kernel. The ISA layer
+`kernel_unified.hpp` is 1,004: the host executor is 248 and the DAE executor is 756, 142 of them the direct kernel. The ISA layer
 adds 105. The runtime's timeline model is 208 of `dsa_runtime.hpp`'s 1,145.
 
 ### Measured results (4-core Cascade Lake VM, AVX-512, ~40 GB/s DRAM)

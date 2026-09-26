@@ -285,7 +285,8 @@ int main(int argc, char** argv) {
                   << dsa::DMA_BYTES_PER_CYCLE * dsa::CLOCK_GHZ << " GB/s per core; " << dsa::DMA_LATENCY_CYCLES / dsa::CLOCK_GHZ
                   << " ns latency per transfer, overlapped when pipelined).\n"
                   << "Queue: TQue sequencer time of the busiest core, which the runtime counts but keeps off the timeline. A core with a\n"
-                  << "single tile has nothing to overlap it with (latency = Total + Queue); shares of <= 512 B run direct (Queue 0).\n"
+                  << "single tile has nothing to overlap it with (latency = Total + Queue); shares of <= "
+                  << hpc::AdaptiveTiler::DIRECT_BYTES << " B run direct (Queue 0).\n"
                   << "Fill / Drain: the critical unit (Crit) idle before its first / after its last operation. Mismatch: idle in between.\n"
                   << "Wait: SyncAll time beyond its own " << dsa::SYNC_ALL_CYCLES << " cycles. Model us: the planner's estimate.\n"
                   << "Floor: the same program replayed with unlimited buffers and stores off the load queue (dsa::TimelineSummary::LatencyFloor):\n"
