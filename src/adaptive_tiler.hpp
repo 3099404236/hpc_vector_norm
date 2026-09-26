@@ -140,6 +140,7 @@ struct TilingConfig {
     uint32_t tailRows;       // Row tiles: rows of a core's last tile (0: what is left)
     bool paramsFirst;        // Row tiles: gamma/beta load before tile 0 (else right after it)
     bool earlyLoads;         // Row tiles: X1/X2 of a later tile load as soon as the tile's Z is built (else after its store)
+    bool laneRms;            // Row tiles: each row group's inverse RMS in vector lanes (else VectorInvRms and Muls per row)
     uint32_t tileElems;      // Elements per X1/X2 tile
     uint32_t pitch;          // Row pitch inside a tile: D, or the column band width (SPLIT_COLUMNS)
     uint32_t repRows;        // gamma/beta rows replicated in the scratchpad: one op covers repRows rows
@@ -187,6 +188,9 @@ public:
     static constexpr uint32_t REP_FLOATS = 2048;         // DAE replicated gamma (and beta): <= 8 KB each
     static constexpr uint32_t ROW_GROUP = 128;           // DAE row sums in flight at once: a worker's fixed per-row arrays
     static constexpr double CHUNK_BYTES = 64 * 1024;     // Host serpentine chunk (prefetch-friendly run)
+    // Row tiles with laneRms: a row group's sums, then -mean / 2, its inverse RMS and a Newton-Raphson
+    // term, in three partitions of ROW_GROUP lanes after the fold partition
+    static constexpr uint32_t LANE_BYTES = 3 * ROW_GROUP * sizeof(float);
     // Direct kernel [ARCH CHALLENGE 8]: static buffers sized for a share of at most DIRECT_BYTES per
     // tensor (P02's 800-byte FP32 rows fit); ReduceSum runs on whole 64-lane repeats, so each row's
     // squares are zero-padded to LANES and the padded rows of a share fit DIRECT_FLOATS (at most 16
@@ -338,11 +342,13 @@ public:
     static inline uint32_t ParamBytes(uint64_t rep, uint64_t pitch) { return 2 * Align32(4 * rep * pitch); }
 
     // Row tiles: X1/X2 (`depth` each), `outDepth` egress buffers of a tile, and for 16-bit data
-    // the FP32 Z tile (FP32 builds Z in the egress buffer)
-    static inline DaeLayout RowLayout(uint64_t rows, uint32_t D, uint32_t s, uint64_t rep, uint32_t depth = 2, uint32_t outDepth = 1) {
+    // the FP32 Z tile (FP32 builds Z in the egress buffer); `lanes`: the scratch buffer also holds
+    // the lane partitions of the inverse RMS
+    static inline DaeLayout RowLayout(uint64_t rows, uint32_t D, uint32_t s, uint64_t rep, uint32_t depth = 2, uint32_t outDepth = 1,
+                                      bool lanes = false) {
         const uint64_t e = rows * D;
-        return {Align32(e * s), s < 4 ? Align32(e * 4) : 0u, SCRATCH_BYTES, ParamBytes(rep, D), 0u, 0u, false, depth,
-                Align32(e * s), outDepth, 0u};
+        return {Align32(e * s), s < 4 ? Align32(e * 4) : 0u, SCRATCH_BYTES + (lanes ? LANE_BYTES : 0u), ParamBytes(rep, D), 0u, 0u,
+                false, depth, Align32(e * s), outDepth, 0u};
     }
 
     static inline DaeLayout BandLayout(uint64_t rows, uint32_t pitch, uint32_t M, uint32_t s, uint64_t rep, uint32_t misc, uint32_t rec,
@@ -371,6 +377,13 @@ public:
         uint32_t steps = 0;
         for (uint32_t bits = RSQRT_BITS; bits <= (s == 4 ? 24u : 11u); bits *= 2) ++steps;
         return steps;
+    }
+
+    // Inverse RMS of n rows in vector lanes (DaePipeline::LaneInvRms): Muls by invD, Adds eps,
+    // Rsqrt, and each Newton-Raphson step's four instructions after a setup
+    static inline uint64_t LaneRmsCycles(uint64_t n, uint32_t s) {
+        const uint32_t steps = NewtonSteps(s);
+        return 2 * DaeIsa::Op(n) + DaeIsa::Rsqrt(n) + (steps ? (1 + 4 * steps) * DaeIsa::Op(n) : 0);
     }
 
     // The direct kernel's static buffers (DaePipeline::DirectCore claims exactly these, so their
@@ -411,10 +424,14 @@ public:
     // One tile of k rows at pitch w: Z = X1 + X2 + beta, squares and row sums, inverse RMS,
     // scale, gamma, narrow. `lens` gives band rows (SPLIT_COLUMNS) their own column counts
     // (0: empty row); null means k full rows of w. Row sums go in groups of ROW_GROUP rows, the
-    // squares of a group through the scratch chunk as many rows at a time as fit.
-    static inline uint64_t TileCycles(uint64_t k, uint64_t w, uint32_t s, uint64_t rep, const uint32_t* lens) {
+    // squares of a group through the scratch chunk as many rows at a time as fit. `lanes` (full rows
+    // that fit the scratch chunk): each group's inverse RMS in vector lanes, spread by one Brcb per
+    // row over the scratch chunk and applied by one Mul per chunk of rows, instead of one
+    // VectorInvRms and one Muls per row.
+    static inline uint64_t TileCycles(uint64_t k, uint64_t w, uint32_t s, uint64_t rep, const uint32_t* lens, bool lanes = false) {
         using I = DaeIsa;
         const uint64_t e = k * w;
+        lanes = lanes && !lens && w <= TMP_FLOATS;
         uint64_t c = I::Op(e);  // FP32: X1 + X2; 16-bit: widen X1
         if (s < 4) {
             for (uint64_t o = 0; o < e; o += TMP_FLOATS) c += 2 * I::Op(std::min<uint64_t>(TMP_FLOATS, e - o));
@@ -430,15 +447,21 @@ public:
                     if (!lens) c += I::ReduceRuns(m, w);
                     else for (uint64_t i = r0; i < r0 + m; ++i) c += lens[i] ? I::Reduce(lens[i]) : 0;
                 }
+                if (!lanes) continue;
+                c += LaneRmsCycles(end - g, s);  // The group's inverse RMS, then scale a chunk of rows at a time
+                for (uint64_t r0 = g; r0 < end; r0 += per) {
+                    const uint64_t m = std::min(per, end - r0);
+                    c += m * I::Brcb(I::Repeats(w)) + I::Op(m * w);
+                }
             }
         } else {
             c += k * SquareSumCycles(w);
         }
-        for (uint64_t i = 0; i < k; ++i) {
+        for (uint64_t i = 0; i < k && !lanes; ++i) {
             const uint64_t len = lens ? lens[i] : w;
             c += len ? I::kInvRms + I::Op(len) : 0;  // Inverse RMS and scale
         }
-        if (s < 4) c += I::Op(e);  // Narrow into the X1 slot
+        if (s < 4) c += I::Op(e);  // Narrow into the egress buffer
         return c;
     }
 
@@ -502,6 +525,7 @@ public:
         uint32_t rep, depth;     // Replicated parameter rows; tiles in flight per input queue
         uint32_t outDepth;       // Egress buffers (VECOUT), 1 or 2
         bool paramsFirst, earlyLoads;
+        bool lanes = false;      // Inverse RMS of each row group in vector lanes (rows within the scratch chunk)
     };
     struct RowTimeline { double finish, vector, dma; };
 
@@ -529,8 +553,9 @@ public:
         cfg.repRows = pp.rep;
         cfg.paramsFirst = pp.paramsFirst;
         cfg.earlyLoads = pp.earlyLoads;
+        cfg.laneRms = pp.lanes && D <= TMP_FLOATS;
         cfg.zResident = 0;
-        cfg.layout = RowLayout(pp.B, D, s, pp.rep, pp.depth, pp.outDepth);
+        cfg.layout = RowLayout(pp.B, D, s, pp.rep, pp.depth, pp.outDepth, cfg.laneRms);
         cfg.modelCycles = static_cast<uint64_t>(vector + 0.5);
         cfg.modelNs = finish / hw.clockGHz;
     }
@@ -549,7 +574,7 @@ public:
         const uint32_t head = pp.head && pp.head < R ? pp.head : 0, rest = R - head;
         const uint32_t tail = pp.tail && rest > pp.tail ? pp.tail : 0;
         const uint32_t body = (rest - tail) / B, partial = (rest - tail) % B;
-        auto tileVector = [&](uint32_t k) { return k ? TileCycles(k, D, s, pp.rep, nullptr) : 0; };
+        auto tileVector = [&](uint32_t k) { return k ? TileCycles(k, D, s, pp.rep, nullptr, pp.lanes) : 0; };
         auto tileBytes = [&](uint32_t k) { return static_cast<double>(Align32(uint64_t(k) * D * s)); };
         const uint64_t zBytes = RowLayout(B, D, s, pp.rep, d, od).z, stage = std::max<uint64_t>(TMP_BYTES, zBytes);
         const bool staged = s == 4 || 2ull * Align32(uint64_t(D) * s) <= stage;
@@ -676,7 +701,7 @@ public:
         };
         for (uint32_t row = 0; row < R;) {
             const uint32_t k = tiles.Rows(row), slot = static_cast<uint32_t>(done % d), ys = static_cast<uint32_t>(done % od);
-            const uint64_t e = uint64_t(k) * D, C = TileCycles(k, D, s, pp.rep, nullptr);
+            const uint64_t e = uint64_t(k) * D, C = TileCycles(k, D, s, pp.rep, nullptr, pp.lanes);
             const double parB = betaRows(std::min(pp.rep, k));
             if (s == 4) {  // Z = X1 + X2 straight into the egress buffer, once its last store streamed out
                 const double start = std::max({vec, land1[slot], land2[slot], yFree[ys]});
@@ -1177,14 +1202,13 @@ public:
     }
 
     // -------------------------------------------------------------------------
-    // Direct kernel [ARCH CHALLENGE 8]. Every TQue lifecycle step (AllocTensor, EnQue, DeQue,
-    // FreeTensor) costs the queue sequencer 625 cycles, and a row tile takes ten of them: X1 and
-    // X2 four each, its egress buffer two. That is 6,250 cycles per core, and a share that fits
-    // DIRECT_BYTES is one tile, with no other tile to hide them behind. Such a core runs its rows
-    // in one shot from static scratchpad buffers instead (LocalMemAllocator: no queue, no
-    // sequencer): scoreboard event flags order the pipes, each row's squares are zero-padded to whole
-    // 64-lane repeats for ReduceSum, and the inverse RMS stays in the vector unit (Rsqrt,
-    // Newton-Raphson, Brcb) instead of crossing to the scalar unit.
+    // Direct kernel [ARCH CHALLENGE 8]. A core runs its rows in one shot from static scratchpad
+    // buffers (LocalMemAllocator: no queue, no sequencer): scoreboard event flags order the pipes,
+    // each row's squares are zero-padded to whole 64-lane repeats for ReduceSum, and the inverse RMS
+    // stays in the vector unit (Rsqrt, Newton-Raphson, Brcb) instead of crossing to the scalar unit.
+    // It first served shares that fit DIRECT_BYTES because a TQue lifecycle step costs the queue
+    // sequencer 625 cycles, ten per row tile. Row tiles now use static rings too (no step at all),
+    // so the planner runs the direct kernel only where its timeline finishes first.
     //
     // Timeline of a core with k rows, replaying DirectCore::Run with dsa::CoreTimeline's rules:
     // the loads stream back to back (X1, X2, beta, gamma), the vector unit waits for each input
@@ -1223,9 +1247,7 @@ public:
         }
         compute(0, padded == D ? I::Op(n) : k * I::Op(D));  // Squares
         compute(0, k * I::Reduce(padded));                  // ReduceSum per row
-        compute(0, 2 * I::Op(k) + I::Rsqrt(k));             // mean = sum * invD + eps, Rsqrt
-        const uint32_t steps = NewtonSteps(s);
-        compute(0, steps ? (1 + 4 * steps) * I::Op(k) : 0);  // Newton-Raphson
+        compute(0, LaneRmsCycles(k, s));                    // mean = sum * invD + eps, Rsqrt, Newton-Raphson
         compute(0, k * (I::Brcb(padded / LANES) + I::Op(D)));  // Broadcast and scale, per row
         compute(gamma, (s < 4 ? I::Op(D) : 0) + perRow);    // (Widen gamma), * gamma
         if (s < 4) compute(0, I::Op(n));                    // Narrow into the egress buffer
@@ -1251,7 +1273,7 @@ public:
         cfg.headRows = cfg.tailRows = 0;
         cfg.pitch = D;
         cfg.repRows = 1;
-        cfg.paramsFirst = cfg.earlyLoads = false;
+        cfg.paramsFirst = cfg.earlyLoads = cfg.laneRms = false;
         cfg.zResident = 0;
         cfg.layout = DirectLayout(s);
         cfg.modelCycles = static_cast<uint64_t>(x.vector + 0.5);
@@ -1265,10 +1287,12 @@ private:
     // DirectTimeline for direct shares), which equal the runtime's timeline cycle for cycle, and
     // the one whose slowest core finishes first wins.
     // The 191 KB layout bounds each candidate (the Challenge 2 knapsack):
-    //   direct        a share of at most DIRECT_BYTES per tensor: static buffers, no queues (Challenge 8)
+    //   direct        a share of at most DIRECT_BYTES per tensor: static buffers (Challenge 8)
     //   row tiles     depth x 2 x B D s bytes of X1/X2 tiles, outDepth x B D s of egress buffers,
     //                 4 B D more for the FP32 Z tile at 16 bits, the replicated gamma/beta and the
-    //                 9 KB scratch (the 8 KB chunk and its fold partition)
+    //                 9 KB scratch (the 8 KB chunk and its fold partition; 1.5 KB more of lanes
+    //                 when the inverse RMS runs in lanes)
+    // No candidate takes a queue step: X1, X2, gamma/beta chunks and egress buffers are static rings.
     //   column band   k rows at the band pitch, the band's FP32 Z resident across the barrier
     //   column tiles  (8s + 4) bytes per element (X1, X2, parameter chunks, egress, each twice;
     //                 FP32 Z), plus the resident FP32 Z
@@ -1295,17 +1319,23 @@ private:
     //                 last tile finishes the final store sooner (epilogue drain)
     //   issue order   gamma/beta before tile 0; X1/X2 of a later tile as soon as the tile's Z
     //                 is built (both buffers are free then) rather than after its store
+    //   lanes         each row group's inverse RMS in vector lanes, applied a scratch chunk of
+    //                 rows at a time: fewer instructions per row, a chain of them per group
     // Every busy core holds the same rows up to one unit, so the busiest one is
     // ceil(MaxLoad / D) rows.
     static inline bool PlanRowTiles(TilingConfig& cfg, uint32_t M, uint32_t D, uint32_t s, const HardwareModel& hw, double bound) {
         const uint64_t total = static_cast<uint64_t>(M) * D;
         const uint64_t rows = (MaxLoad(total, cfg.unitElems, cfg.blocks) + D - 1) / D;
-        // A share of at most DIRECT_BYTES per tensor is one tile: its queue lifecycle (6,250 sequencer
-        // cycles) would cost more than the whole direct kernel, so it runs direct [ARCH CHALLENGE 8]
-        if (DirectFits(rows, D, s)) {
-            ApplyDirect(cfg, M, D, s, hw);
-            if (cfg.modelNs * hw.clockGHz >= bound) cfg.modelNs = std::numeric_limits<double>::infinity();
-            return true;
+        // A share that fits the direct kernel's static buffers [ARCH CHALLENGE 8] is a candidate too.
+        // Neither kernel takes a queue step (both use static buffers), so the direct kernel runs only
+        // where it finishes first: its time is the bound the row tiles below have to beat.
+        const double outer = bound;
+        TilingConfig direct{};
+        const bool directFits = DirectFits(rows, D, s);
+        if (directFits) {
+            direct = cfg;
+            ApplyDirect(direct, M, D, s, hw);
+            bound = std::min(bound, direct.modelNs * hw.clockGHz);
         }
         const uint32_t p = static_cast<uint32_t>(RowUnit(D, s, hw) / D);
         const uint32_t repMax = D % 8 == 0 ? std::max<uint32_t>(1, REP_FLOATS / D) : 1;  // 32-byte FP32 rows
@@ -1318,30 +1348,33 @@ private:
         for (uint32_t depth = 2; depth <= 4; ++depth) {
             for (const uint32_t outDepth : {1u, 2u}) {
                 for (const uint32_t repChoice : {repMax, 1u}) {
-                    uint32_t cap = 0;  // The largest body tile the layout admits (binary search over row units)
-                    for (uint32_t lo = 1, hi = most / p; lo <= hi;) {
-                        const uint32_t mid = lo + (hi - lo) / 2, B = mid * p;
-                        if (RowLayout(B, D, s, std::min(repChoice, B), depth, outDepth).Total() <= hw.spmBytes) cap = B, lo = mid + 1;
-                        else hi = mid - 1;
-                    }
-                    if (cap) fits = true;
-                    for (uint32_t B = p; cap && B <= cap; B = B < 48 * p ? B + p : std::max(B + p, std::min(cap, B * 9 / 8 / p * p))) {
-                        const RowPipe pp{B, 0, 0, std::min(repChoice, B), depth, outDepth, false, false};
-                        const double f = RowTilesTimeline(rows, D, s, pp, hw, std::min(bound, top[KEEP - 1].finish) * 1.05).finish;
-                        for (uint32_t i = 0; i < KEEP; ++i) {
-                            if (f < top[i].finish) {
-                                for (uint32_t j = KEEP - 1; j > i; --j) top[j] = top[j - 1];
-                                top[i] = {f, pp};
-                                break;
-                            }
+                    for (const bool lanes : {false, true}) {
+                        if (lanes && D > TMP_FLOATS) break;  // Lanes scale rows through the scratch chunk
+                        uint32_t cap = 0;  // The largest body tile the layout admits (binary search over row units)
+                        for (uint32_t lo = 1, hi = most / p; lo <= hi;) {
+                            const uint32_t mid = lo + (hi - lo) / 2, B = mid * p;
+                            if (RowLayout(B, D, s, std::min(repChoice, B), depth, outDepth, lanes).Total() <= hw.spmBytes) cap = B, lo = mid + 1;
+                            else hi = mid - 1;
                         }
-                        if (B == cap) break;
+                        if (cap) fits = true;
+                        for (uint32_t B = p; cap && B <= cap; B = B < 48 * p ? B + p : std::max(B + p, std::min(cap, B * 9 / 8 / p * p))) {
+                            const RowPipe pp{B, 0, 0, std::min(repChoice, B), depth, outDepth, false, false, lanes};
+                            const double f = RowTilesTimeline(rows, D, s, pp, hw, std::min(bound, top[KEEP - 1].finish) * 1.05).finish;
+                            for (uint32_t i = 0; i < KEEP; ++i) {
+                                if (f < top[i].finish) {
+                                    for (uint32_t j = KEEP - 1; j > i; --j) top[j] = top[j - 1];
+                                    top[i] = {f, pp};
+                                    break;
+                                }
+                            }
+                            if (B == cap) break;
+                        }
                     }
                     if (repMax == 1) break;  // One replication choice only
                 }
             }
         }
-        if (!fits) return false;  // Not even one row unit fits: column tiles
+        if (!fits && !directFits) return false;  // Not even one row unit fits: column tiles
         // Stage 2: head and tail tiles and issue order around the best few
         RowPipe best{};
         double bestTime = bound;
@@ -1368,12 +1401,13 @@ private:
             RowPipe pp = best;
             pp.B = static_cast<uint32_t>(static_cast<int>(best.B) + step * static_cast<int>(p));
             pp.rep = std::min(best.rep, pp.B);
-            if (!pp.B || pp.head >= pp.B || pp.tail >= pp.B || RowLayout(pp.B, D, s, pp.rep, pp.depth, pp.outDepth).Total() > hw.spmBytes) continue;
+            if (!pp.B || pp.head >= pp.B || pp.tail >= pp.B || RowLayout(pp.B, D, s, pp.rep, pp.depth, pp.outDepth, pp.lanes).Total() > hw.spmBytes) continue;
             const double t = RowTilesTimeline(rows, D, s, pp, hw, bestTime).finish;
             if (t < bestTime) bestTime = t, best = pp;
         }
-        if (!best.B) {  // Row tiles fit but cannot beat the bound
-            cfg.modelNs = std::numeric_limits<double>::infinity();
+        if (!best.B) {  // No row tiles beat the bound: the direct kernel, if it beat the caller's
+            if (directFits && direct.modelNs * hw.clockGHz < outer) cfg = direct;
+            else cfg.modelNs = std::numeric_limits<double>::infinity();
             return true;
         }
         ApplyRowPipe(cfg, M, D, s, hw, best);
