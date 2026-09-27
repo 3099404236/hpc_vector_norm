@@ -16,13 +16,16 @@
 
 using hpc::DataType;
 
+// The target benchmark's 15 shapes (docs/TARGET_MEASUREMENTS.md, section 9). The target's times are
+// measured at full size; C14 and C15 execute here with fewer rows (fullM: the benchmark's rows).
 struct TestCase {
     std::string name;
     uint32_t M;
     uint32_t D;
     DataType dtype;
-    double targetUs;
-    uint32_t targetM; // Rows the target refers to (P14/P15 run scaled down; target scaled to match)
+    double refUs;   // Target: the reference implementation
+    double bestUs;  // Target: the best known time
+    uint32_t fullM;
 };
 
 namespace {
@@ -81,41 +84,39 @@ int main(int argc, char** argv) {
     const size_t llc = hpc::AdaptiveTiler::LastLevelCacheBytes();
 
     std::cout << "========================================================================================================\n";
-    std::cout << "  HPC Fused Residual Vector Normalization Benchmark (15 Test Profiles)\n";
-    std::cout << "  Multi-Core SIMD & Cache-Conscious Adaptive Architecture\n";
+    std::cout << "  HPC Fused Residual Vector Normalization Benchmark (the target's 15 cases)\n";
+    std::cout << "  Host: correctness and CI latency only; the target is planned and simulated below\n";
     std::cout << "  Threads: " << P << " | LLC: " << (llc >> 20) << " MB | SIMD: " << SimdName()
-              << (legacyFp32 ? " | --fp32: every profile runs in FP32" : "") << "\n";
+              << (legacyFp32 ? " | --fp32: every case runs in FP32" : "") << "\n";
     std::cout << "========================================================================================================\n\n";
 
     std::vector<TestCase> testCases = {
-        {"P01_1x64",          1,      64, DataType::FP16,    1.47,       1},
-        {"P02_7x200",         7,     200, DataType::FP32,    2.06,       7},
-        {"P03_128x256",     128,     256, DataType::FP32,    2.54,     128},
-        {"P04_768x192",     768,     192, DataType::FP16,    3.23,     768},
-        {"P05_8x32768",       8,   32768, DataType::FP16,    5.39,       8},
-        {"P06_1536x576",   1536,     576, DataType::FP16,    8.58,    1536},
-        {"P07_10240x400", 10240,     400, DataType::FP16,   16.10,   10240},
-        {"P08_10240x512", 10240,     512, DataType::FP16,   17.57,   10240},
-        {"P09_4096x1536",  4096,    1536, DataType::FP32,   41.70,    4096},
-        {"P10_8192x1024",  8192,    1024, DataType::FP16,   47.34,    8192},
-        {"P11_4096x3072",  4096,    3072, DataType::FP32,  132.31,    4096},
-        {"P12_4096x4096",  4096,    4096, DataType::BF16,   48.62,    4096},
-        {"P13_10240x3072",10240,    3072, DataType::FP16,  223.00,   10240},
-        {"P14_2Mx128",    50000,     128, DataType::FP16, 1322.97, 2097152}, // Scaled for quick bench
-        {"P15_115Kx8192",  5000,    8192, DataType::FP16, 6081.74,  115000}  // Scaled for quick bench
+        {"C1_1x64",             1,     64, DataType::FP16,    2.13,    1.70,      1},
+        {"C2_7x197",            7,    197, DataType::FP32,    2.74,    2.21,      7},
+        {"C3_128x256",        128,    256, DataType::FP32,    3.11,    2.47,    128},
+        {"C4_766x193",        766,    193, DataType::FP16,    8.83,    6.66,    766},
+        {"C5_8x32768",          8,  32768, DataType::FP16,   10.87,    5.20,      8},
+        {"C6_1508x577",      1508,    577, DataType::FP16,   13.42,    9.62,   1508},
+        {"C7_3104x397",      3104,    397, DataType::FP16,   17.85,   13.90,   3104},
+        {"C8_10240x512",    10240,    512, DataType::FP16,   34.46,   30.16,  10240},
+        {"C9_4080x1536",     4080,   1536, DataType::FP32,   71.56,   68.20,   4080},
+        {"C10_8192x1024",    8192,   1024, DataType::FP16,   52.62,   46.63,   8192},
+        {"C11_3752x3083",    3752,   3083, DataType::FP32,  161.39,  131.16,   3752},
+        {"C12_3392x4096",    3392,   4096, DataType::BF16,   80.70,   76.35,   3392},
+        {"C13_10432x3079",  10432,   3079, DataType::FP32,  565.99,  392.72,  10432},
+        {"C14_3440640x128", 50000,    128, DataType::FP16, 3943.65, 3750.12, 3440640},  // Executed with 50,000 rows
+        {"C15_117504x8192",  5000,   8192, DataType::FP16, 8903.53, 8321.94,  117504}   // Executed with 5,000 rows
     };
 
     std::cout << std::left << std::setw(18) << "Case Name"
               << std::setw(14) << "Dimensions"
               << std::setw(7)  << "Type"
               << std::setw(14) << "Latency (us)"
-              << std::setw(13) << "Target (us)"
               << std::setw(9)  << "GB/s"
               << std::setw(11) << "Max Err"
               << std::setw(11) << "Accuracy"
-              << std::setw(14) << "Plan"
-              << "Status\n";
-    std::cout << std::string(104, '-') << "\n";
+              << "Plan\n";
+    std::cout << std::string(90, '-') << "\n";
 
     using Clock = std::chrono::steady_clock;
     std::vector<std::string> targetRows, timelineRows;
@@ -177,7 +178,6 @@ int main(int argc, char** argv) {
         std::sort(samples.begin(), samples.end());
         const double latencyUs = samples[samples.size() / 2];
 
-        const double targetUs = tc.targetUs * tc.M / tc.targetM;
         const double gbps = (3.0 * N + 2.0 * tc.D) * eb / (latencyUs * 1e3);
         const hpc::TilingConfig plan = hpc::AdaptiveTiler::Plan(tc.M, tc.D, static_cast<uint32_t>(eb), hpc::HardwareModel::Host(P), llc);
         const std::string planStr = std::to_string(plan.threads) + "T " +
@@ -188,33 +188,35 @@ int main(int argc, char** argv) {
                   << std::setw(14) << dimStr
                   << std::setw(7)  << TypeName(dt)
                   << std::setw(14) << std::fixed << std::setprecision(2) << latencyUs
-                  << std::setw(13) << targetUs
                   << std::setw(9)  << std::setprecision(1) << gbps
                   << std::setw(11) << std::scientific << std::setprecision(2) << maxErr << std::fixed
                   << std::setw(11) << (bad == 0 ? "100% PASS" : "FAIL")
-                  << std::setw(14) << planStr
-                  << (latencyUs <= targetUs ? "TOP 1 🏆" : "OPTIMIZING")
-                  << "\n";
+                  << planStr << "\n";
 
-        // 3. The deployment plan for the same tensor on the 40-core target, optionally executed
-        //    through the DAE hardware simulation (sanitizer on) and checked against the reference
-        const hpc::TilingConfig tp = hpc::AdaptiveTiler::Plan(tc.M, tc.D, static_cast<uint32_t>(eb), hpc::HardwareModel::Target());
-        const uint64_t busiest = hpc::AdaptiveTiler::MaxLoad(N, tp.unitElems, tp.blocks);
-        const uint64_t lightest = tp.units / tp.blocks * tp.unitElems;
-        const bool rows = tp.mode == hpc::TilingMode::ROW_PARALLEL;
-        std::string tile = tp.tileRows ? std::to_string(tp.tileRows) + (tp.tileRows == 1 ? " row" : " rows") : std::to_string(tp.tileElems) + " el";
-        if (tp.mode == hpc::TilingMode::SPLIT_COLUMNS) tile += " x " + std::to_string(tp.pitch);
-        else if (!tp.tileRows && tp.zResident) tile += " +Z";
+        // 3. The deployment plan of the full-size case on the 40-core target, modeled with the
+        //    measured constants; optionally the plan of the executed tensor, run through the DAE
+        //    hardware simulation (sanitizer on) and checked against the host kernel
+        const hpc::TilingConfig fp = hpc::AdaptiveTiler::Plan(tc.fullM, tc.D, static_cast<uint32_t>(eb), hpc::HardwareModel::Target());
+        const hpc::TilingConfig tp = tc.fullM == tc.M ? fp : hpc::AdaptiveTiler::Plan(tc.M, tc.D, static_cast<uint32_t>(eb), hpc::HardwareModel::Target());
+        const uint64_t fullN = static_cast<uint64_t>(tc.fullM) * tc.D;
+        const uint64_t busiest = hpc::AdaptiveTiler::MaxLoad(fullN, fp.unitElems, fp.blocks);
+        const uint64_t lightest = fp.units / fp.blocks * fp.unitElems;
+        const bool rows = fp.mode == hpc::TilingMode::ROW_PARALLEL;
+        std::string tile = fp.tileRows ? std::to_string(fp.tileRows) + (fp.tileRows == 1 ? " row" : " rows") : std::to_string(fp.tileElems) + " el";
+        if (fp.mode == hpc::TilingMode::SPLIT_COLUMNS) tile += " x " + std::to_string(fp.pitch);
+        else if (!fp.tileRows && fp.zResident) tile += " +Z";
         std::ostringstream row;
         row << std::left << std::setw(18) << tc.name
-            << std::setw(7) << (tp.direct ? "direct" : rows ? "rows" : tp.mode == hpc::TilingMode::SPLIT_D ? "split" : "band")
-            << std::setw(6) << tp.blocks
-            << std::setw(8) << (rows ? std::to_string(tp.unitElems / tc.D) + " row" : std::to_string(tp.unitElems * eb) + " B")
+            << std::setw(7) << (fp.direct ? "direct" : rows ? "rows" : fp.mode == hpc::TilingMode::SPLIT_D ? "split" : "band")
+            << std::setw(6) << fp.blocks
+            << std::setw(8) << (rows ? std::to_string(fp.unitElems / tc.D) + " row" : std::to_string(fp.unitElems * eb) + " B")
             << std::setw(22) << (std::to_string(busiest) + " (min " + std::to_string(std::min(busiest, lightest)) + ")")
             << std::setw(16) << tile
-            << std::setw(8) << std::fixed << std::setprecision(1) << tp.layout.Total() / 1024.0
-            << std::setw(10) << tp.modelCycles
-            << std::setw(10) << std::setprecision(2) << tp.modelNs / 1e3;
+            << std::setw(8) << std::fixed << std::setprecision(1) << fp.layout.Total() / 1024.0
+            << std::setw(10) << fp.modelCycles
+            << std::setw(10) << std::setprecision(2) << fp.modelNs / 1e3
+            << std::setw(10) << tc.bestUs
+            << std::setw(8) << std::setprecision(3) << fp.modelNs / 1e3 / tc.bestUs;
         if (simulateTarget) {
             Buffer yt = Allocate(N * eb);
             // Freestanding workers: a sanitizer trap or a DSA_ASSERT aborts the run with its report
@@ -231,16 +233,16 @@ int main(int argc, char** argv) {
             if (verdict == "PASS" && st.spmBytes != tp.layout.Total()) verdict = "SPM != plan";
             row << std::setw(10) << st.vectorCycles << std::setw(9) << st.queueCycles << std::setw(8) << st.scalarStalls
                 << std::setw(9) << std::setprecision(1) << st.dmaBytes / 1e6 << std::setw(6) << st.padTransfers << verdict;
-            if (timeline) {  // The core that finishes last, in us at the timeline clock
+            if (timeline) {  // The core that finishes last, in us after the kernel launch
                 const dsa::TimelineSummary& t = st.timeline;
                 const double us = 1.0 / (dsa::CLOCK_GHZ * 1e3);
                 std::ostringstream tl;
                 tl << std::left << std::setw(18) << tc.name << std::right << std::fixed << std::setprecision(2)
-                   << std::setw(9) << t.finish * us << std::setw(8) << st.queueCycles * us << std::setw(10) << t.finish
+                   << std::setw(9) << dsa::KERNEL_LAUNCH_NS / 1e3 + t.finish * us << std::setw(8) << st.queueCycles * us << std::setw(10) << t.finish
                    << std::setw(9) << t.vectorBusy * us
                    << std::setw(9) << t.dmaBusy * us << std::setw(8) << t.syncCycles * us << std::setw(9) << t.LowerBound() * us
                    << std::setw(8) << t.fill * us << std::setw(8) << t.drain * us << std::setw(10) << t.mismatch * us
-                   << std::setw(8) << (t.barrier - t.syncCycles) * us << std::setw(9) << t.Bubble() * us << std::setw(8)
+                   << std::setw(8) << (t.Bubble() - t.fill - t.drain - t.mismatch) * us << std::setw(9) << t.Bubble() * us << std::setw(8)
                    << std::setprecision(1) << 100.0 * t.Bubble() / t.finish << "%" << std::setw(6) << (t.dmaBound ? "DMA" : "VEC")
                    << std::setw(9) << std::setprecision(2) << t.LatencyFloor() * us << std::setw(8) << (t.finish - t.LatencyFloor()) * us
                    << std::setw(10) << tp.modelNs / 1e3;
@@ -252,24 +254,27 @@ int main(int argc, char** argv) {
         targetRows.push_back(row.str());
     }
 
-    std::cout << std::string(104, '=') << "\n";
-    const size_t width = simulateTarget ? 167 : 125;
-    std::cout << "\nTarget deployment plan (HardwareModel::Target(): 40 cores, 32-byte DMA blocks, 191 KB scratchpad/core;"
-              << " model at " << hpc::HardwareModel::Target().clockGHz << " GHz, busiest core)"
+    std::cout << std::string(90, '=') << "\n";
+    const size_t width = simulateTarget ? 185 : 143;
+    std::cout << "\nTarget deployment plan of each full-size case (HardwareModel::Target(): 40 cores, 32-byte DMA blocks, 191 KB"
+              << " scratchpad/core, measured launch, SyncAll and memory system; busiest core)"
               << (simulateTarget ? ", executed on the DAE simulation" : "") << "\n";
     std::cout << std::left << std::setw(18) << "Case Name" << std::setw(7) << "Mode" << std::setw(6) << "Cores"
               << std::setw(8) << "Unit" << std::setw(22) << "Busiest core (elems)" << std::setw(16) << "Tile"
-              << std::setw(8) << "SPM KB" << std::setw(10) << "Model cyc" << std::setw(10) << "Model us"
+              << std::setw(8) << "SPM KB" << std::setw(10) << "Model cyc" << std::setw(10) << "Model us" << std::setw(10) << "Best us"
+              << std::setw(8) << "Ratio"
               << (simulateTarget ? "Cycles    Queue    Stalls  DMA MB   Pads  Sanitizer / result" : "") << "\n";
     std::cout << std::string(width, '-') << "\n";
     for (const auto& r : targetRows) std::cout << r << "\n";
+    std::cout << "Model us: the planner's estimate from the measured constants (kernel launch, then the slowest core's timeline), not a\n"
+              << "measurement. Best us: the best known time measured on the target (docs/TARGET_MEASUREMENTS.md, section 9). Ratio: model / best.\n";
     if (simulateTarget) {
-        std::cout << "Cycles: the busiest core's vector, scalar-stall, barrier and queue sequencer cycles. Queue: the most TQue\n"
-                  << "sequencer cycles of any core (625 per lifecycle step; no kernel takes one: static buffer rings).\n";
+        std::cout << "Simulated (C14 with 50,000 rows, C15 with 5,000): Cycles: the busiest core's vector, scalar-stall, barrier and queue\n"
+                  << "sequencer cycles. Queue: the most TQue sequencer cycles of any core (625 per lifecycle step; no kernel takes one).\n";
     }
     std::cout << std::string(width, '=') << "\n";
     if (timeline) {
-        std::cout << "\nTarget timeline (core that finishes last; us at " << dsa::CLOCK_GHZ << " GHz; bound = max(compute, stream) + sync;"
+        std::cout << "\nTarget timeline (core that finishes last; us after the kernel launch; bound = max(compute + sync, stream);"
                   << " bubble = total - bound = fill + drain + mismatch + wait)\n";
         std::cout << std::left << std::setw(18) << "Case Name" << std::right << std::setw(9) << "Total" << std::setw(8) << "Queue"
                   << std::setw(10) << "Cycles"
@@ -282,13 +287,14 @@ int main(int argc, char** argv) {
         std::cout << std::string(175, '-') << "\n";
         std::cout << "Mean bubble ratio: " << std::fixed << std::setprecision(1) << 100.0 * bubbleSum / timelineRows.size()
                   << "%   Mean excess over the latency floor: " << std::setprecision(2) << 100.0 * excessSum / timelineRows.size() << "%\n";
-        std::cout << "Compute: vector pipe busy. Stream: system-memory channel busy (loads and stores share "
-                  << dsa::DMA_BYTES_PER_CYCLE * dsa::CLOCK_GHZ << " GB/s per core; " << dsa::DMA_LATENCY_CYCLES / dsa::CLOCK_GHZ
-                  << " ns latency per transfer, overlapped when pipelined).\n"
+        std::cout << "Compute: vector pipe busy. Stream: system-memory channel busy (loads and stores share the core's part of the\n"
+                  << "measured memory system: min(working-set regime, transfer-size ceiling) x min(1, P / 27) GB/s over P cores; "
+                  << dsa::DMA_LATENCY_NS << " ns latency per transfer, overlapped when pipelined).\n"
                   << "Queue: TQue sequencer time of the busiest core, which the runtime counts but keeps off the timeline (0: every\n"
                   << "kernel's buffers are static rings or static buffers, so Total is the latency).\n"
                   << "Fill / Drain: the critical unit (Crit) idle before its first / after its last operation. Mismatch: idle in between.\n"
-                  << "Wait: SyncAll time beyond its own " << dsa::SYNC_ALL_CYCLES << " cycles. Model us: the planner's estimate.\n"
+                  << "Wait: the critical unit's SyncAll idle time beyond what the bound counts (the barrier is " << dsa::SYNC_ALL_CYCLES
+                  << " cycles; loads may stream through it). Model us: the planner's estimate.\n"
                   << "Floor: the same program replayed with unlimited buffers and stores off the load queue (dsa::TimelineSummary::LatencyFloor):\n"
                   << "its DMA latency and dependencies alone; no run finishes sooner. Excess = Total - Floor: the cost of buffer reuse, the shared\n"
                   << "channel's order and SyncAll waits.\n";

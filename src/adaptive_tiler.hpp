@@ -50,18 +50,18 @@ struct DaeIsa {
 // -----------------------------------------------------------------------------
 // Machine description. Every number the planning equations use comes from here:
 //   Target()  the deployment machine: 40 symmetric DAE cores, 32-byte DMA blocks,
-//             191 KB scratchpad per core, ~0 fork/join, and the runtime's timing
-//             (include/dsa_runtime.hpp): cycle costs, clock, DMA bandwidth and latency.
+//             191 KB scratchpad per core, and the runtime's timing (include/dsa_runtime.hpp),
+//             measured on the target (docs/TARGET_MEASUREMENTS.md): kernel launch, SyncAll, the
+//             memory system (dsa::MemorySystem) and the time base of the cycle costs.
 //   Host(P)   the same machine laws run by P CI threads with the host's measured costs.
 // -----------------------------------------------------------------------------
 struct HardwareModel {
     uint32_t cores;         // Symmetric cores
     uint32_t quantumBytes;  // DMA block: split boundaries and block transfers are multiples of it
     size_t   spmBytes;      // Per-core scratchpad budget
-    double   launchNs;      // Engaging all cores (fork/join)
+    double   launchNs;      // Target: the kernel launch, paid by every plan whatever its core count; host: fork/join
     double   syncNs;        // One all-core barrier (SyncAll)
     double   elemNs;        // Host: vector work per element on one core
-    double   byteNs;        // Streaming cost per byte on one core (1 / per-core bandwidth)
     double   latencyNs;     // Target: a DMA transfer's data lands this long after it streamed; 0 on the host
     double   clockGHz;      // Target: converts the runtime's vector cycles (DaeIsa) to ns; 0 on the host
     uint32_t batchElems;    // Host: rows whose pass-1 Z stays L1-resident together
@@ -71,20 +71,21 @@ struct HardwareModel {
         hw.cores = dsa::MAX_HARDWARE_CORES;
         hw.quantumBytes = dsa::DMA_ALIGN_BYTES;
         hw.spmBytes = dsa::SCRATCHPAD_SAFE_WATERLINE;
-        hw.launchNs = 0.0;                                                  // Zero fork/join cost
-        hw.clockGHz = dsa::CLOCK_GHZ;                                       // 1.5, assumed (docs)
-        hw.syncNs = dsa::SYNC_ALL_CYCLES / hw.clockGHz;                     // SyncAll: 7500 cycles
-        hw.elemNs = 0.0;                                                    // Vector work: the DaeIsa cycle model
-        hw.byteNs = 1.0 / (dsa::DMA_BYTES_PER_CYCLE * dsa::CLOCK_GHZ);      // 850 GB/s shared by 40 cores
-        hw.latencyNs = dsa::DMA_LATENCY_CYCLES / dsa::CLOCK_GHZ;            // 800 ns, inferred from the targets (docs)
+        hw.launchNs = dsa::KERNEL_LAUNCH_NS;                     // 1.70 us, measured: any core count
+        hw.clockGHz = dsa::CLOCK_GHZ;                            // The measured repeat time of a vector pass
+        hw.syncNs = dsa::SYNC_ALL_CYCLES / hw.clockGHz;          // 0.924 us, measured
+        hw.elemNs = 0.0;                                         // Vector work: the DaeIsa cycle model
+        hw.latencyNs = dsa::DMA_LATENCY_CYCLES / hw.clockGHz;    // Not measured (dsa_runtime.hpp)
         hw.batchElems = 0;
         return hw;
     }
 
     // The target's timing in vector cycles, as the timeline models use it
-    double BytesPerCycle() const { return 1.0 / (byteNs * clockGHz); }
     double LatencyCycles() const { return latencyNs * clockGHz; }
     double SyncCycles() const { return syncNs * clockGHz; }
+    // The memory system of a launch of `cores` cores over a working set of `workingSet` bytes: what
+    // each of its transfers costs the core's DMA channel
+    static dsa::MemorySystem Memory(uint32_t cores, double workingSet) { return dsa::MemorySystem(cores, workingSet); }
 
     static HardwareModel Host(uint32_t threads) {
         HardwareModel hw = Target();
@@ -92,7 +93,6 @@ struct HardwareModel {
         hw.launchNs = 3500.0;  // Measured on the 4-core CI VM (docs)
         hw.syncNs = 1000.0;
         hw.elemNs = 0.3;       // Cache-resident rows are compute-bound: any dtype
-        hw.byteNs = 0.0;
         hw.latencyNs = 0.0;    // Hardware prefetchers, no explicit DMA
         hw.clockGHz = 0.0;     // No DAE cycle model: SIMD work is elemNs
         hw.batchElems = 2048;
@@ -146,8 +146,9 @@ struct TilingConfig {
     uint32_t repRows;        // gamma/beta rows replicated in the scratchpad: one op covers repRows rows
     uint32_t zResident;      // FP32 Z elements kept resident (column tiles and bands)
     DaeLayout layout;
-    double modelNs;          // Modeled time of the busiest core: what Plan() minimizes
+    double modelNs;          // Modeled time: what Plan() minimizes (target: the launch, then the slowest core's timeline)
     uint64_t modelCycles;    // Target: modeled vector cycles of the busiest core (barriers excluded)
+    double modelFinish;      // Target: the slowest core's modeled timeline finish, in vector cycles (launch excluded)
 };
 
 // A core's share of the flattened M*D stream: units [floor(U t/n), floor(U (t+1)/n)), i.e.
@@ -262,14 +263,15 @@ public:
     //                  block of the mean for any M and any core count, plus one SyncAll
     //   SPLIT_COLUMNS  the same blocks numbered column-major (target only): same balance, and
     //                  each core reads gamma/beta for its column band once instead of per row
-    // Host cost: launch + barrier + elements * elemNs. Target cost: the finish time of the
-    // slowest core on the timeline models of (3), SyncAll included.
+    // Host cost: launch + barrier + elements * elemNs. Target cost: the kernel launch, then the
+    // finish time of the slowest core on the timeline models of (3), SyncAll included.
     // -------------------------------------------------------------------------
     static inline TilingConfig Plan(uint32_t M, uint32_t D, uint32_t elemBytes, const HardwareModel& hw,
                                     size_t llcBytes = 0) {
-        // Inline on the caller is a candidate where engaging the cores costs something (the host);
-        // on the target it cannot beat the same rows on min(cores, units) cores
-        const bool inlineCandidate = hw.launchNs > 0 || hw.cores < 2 || static_cast<uint64_t>(M) * D == 0;
+        // Inline on the caller is a candidate where engaging the cores costs something the caller
+        // does not pay (the host's fork/join); every target plan is a kernel launch, whatever its
+        // core count, and one core cannot beat the same rows on min(cores, units) cores
+        const bool inlineCandidate = (hw.clockGHz <= 0 && hw.launchNs > 0) || hw.cores < 2 || static_cast<uint64_t>(M) * D == 0;
         TilingConfig best{};
         bool have = false;
         if (inlineCandidate) {
@@ -306,13 +308,28 @@ public:
         cfg.streamStores = llcBytes && 3.0 * total * elemBytes > static_cast<double>(llcBytes);
         cfg.serpentine = true;
 
-        if (hw.clockGHz > 0) {
-            PlanTiles(cfg, M, D, elemBytes, hw, boundNs * hw.clockGHz);  // Explicit DMA pipeline: tiles, layout, modeled time
+        if (hw.clockGHz > 0) {  // Explicit DMA pipeline: tiles, layout, modeled time (the bound less the launch)
+            PlanTiles(cfg, M, D, elemBytes, hw, (boundNs - hw.launchNs) * hw.clockGHz);
         } else {
             const double sync = mode == TilingMode::ROW_PARALLEL ? 0.0 : hw.syncNs;
             cfg.modelNs = (cfg.threads > 1 ? hw.launchNs : 0.0) + sync + MaxLoad(total, cfg.unitElems, cfg.blocks) * hw.elemNs;
         }
         return cfg;
+    }
+
+    // Bytes of system memory a launch touches: X1, X2 and Y, gamma and beta
+    static inline double WorkingSet(uint32_t M, uint32_t D, uint32_t s) { return (3.0 * M * D + 2.0 * D) * s; }
+
+    // The memory system a plan's launch streams through: its cores over the tensor's working set
+    static inline dsa::MemorySystem Memory(const TilingConfig& cfg, uint32_t M, uint32_t D, uint32_t s) {
+        return HardwareModel::Memory(cfg.blocks, WorkingSet(M, D, s));
+    }
+
+    // A target plan's modeled time: the kernel launch, then its slowest core's timeline
+    static inline void SetModel(TilingConfig& cfg, double finish, double vector, const HardwareModel& hw) {
+        cfg.modelFinish = finish;
+        cfg.modelNs = hw.launchNs + finish / hw.clockGHz;
+        cfg.modelCycles = static_cast<uint64_t>(vector + 0.5);
     }
 
     // Busiest core's elements when `total` splits into units of `unit` over P cores
@@ -516,12 +533,13 @@ public:
                                     const RowPipe& pp) {
         double finish = 0, vector = 0;
         uint32_t seen[3] = {0, 0, 0}, nSeen = 0;
+        const dsa::MemorySystem mem = Memory(cfg, M, D, s);
         for (uint32_t t = 0; t < cfg.blocks; ++t) {
             const CoreRange r = Range(cfg, M, D, t, cfg.blocks);
             const uint32_t rows = r.rowZ - r.rowA;
             if (!rows || std::find(seen, seen + nSeen, rows) != seen + nSeen) continue;
             if (nSeen < 3) seen[nSeen++] = rows;
-            const RowTimeline x = RowTilesTimeline(rows, D, s, pp, hw);
+            const RowTimeline x = RowTilesTimeline(rows, D, s, pp, hw, mem);
             finish = std::max(finish, x.finish);
             vector = std::max(vector, x.vector);
         }
@@ -537,17 +555,17 @@ public:
         cfg.laneRms = pp.lanes && D <= TMP_FLOATS;
         cfg.zResident = 0;
         cfg.layout = RowLayout(pp.B, D, s, pp.rep, pp.depth, pp.outDepth, cfg.laneRms);
-        cfg.modelCycles = static_cast<uint64_t>(vector + 0.5);
-        cfg.modelNs = finish / hw.clockGHz;
+        SetModel(cfg, finish, vector, hw);
     }
 
     // `bound`: give up (finish = infinity) once the core cannot finish before it. Uniform body
     // tiles make the replay a max-plus linear recurrence: once the whole state has shifted by the
     // same amount over c tiles it keeps doing so, and the replay jumps ahead by whole periods.
+    // `mem`: the launch's memory system, which prices every transfer by its size.
     static inline RowTimeline RowTilesTimeline(uint64_t rows, uint32_t D, uint32_t s, const RowPipe& pp, const HardwareModel& hw,
-                                               double bound = std::numeric_limits<double>::infinity()) {
+                                               const dsa::MemorySystem& mem, double bound = std::numeric_limits<double>::infinity()) {
         using I = DaeIsa;
-        const double bw = hw.BytesPerCycle(), L = hw.LatencyCycles(), lbw = dsa::LOCAL_BYTES_PER_CYCLE;
+        const double L = hw.LatencyCycles(), lbw = dsa::LOCAL_BYTES_PER_CYCLE;
         const uint32_t d = pp.depth, od = pp.outDepth, R = static_cast<uint32_t>(rows), B = pp.B;
         RowTimeline out{std::numeric_limits<double>::infinity(), 0.0, 0.0};
         if (od < 1 || od > 4) return out;
@@ -557,19 +575,21 @@ public:
         const uint32_t body = (rest - tail) / B, partial = (rest - tail) % B;
         auto tileVector = [&](uint32_t k) { return k ? TileCycles(k, D, s, pp.rep, nullptr, pp.lanes) : 0; };
         auto tileBytes = [&](uint32_t k) { return static_cast<double>(Align32(uint64_t(k) * D * s)); };
+        auto tileChannel = [&](uint32_t k) { return mem.Cycles(tileBytes(k)); };  // One tile's transfer on the channel
         const uint64_t zBytes = RowLayout(B, D, s, pp.rep, d, od).z, stage = std::max<uint64_t>(TMP_BYTES, zBytes);
         const bool staged = s == 4 || 2ull * Align32(uint64_t(D) * s) <= stage;
         const uint64_t chunk = TMP_BYTES / s;  // Unstaged 16-bit parameters: scratch-sized pieces
-        double paramBytes = 0;
-        if (staged) paramBytes = 2.0 * Align32(uint64_t(D) * s);
-        else for (uint64_t o = 0; o < D; o += chunk) paramBytes += 2.0 * Align32(std::min<uint64_t>(chunk, D - o) * s);
+        double paramChannel = 0;
+        if (staged) paramChannel = 2.0 * mem.Cycles(Align32(uint64_t(D) * s));
+        else for (uint64_t o = 0; o < D; o += chunk) paramChannel += 2.0 * mem.Cycles(Align32(std::min<uint64_t>(chunk, D - o) * s));
         const uint64_t bodyVector = tileVector(B);
+        const double bodyChannel = tileChannel(B);
         uint64_t vectorLeft = ParamCycles(D, s, stage) + tileVector(head) + body * bodyVector + tileVector(partial) + tileVector(tail);
-        double channelLeft = paramBytes + 3 * (tileBytes(head) + body * tileBytes(B) + tileBytes(partial) + tileBytes(tail));
+        double channelLeft = paramChannel + 3 * (tileChannel(head) + body * bodyChannel + tileChannel(partial) + tileChannel(tail));
         const uint32_t last = tail ? tail : partial ? partial : body ? B : head;
         // Lower bound: the vector unit starts after a load landed and the last store lands after
         // it; the channel streams everything and the last store lands after that
-        if (std::max(L + vectorLeft + tileBytes(last) / bw + L, channelLeft / bw + L) >= bound) return out;
+        if (std::max(L + vectorLeft + tileChannel(last) + L, channelLeft + L) >= bound) return out;
 
         const RowSchedule tiles{0, R, B, pp.head, pp.tail};
         double ch = 0, vec = 0, local = 0, loads = 0, stores = 0;
@@ -587,10 +607,10 @@ public:
         uint32_t next1 = 0, next2 = 0;
         uint64_t n1 = 0, n2 = 0, done = 0;
         auto transfer = [&](double ready, double bytes) {  // Landing time of one transfer
-            const double start = std::max(ch, ready), occupied = bytes / bw;
+            const double start = std::max(ch, ready), occupied = mem.Cycles(bytes);
             ch = start + occupied;
             out.dma += occupied;
-            channelLeft -= bytes;
+            channelLeft -= occupied;
             return ch + L;
         };
         auto load1 = [&] {
@@ -715,10 +735,10 @@ public:
                 if (next2 < R) load2();
             }
             // Y leaves from the egress buffer: the store follows the tile's last instruction
-            const double start = std::max(ch, vec), occupied = tileBytes(k) / bw;
+            const double start = std::max(ch, vec), occupied = tileChannel(k);
             ch = start + occupied;
             out.dma += occupied;
-            channelLeft -= tileBytes(k);
+            channelLeft -= occupied;
             yFree[ys] = ch;
             stores = std::max(stores, ch + L);
             if (!pp.earlyLoads) {
@@ -727,7 +747,7 @@ public:
             }
             row += k;
             ++done;
-            if (std::max(vec + vectorLeft + tileBytes(last) / bw + L, ch + channelLeft / bw + L) >= bound) {
+            if (std::max(vec + vectorLeft + tileChannel(last) + L, ch + channelLeft + L) >= bound) {
                 out.finish = std::numeric_limits<double>::infinity();
                 return out;
             }
@@ -757,9 +777,9 @@ public:
                 row += static_cast<uint32_t>(m) * B, next1 += static_cast<uint32_t>(m) * B, next2 += static_cast<uint32_t>(m) * B;
                 done += m, n1 += m, n2 += m;
                 out.vector += static_cast<double>(m * bodyVector);
-                out.dma += static_cast<double>(m) * 3 * tileBytes(B) / bw;
+                out.dma += static_cast<double>(m) * 3 * bodyChannel;
                 vectorLeft -= m * bodyVector;
-                channelLeft -= static_cast<double>(m) * 3 * tileBytes(B);
+                channelLeft -= static_cast<double>(m) * 3 * bodyChannel;
                 break;
             }
         }
@@ -780,7 +800,8 @@ public:
                                            const BandPipe& bp, const HardwareModel& hw,
                                            double bound = std::numeric_limits<double>::infinity()) {
         using I = DaeIsa;
-        const double bw = hw.BytesPerCycle(), L = hw.LatencyCycles(), lbw = dsa::LOCAL_BYTES_PER_CYCLE;
+        const double L = hw.LatencyCycles(), lbw = dsa::LOCAL_BYTES_PER_CYCLE;
+        const dsa::MemorySystem mem = Memory(cfg, M, D, s);
         const uint32_t q = QuantumElems(s, hw), R = RecordFloats(cfg, M), nb = cfg.blocks;
         const uint32_t per = TMP_FLOATS / pitch;  // Band rows whose squares fit the scratch chunk
         RowTimeline out{0.0, 0.0, 0.0};
@@ -805,7 +826,7 @@ public:
             uint32_t x2Chunks[4] = {};
             double rowLand1[4096], rowLand2[4096];      // Per row: when its X1 / X2 landed
             auto transfer = [&](double ready, double bytes) {
-                const double start = std::max(ch, ready), occupied = bytes / bw;
+                const double start = std::max(ch, ready), occupied = mem.Cycles(bytes);
                 ch = start + occupied;
                 dma += occupied;
                 return ch + L;
@@ -883,8 +904,8 @@ public:
             }
             // The record goes out; SyncAll waits for it to land
             const double start = std::max(ch, vec);
-            ch = start + R * 4.0 / bw;
-            dma += R * 4.0 / bw;
+            ch = start + mem.Cycles(R * 4.0);
+            dma += mem.Cycles(R * 4.0);
             arrive[t] = std::max({vec, local, ch + L});
             phase1[t] = cycles;
             out.dma = std::max(out.dma, dma);
@@ -912,7 +933,7 @@ public:
                 cycles += static_cast<double>(c);
                 return vec;
             };
-            ch += nb * R * 4.0 / bw;
+            ch += mem.Cycles(nb * R * 4.0);  // Every core's record in one transfer
             const double gathered = ch + L;
             compute(gathered, 0);
             for (uint64_t n = nb; n > 1; n -= n / 2) compute(0, I::Op(n / 2 * R));
@@ -933,7 +954,7 @@ public:
                     outRead[buf][i] = 0;
                     if (!lens[row + i]) continue;
                     const double start = std::max(ch, vec);
-                    ch = start + Align32(uint64_t(lens[row + i]) * s) / bw;
+                    ch = start + mem.Cycles(Align32(uint64_t(lens[row + i]) * s));
                     outRead[buf][i] = ch;
                     stores = std::max(stores, ch + L);
                 }
@@ -964,13 +985,14 @@ public:
         };
         uint32_t D, s, q;
         uint64_t tile;
-        double bw, L;
+        dsa::MemorySystem mem;
+        double L;
         double ch = 0, vec = 0, loads = 0, stores = 0, cycles = 0, dma = 0;
         Buffer x1[2], x2[2], g[2], b[2], y[2];  // g, b: the two ways of the gamma/beta ring
         uint32_t yNext = 0;  // Egress buffers rotate across every sweep of the core
 
         double Transfer(double ready, double bytes) {
-            const double start = std::max(ch, ready), occupied = bytes / bw;
+            const double start = std::max(ch, ready), occupied = mem.Cycles(bytes);
             ch = start + occupied;
             dma += occupied;
             return ch + L;
@@ -987,9 +1009,9 @@ public:
             loads = std::max(loads, b.land);
         }
         void Store(Buffer& b, uint64_t n) {
-            const double start = std::max(ch, vec);
-            ch = start + Bytes(n) / bw;
-            dma += Bytes(n) / bw;
+            const double start = std::max(ch, vec), occupied = mem.Cycles(Bytes(n));
+            ch = start + occupied;
+            dma += occupied;
             b.ReadAll(ch);
             stores = std::max(stores, ch + L);
         }
@@ -1087,6 +1109,7 @@ public:
                                              double bound = std::numeric_limits<double>::infinity()) {
         const bool split = cfg.mode == TilingMode::SPLIT_D;
         const uint32_t nb = cfg.blocks, q = QuantumElems(s, hw);
+        const dsa::MemorySystem mem = Memory(cfg, M, D, s);
         RowTimeline out{0.0, 0.0, 0.0};
         if (nb > MAX_THREADS) return out.finish = std::numeric_limits<double>::infinity(), out;
         ColumnSim sims[MAX_THREADS];
@@ -1104,7 +1127,7 @@ public:
                 if (nSeen < 4) seenRows[nSeen++] = rows;
             }
             ColumnSim& c = sims[t];
-            c.D = D, c.s = s, c.q = q, c.tile = cfg.tileElems, c.bw = hw.BytesPerCycle(), c.L = hw.LatencyCycles();
+            c.D = D, c.s = s, c.q = q, c.tile = cfg.tileElems, c.mem = mem, c.L = hw.LatencyCycles();
             uint64_t used = 0;
             for (uint32_t k = 0; k < r.nFrag; ++k) {
                 const CoreRange::Fragment& f = r.frag[k];
@@ -1116,8 +1139,8 @@ public:
             if (split) {  // The core's two records, zeroed and filled, go out
                 c.Compute(0, DaeIsa::Fill(16));
                 const double start = std::max(c.ch, c.vec);
-                c.ch = start + 64.0 / c.bw;
-                c.dma += 64.0 / c.bw;
+                c.ch = start + mem.Cycles(64.0);
+                c.dma += mem.Cycles(64.0);
                 c.stores = std::max(c.stores, c.ch + c.L);
             }
             for (uint32_t row = r.rowA; row < r.rowZ; ++row) {
@@ -1171,8 +1194,7 @@ public:
         cfg.tileElems = bp.k * cfg.pitch;
         cfg.repRows = bp.rep;
         cfg.layout = BandLayout(bp.k, cfg.pitch, M, s, bp.rep, cfg.layout.misc, cfg.layout.rec, bp.depth, bp.outDepth);
-        cfg.modelCycles = static_cast<uint64_t>(t.vector + 0.5);
-        cfg.modelNs = t.finish / hw.clockGHz;
+        SetModel(cfg, t.finish, t.vector, hw);
     }
 
     // -------------------------------------------------------------------------
@@ -1189,9 +1211,9 @@ public:
     // as it lands, and the store follows the last vector instruction. The zero padding has no
     // operand to wait for: it runs under the DMA latency.
     // -------------------------------------------------------------------------
-    static inline RowTimeline DirectTimeline(uint64_t k, uint32_t D, uint32_t s, const HardwareModel& hw) {
+    static inline RowTimeline DirectTimeline(uint64_t k, uint32_t D, uint32_t s, const HardwareModel& hw, const dsa::MemorySystem& mem) {
         using I = DaeIsa;
-        const double bw = hw.BytesPerCycle(), L = hw.LatencyCycles();
+        const double L = hw.LatencyCycles();
         const uint64_t n = k * D, padded = LanePad(D);
         // * gamma and + beta: one strided instruction for all rows when FP32 rows are whole 32-byte
         // blocks (the repeat stride counts blocks), else one per row
@@ -1199,7 +1221,7 @@ public:
         RowTimeline out{0.0, 0.0, 0.0};
         double ch = 0, vec = 0;
         auto load = [&](uint64_t bytes) {
-            const double occupied = Align32(bytes) / bw;
+            const double occupied = mem.Cycles(Align32(bytes));
             ch += occupied;
             out.dma += occupied;
             return ch + L;
@@ -1224,7 +1246,7 @@ public:
         compute(gamma, (s < 4 ? I::Op(D) : 0) + perRow);    // (Widen gamma), * gamma
         compute(beta, (s < 4 ? I::Op(D) : 0) + perRow);     // (Widen beta), + beta
         if (s < 4) compute(0, I::Op(n));                    // Narrow into the egress buffer
-        const double occupied = Align32(n * s) / bw, start = std::max(ch, vec);
+        const double occupied = mem.Cycles(Align32(n * s)), start = std::max(ch, vec);
         ch = start + occupied;
         out.dma += occupied;
         out.finish = ch + L;
@@ -1239,7 +1261,7 @@ public:
             const CoreRange r = Range(cfg, M, D, t, cfg.blocks);
             most = std::max(most, r.rowZ - r.rowA);
         }
-        const RowTimeline x = DirectTimeline(most, D, s, hw);
+        const RowTimeline x = DirectTimeline(most, D, s, hw, Memory(cfg, M, D, s));
         cfg.direct = true;
         cfg.tileRows = most;
         cfg.tileElems = most * D;
@@ -1249,8 +1271,7 @@ public:
         cfg.paramsFirst = cfg.earlyLoads = cfg.laneRms = false;
         cfg.zResident = 0;
         cfg.layout = DirectLayout(s);
-        cfg.modelCycles = static_cast<uint64_t>(x.vector + 0.5);
-        cfg.modelNs = x.finish / hw.clockGHz;
+        SetModel(cfg, x.finish, x.vector, hw);
     }
 
 private:
@@ -1303,12 +1324,13 @@ private:
         // Neither kernel takes a queue step (both use static buffers), so the direct kernel runs only
         // where it finishes first: its time is the bound the row tiles below have to beat.
         const double outer = bound;
+        const dsa::MemorySystem mem = Memory(cfg, M, D, s);
         TilingConfig direct{};
         const bool directFits = DirectFits(rows, D, s);
         if (directFits) {
             direct = cfg;
             ApplyDirect(direct, M, D, s, hw);
-            bound = std::min(bound, direct.modelNs * hw.clockGHz);
+            bound = std::min(bound, direct.modelFinish);
         }
         const uint32_t p = static_cast<uint32_t>(RowUnit(D, s, hw) / D);
         const uint32_t repMax = D % 8 == 0 ? std::max<uint32_t>(1, REP_FLOATS / D) : 1;  // 32-byte FP32 rows
@@ -1332,7 +1354,7 @@ private:
                         if (cap) fits = true;
                         for (uint32_t B = p; cap && B <= cap; B = B < 48 * p ? B + p : std::max(B + p, std::min(cap, B * 9 / 8 / p * p))) {
                             const RowPipe pp{B, 0, 0, std::min(repChoice, B), depth, outDepth, false, false, lanes};
-                            const double f = RowTilesTimeline(rows, D, s, pp, hw, std::min(bound, top[KEEP - 1].finish) * 1.05).finish;
+                            const double f = RowTilesTimeline(rows, D, s, pp, hw, mem, std::min(bound, top[KEEP - 1].finish) * 1.05).finish;
                             for (uint32_t i = 0; i < KEEP; ++i) {
                                 if (f < top[i].finish) {
                                     for (uint32_t j = KEEP - 1; j > i; --j) top[j] = top[j - 1];
@@ -1361,7 +1383,7 @@ private:
                         for (const bool early : {false, true}) {
                             RowPipe pp = f.pp;
                             pp.head = head, pp.tail = tail, pp.paramsFirst = first, pp.earlyLoads = early;
-                            const double t = RowTilesTimeline(rows, D, s, pp, hw, bestTime).finish;
+                            const double t = RowTilesTimeline(rows, D, s, pp, hw, mem, bestTime).finish;
                             if (t < bestTime) bestTime = t, best = pp;
                         }
                     }
@@ -1375,11 +1397,11 @@ private:
             pp.B = static_cast<uint32_t>(static_cast<int>(best.B) + step * static_cast<int>(p));
             pp.rep = std::min(best.rep, pp.B);
             if (!pp.B || pp.head >= pp.B || pp.tail >= pp.B || RowLayout(pp.B, D, s, pp.rep, pp.depth, pp.outDepth, pp.lanes).Total() > hw.spmBytes) continue;
-            const double t = RowTilesTimeline(rows, D, s, pp, hw, bestTime).finish;
+            const double t = RowTilesTimeline(rows, D, s, pp, hw, mem, bestTime).finish;
             if (t < bestTime) bestTime = t, best = pp;
         }
         if (!best.B) {  // No row tiles beat the bound: the direct kernel, if it beat the caller's
-            if (directFits && direct.modelNs * hw.clockGHz < outer) cfg = direct;
+            if (directFits && direct.modelFinish < outer) cfg = direct;
             else cfg.modelNs = std::numeric_limits<double>::infinity();
             return true;
         }
@@ -1475,8 +1497,7 @@ private:
             return;
         }
         cfg = best;
-        cfg.modelCycles = static_cast<uint64_t>(bestTime.vector + 0.5);
-        cfg.modelNs = bestTime.finish / hw.clockGHz;
+        SetModel(cfg, bestTime.finish, bestTime.vector, hw);
     }
 };
 

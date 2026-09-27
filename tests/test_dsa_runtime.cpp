@@ -217,14 +217,14 @@ int main() {
     });
 
     // -------------------------------------------------------------------------
-    // Test 8: Timeline model. One core: a load lands DMA_LATENCY_CYCLES after it streamed at
-    // DMA_BYTES_PER_CYCLE; the add waits for it; the store follows the add and lands one
-    // latency later. Two tiles: the second load streams while the first tile computes.
+    // Test 8: Timeline model. One core: a load lands DMA_LATENCY_CYCLES after it streamed at its
+    // share of the memory system (g_memory); the add waits for it; the store follows the add and
+    // lands one latency later. Two tiles: the second load streams while the first tile computes.
     // -------------------------------------------------------------------------
     std::cout << "\n[Testing Timeline Model]...\n";
     {
         auto near = [](double a, double b) { return std::fabs(a - b) <= 1e-9 * (std::fabs(b) + 1.0); };
-        const double bw = DMA_BYTES_PER_CYCLE, L = DMA_LATENCY_CYCLES;
+        const double bw = 4096 / g_memory.Cycles(4096), L = DMA_LATENCY_CYCLES;  // 4 KB transfers: bytes per cycle
         AlignedVector<float> src(1024, 1.0f), dst(1024, 0.0f);
         {
             TPipe p;
@@ -433,6 +433,34 @@ int main() {
         }
 
         std::cout << "PASS: Extended Microarchitectural Primitives verified successfully\n";
+    }
+
+    // -------------------------------------------------------------------------
+    // Test 11: the measured memory system (docs/TARGET_MEASUREMENTS.md, sections 3-5). Transfer-size
+    // ceilings at their measured points, interpolated between them and flat outside; the working-set
+    // regime combined by min; the aggregate saturating at 27 cores.
+    // -------------------------------------------------------------------------
+    std::cout << "\n[Testing Measured Memory System]...\n";
+    {
+        auto near = [](double a, double b) { return std::fabs(a - b) <= 1e-9 * std::fabs(b); };
+        const double MiB = 1024.0 * 1024.0;
+        const MemorySystem small(40, 1 * MiB), mid(40, 368 * MiB), huge(40, 5632 * MiB), big(40, 2560 * MiB);
+        bool mem = near(small.AggregateGBs(1024), 277) && near(small.AggregateGBs(2048), 475) && near(small.AggregateGBs(4096), 677) &&
+                   near(small.AggregateGBs(6144), 1090) && near(small.AggregateGBs(16384), 1090) && near(small.AggregateGBs(256), 277) &&
+                   near(small.AggregateGBs(3072), 576);
+        // The regime binds only below the size ceiling: 1252 GB/s at 368 MiB does not, 943 at 5.5 GiB does
+        mem &= near(mid.AggregateGBs(16384), 1090) && near(huge.AggregateGBs(16384), 943) && near(big.AggregateGBs(16384), 981);
+        mem &= near(huge.AggregateGBs(1024), 277);  // ... and the smaller of the two wins either way
+        // Cores: 8 cores reach 8/27 of the bandwidth, 27 and more all of it; a transfer occupies its
+        // core's channel for bytes / (aggregate / cores)
+        const MemorySystem p8(8, 1 * MiB), p27(27, 1 * MiB);
+        mem &= near(p8.AggregateGBs(16384), 1090.0 * 8 / 27) && near(p27.AggregateGBs(16384), 1090);
+        mem &= near(small.Cycles(16384), 16384.0 * 40 / 1090 * CLOCK_GHZ) && near(p8.Cycles(16384), 16384.0 * 27 / 1090 * CLOCK_GHZ);
+        // Measured constants: SyncAll 0.924 us, launch 1.70 us, a 4-byte repeat 1.165 ns = 2 cycles
+        mem &= std::fabs(SYNC_ALL_CYCLES / CLOCK_GHZ - 924.0) < 1.0 && near(2.0 / CLOCK_GHZ, 64 * 0.0182) && KERNEL_LAUNCH_NS == 1700.0;
+        ok &= mem;
+        if (mem) std::cout << "PASS: size ceilings, working-set regime, saturation at 27 cores, measured constants\n";
+        else std::cerr << "FAIL: memory system does not follow the measured rules\n";
     }
 
     if (!ok) return 1;

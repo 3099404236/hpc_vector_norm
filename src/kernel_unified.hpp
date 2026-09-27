@@ -458,6 +458,9 @@ public:
         if (need) std::memset(workspace, 0, need);  // A core without units publishes nothing: its records read 0
         const float invD = 1.0f / static_cast<float>(D);  // Converted here: the worker has no scalar int-to-float unit
         const uint32_t cores = Cores(plan);
+        // The launch's memory system: its cores share the bandwidth of its working set (the one the
+        // planner priced every transfer with)
+        dsa::g_memory = AdaptiveTiler::Memory(plan, M, D, sizeof(S));
         CoreResult results[AdaptiveTiler::MAX_THREADS];
         Launch(cores, x1, x2, gamma, bias, y, workspace, &plan, results, M, D, eps, invD);
         for (uint32_t b = 0; b < cores; ++b) {

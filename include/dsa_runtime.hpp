@@ -176,13 +176,13 @@ struct HardwareCycleTracker {
     uint64_t vBlockReduceCycles = 0; // Block reduction: 1 cycle/repeat
     uint64_t vWholeReduceCycles = 0; // Full reduction: 14 cycles/repeat (expensive!)
     uint64_t vRsqrtCycles     = 0;   // Reciprocal square root: 2 cycles/repeat + 14 head
-    uint64_t scalarStallCycles = 0;  // 500 cycles per GetValue() V->S pipeline stall
+    uint64_t scalarStallCycles = 0;  // GET_VALUE_CYCLES per GetValue() V->S read
     uint64_t scalarStallCount = 0;
     uint64_t dmaBytesMoved    = 0;
     uint64_t dmaTransfers     = 0;
     uint64_t padTransfers     = 0;   // DataCopyPad: transfers that were not whole 32-byte blocks
     uint64_t barrierCount     = 0;
-    uint64_t barrierCycles    = 0;   // 7500 cycles per PipeBarrier / SyncAll
+    uint64_t barrierCycles    = 0;   // SYNC_ALL_CYCLES per SyncAll, PIPE_ALL_CYCLES per PipeBarrier<PIPE_ALL>
     uint64_t queueSequencerCycles = 0; // State-machine queue lifecycle penalty (1800-2500 cycles per tile for TQue)
 
     void Reset() {
@@ -214,14 +214,15 @@ inline thread_local HardwareCycleTracker g_cycleTracker;
 // A core has three in-order units:
 //   VECTOR  the vector pipe: every vector instruction, for its cycle cost
 //   DMA     the system-memory channel, shared by loads and stores: a transfer occupies it
-//           for bytes / DMA_BYTES_PER_CYCLE, and its data lands DMA_LATENCY_CYCLES after
-//           that (the latency of back-to-back transfers overlaps)
+//           for g_memory.Cycles(bytes) (MemorySystem, below), and its data lands
+//           DMA_LATENCY_CYCLES after that (the latency of back-to-back transfers overlaps)
 //   LOCAL   scratchpad-to-scratchpad copies (no system-memory traffic)
 // Operations issue in program order. Each starts once its unit is free and its operands
 // are: a 32-byte scratchpad block can be read once its last write has landed, and written
 // once its last read has ended. A core arrives at SyncAll once its vector and local units
 // are idle and its stores have landed (loads may stay in flight); all cores leave
-// SYNC_ALL_CYCLES after the last arrival. Times are vector cycles at CLOCK_GHZ.
+// SYNC_ALL_CYCLES after the last arrival. Times are vector cycles (CLOCK_GHZ per ns). The
+// kernel launch (KERNEL_LAUNCH_NS) precedes every core's timeline.
 //
 // Latency floor: the same program replayed alongside on a relaxed core, where
 //   - an operation waits only for its unit and its operands' data, never for a buffer's
@@ -234,11 +235,83 @@ inline thread_local HardwareCycleTracker g_cycleTracker;
 // Excess = finish - floor is what buffer reuse, the shared channel's order and waiting for
 // other cores at SyncAll cost; the floor itself is DMA latency and dependencies.
 // -----------------------------------------------------------------------------
-static constexpr double   CLOCK_GHZ             = 1.5;     // Assumed vector clock: converts cycles to time
-static constexpr double   DMA_BYTES_PER_CYCLE   = 850.0 / MAX_HARDWARE_CORES / CLOCK_GHZ;  // 21.25 GB/s per core
-static constexpr double   DMA_LATENCY_CYCLES    = 1200.0;  // 800 ns from a transfer's issue to its data landing
+// Timing measured on the target (docs/TARGET_MEASUREMENTS.md, sections in brackets).
+//
+// The time base [2]: a vector instruction costs 2 cycles per 256-byte repeat, and one repeat of a
+// 4-byte pass measures 64 x 0.0182 ns, so a cycle is half of that. CLOCK_GHZ is this conversion,
+// not a measured clock frequency. The fixed per-instruction terms of the cycle costs (+13, +14,
+// +15, +18) are not measured [10]: their magnitude should not decide a plan on its own.
+static constexpr double   VECTOR_REPEAT_NS      = 64 * 0.0182;               // [2] One repeat of a 4-byte pass
+static constexpr double   CLOCK_GHZ             = 2.0 / VECTOR_REPEAT_NS;    // Cycles per ns: 1.717
+static constexpr double   KERNEL_LAUNCH_NS      = 1700.0;  // [1] Launch and per-core init, the same for any core count
+static constexpr double   SYNC_ALL_NS           = 924.0;   // [1] SyncAll
+static constexpr double   PIPE_ALL_NS           = 12.0;    // [1] PipeBarrier<PIPE_ALL>, once the pipes are drained
+static constexpr double   GET_VALUE_NS          = 1.3;     // [1] A scalar read of the scratchpad (upper bound)
+// DMA latency, from a transfer's end on the channel to its data landing: NOT measured. The doc's
+// launch (1.70 us) is the whole of the fastest 1 x 64 run, of which per-core init keeps the vector
+// unit busy 1.34 us [1]: that leaves ~0.36 us for a load, its compute and a store, and the best
+// known C1-C5 times leave no more than ~0.1 us per latency. (The 800 ns used before was inferred
+// from targets of an earlier benchmark; with the measured launch it would put C1 at 3.4 us and C5
+// at 7.9 us or more, against 1.70 and 5.20 us measured.)
+static constexpr double   DMA_LATENCY_NS        = 100.0;
+static constexpr double   DMA_LATENCY_CYCLES    = DMA_LATENCY_NS * CLOCK_GHZ;
 static constexpr double   LOCAL_BYTES_PER_CYCLE = SIMD_REPEAT_BYTES;
-static constexpr uint32_t SYNC_ALL_CYCLES       = 7500;
+static constexpr uint32_t SYNC_ALL_CYCLES       = static_cast<uint32_t>(SYNC_ALL_NS * CLOCK_GHZ + 0.5);
+static constexpr uint32_t PIPE_ALL_CYCLES       = static_cast<uint32_t>(PIPE_ALL_NS * CLOCK_GHZ + 0.5);
+static constexpr uint32_t GET_VALUE_CYCLES      = static_cast<uint32_t>(GET_VALUE_NS * CLOCK_GHZ + 0.5);
+
+// -----------------------------------------------------------------------------
+// System memory [3-5]. The P cores of a launch share an aggregate bandwidth
+//     bw(P, b) = min(regime(working set), ceiling(b)) * min(1, P / DMA_SATURATION_CORES)
+// for transfers of b bytes each: below 27 cores every core's DMA issue rate is the limit (bw / 27
+// per core), from 27 cores on the memory system (bw / P per core) [4]. The transfer-size ceiling [3]
+// and the working-set regime [5] combine by min: an efficiency factor multiplied onto one rate
+// cannot reproduce shapes that stop improving above 4 KB transfers. Both tables are interpolated
+// linearly (the working set on a log scale) and held flat outside the measured range.
+// -----------------------------------------------------------------------------
+struct BandwidthPoint { double bytes, gbs; };
+static constexpr BandwidthPoint DMA_SIZE_CEILING[] = {{1024, 277}, {2048, 475}, {4096, 677}, {6144, 1090}};  // [3]
+static constexpr double MIB = 1024.0 * 1024.0;
+static constexpr BandwidthPoint DMA_REGIME_CEILING[] = {                                                      // [5]
+    {30 * MIB, 1945}, {48 * MIB, 2020}, {80 * MIB, 2046}, {132 * MIB, 1408}, {368 * MIB, 1252}, {2560 * MIB, 981}, {5632 * MIB, 943}};
+static constexpr double DMA_SATURATION_CORES = 27.0;                                                          // [4]
+
+template <size_t N>
+inline double InterpolateBandwidth(const BandwidthPoint (&t)[N], double x, bool logScale) {
+    if (x <= t[0].bytes) return t[0].gbs;
+    for (size_t i = 1; i < N; ++i) {
+        if (x > t[i].bytes) continue;
+        const double a = logScale ? std::log(t[i - 1].bytes) : t[i - 1].bytes, b = logScale ? std::log(t[i].bytes) : t[i].bytes;
+        return t[i - 1].gbs + ((logScale ? std::log(x) : x) - a) / (b - a) * (t[i].gbs - t[i - 1].gbs);
+    }
+    return t[N - 1].gbs;
+}
+
+class MemorySystem {
+public:
+    MemorySystem() : MemorySystem(MAX_HARDWARE_CORES, 0.0) {}
+    // A launch of `cores` cores that touches `workingSet` bytes of system memory
+    MemorySystem(uint32_t cores, double workingSet)
+        : cores_(cores ? cores : 1u), workingSet_(workingSet), regime_(InterpolateBandwidth(DMA_REGIME_CEILING, workingSet, true)) {}
+
+    uint32_t Cores() const { return cores_; }
+    double WorkingSet() const { return workingSet_; }
+    // Aggregate GB/s of the launch's cores, all streaming transfers of `bytes`
+    double AggregateGBs(double bytes) const {
+        const double ceiling = InterpolateBandwidth(DMA_SIZE_CEILING, bytes, false);
+        const double share = cores_ < DMA_SATURATION_CORES ? cores_ / DMA_SATURATION_CORES : 1.0;
+        return (regime_ < ceiling ? regime_ : ceiling) * share;
+    }
+    // Channel cycles of one transfer of `bytes` on one core: its bytes at the core's share
+    double Cycles(double bytes) const { return bytes * cores_ / AggregateGBs(bytes) * CLOCK_GHZ; }
+
+private:
+    uint32_t cores_;
+    double workingSet_, regime_;
+};
+
+// The memory system of the launch in progress: the coordinator sets it before the cores start
+inline MemorySystem g_memory;
 
 // One core's timeline, summarized. The critical unit is the busier of VECTOR and DMA; its
 // idle time splits into fill (before its first operation), drain (after its last), barrier
@@ -255,7 +328,8 @@ struct TimelineSummary {
     double floor = 0;       // Latency floor (CoreTimeline): no run of this program finishes sooner
     bool dmaBound = false;  // The critical unit is DMA
 
-    double LowerBound() const { return (vectorBusy > dmaBusy ? vectorBusy : dmaBusy) + syncCycles; }
+    // The vector unit idles through every SyncAll; loads may keep streaming through one
+    double LowerBound() const { return vectorBusy + syncCycles > dmaBusy ? vectorBusy + syncCycles : dmaBusy; }
     double Bubble() const { return finish - LowerBound(); }
     // The DMA latency and dependencies of the program: no run finishes sooner
     double LatencyFloor() const { return floor; }
@@ -312,7 +386,7 @@ public:
     }
     // System memory -> scratchpad
     void Load(double bytes, Span w) {
-        const double s = Start(DMA, w, {}, {}), occupied = bytes / DMA_BYTES_PER_CYCLE;
+        const double s = Start(DMA, w, {}, {}), occupied = g_memory.Cycles(bytes);
         Occupy(DMA, s, occupied);
         loadBusy += occupied;
         const double landed = s + occupied + DMA_LATENCY_CYCLES;
@@ -325,7 +399,7 @@ public:
     }
     // Scratchpad -> system memory: the source is free once streamed out
     void Store(double bytes, Span r) {
-        const double s = Start(DMA, {}, r, {}), occupied = bytes / DMA_BYTES_PER_CYCLE;
+        const double s = Start(DMA, {}, r, {}), occupied = g_memory.Cycles(bytes);
         Occupy(DMA, s, occupied);
         Read(r, s + occupied);
         if (s + occupied + DMA_LATENCY_CYCLES > storesDone) storesDone = s + occupied + DMA_LATENCY_CYCLES;
@@ -374,9 +448,9 @@ public:
         for (uint32_t u = 0; u < UNITS; ++u) floorFree[u] = floorFree[u] > fa + SYNC_ALL_CYCLES ? floorFree[u] : fa + SYNC_ALL_CYCLES;
         floorStoreFree = floorStoreFree > fa + SYNC_ALL_CYCLES ? floorStoreFree : fa + SYNC_ALL_CYCLES;
     }
-    // Every unit waits until the core is drained (PipeBarrier<PIPE_ALL>)
-    void DrainAll() {
-        const double t = Drained(), f = FloorDrained();
+    // Every unit waits until the core is drained, then `cycles` more (PipeBarrier<PIPE_ALL>)
+    void DrainAll(double cycles = 0) {
+        const double t = Drained() + cycles, f = FloorDrained() + cycles;
         for (uint32_t u = 0; u < UNITS; ++u) unitFree[u] = t, floorFree[u] = f;
         floorStoreFree = f;
     }
@@ -507,13 +581,17 @@ enum PipeType {
     PIPE_S = 4
 };
 
+// PIPE_ALL drains every pipe of the core, DMA included, then costs PIPE_ALL_NS [1]; a barrier on
+// one pipe costs <= 0.19 ns on the target [6.5], nothing on this timeline
 template <PipeType pipe>
 inline void PipeBarrier() {
     #if defined(__GNUC__) || defined(__clang__)
     __asm__ __volatile__("" ::: "memory");
     #endif
-    g_cycleTracker.barrierCycles += 20;
-    if (pipe == PIPE_ALL) g_timeline.DrainAll();
+    if (pipe == PIPE_ALL) {
+        g_cycleTracker.barrierCycles += PIPE_ALL_CYCLES;
+        g_timeline.DrainAll(PIPE_ALL_CYCLES);
+    }
 }
 
 inline void pipe_barrier(PipeType pipe) {
@@ -672,11 +750,12 @@ public:
                               (capacityBytes > offset * sizeof(T)) ? (capacityBytes - offset * sizeof(T)) : 0, pos);
     }
 
-    // Scalar read/write with hardware V->S pipeline stall telemetry
+    // Scalar read [1]: GET_VALUE_NS once the value's producer has finished (the scalar unit issues
+    // in order, so what follows waits too), with V->S telemetry
     inline T GetValue(uint32_t index) const {
-        g_cycleTracker.scalarStallCycles += 500;
+        g_cycleTracker.scalarStallCycles += GET_VALUE_CYCLES;
         g_cycleTracker.scalarStallCount++;
-        g_timeline.Vector(500, {}, SpanOf(data + index, 1));
+        g_timeline.Vector(GET_VALUE_CYCLES, {}, SpanOf(data + index, 1));
         return data[index];
     }
 

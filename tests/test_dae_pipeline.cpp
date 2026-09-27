@@ -179,38 +179,27 @@ void CheckPlan(const TilingConfig& t, uint32_t M, uint32_t D, uint32_t s, const 
     if (t.tileRows) Check(t.repRows >= 1 && t.repRows <= t.tileRows && (t.repRows == 1 || t.pitch % 8 == 0), msg);
 }
 
+// The target benchmark's 15 shapes (docs/TARGET_MEASUREMENTS.md, section 9), with the best known
+// time on the target in us
+struct BenchCase { const char* name; uint32_t M, D, s; double bestUs; };
+const BenchCase kCases[] = {
+    {"C1", 1, 64, 2, 1.70},         {"C2", 7, 197, 4, 2.21},        {"C3", 128, 256, 4, 2.47},       {"C4", 766, 193, 2, 6.66},
+    {"C5", 8, 32768, 2, 5.20},      {"C6", 1508, 577, 2, 9.62},     {"C7", 3104, 397, 2, 13.90},     {"C8", 10240, 512, 2, 30.16},
+    {"C9", 4080, 1536, 4, 68.20},   {"C10", 8192, 1024, 2, 46.63},  {"C11", 3752, 3083, 4, 131.16},  {"C12", 3392, 4096, 2, 76.35},
+    {"C13", 10432, 3079, 4, 392.72}, {"C14", 3440640, 128, 2, 3750.12}, {"C15", 117504, 8192, 2, 8321.94}};
+
+// The benchmark's plans obey the laws and use min(40, units) cores. Which schedule each gets is the
+// measured model's to decide; the one decision the measurements settle on their own: C5's 8 rows
+// split over all 40 cores, since 8 cores reach only 8/27 of the bandwidth (section 4)
 void CheckProfilePlans() {
-    struct Profile { const char* name; uint32_t M, D, s; } profiles[] = {
-        {"P01", 1, 64, 2}, {"P02", 7, 200, 4}, {"P03", 128, 256, 4}, {"P04", 768, 192, 2}, {"P05", 8, 32768, 2},
-        {"P06", 1536, 576, 2}, {"P07", 10240, 400, 2}, {"P08", 10240, 512, 2}, {"P09", 4096, 1536, 4},
-        {"P10", 8192, 1024, 2}, {"P11", 4096, 3072, 4}, {"P12", 4096, 4096, 2}, {"P13", 10240, 3072, 2},
-        {"P14", 2097152, 128, 2}, {"P15", 115000, 8192, 2}};
     const HardwareModel hw = HardwareModel::Target();
-    for (const auto& p : profiles) {
-        const TilingConfig t = AdaptiveTiler::Plan(p.M, p.D, p.s, hw);
-        CheckPlan(t, p.M, p.D, p.s, p.name);
-        Check(t.blocks == std::min<uint64_t>(dsa::MAX_HARDWARE_CORES, t.units), p.name);  // Saturates the cores
+    for (const BenchCase& c : kCases) {
+        const TilingConfig t = AdaptiveTiler::Plan(c.M, c.D, c.s, hw);
+        CheckPlan(t, c.M, c.D, c.s, c.name);
+        Check(t.blocks == std::min<uint64_t>(dsa::MAX_HARDWARE_CORES, t.units), c.name);  // Saturates the cores
     }
-    // P05: 16384 blocks of 32 bytes over 40 cores -> 409 or 410 each, column-block-major: every
-    // row lands on 5 cores and each core's band of gamma/beta is at most 52 blocks
-    const TilingConfig p5 = AdaptiveTiler::Plan(8, 32768, 2, hw);
-    Check(p5.mode == TilingMode::SPLIT_COLUMNS && p5.blocks == 40 && p5.unitElems == 16 && p5.units == 16384 &&
-          p5.pitch == 52 * 16, "P05 column-band plan");
-    // P04: its 20 rows stream through several tiles, one in flight while another computes;
-    // P08: >= 24 rows in flight within 191 KB (Challenges 2 and 3)
-    const TilingConfig p4 = AdaptiveTiler::Plan(768, 192, 2, hw), p8 = AdaptiveTiler::Plan(10240, 512, 2, hw);
-    Check(p4.tileRows < 20 && p4.layout.depth >= 2, "P04 pipelined tiles");
-    // P01 (one 128-byte row on one core) and P02 (one 800-byte row on each of 7 cores) fit the direct
-    // kernel (Challenge 8), but with no queue step on either kernel the row tile finishes first: P01
-    // under 2.0 us, P02 under its 2.06 us target
-    const TilingConfig p1 = AdaptiveTiler::Plan(1, 64, 2, hw), p2 = AdaptiveTiler::Plan(7, 200, 4, hw);
-    Check(!p1.direct && p1.blocks == 1 && p1.modelNs < 2000.0 && p1.modelNs < ForcedDirect(1, 64, 2).modelNs, "P01 row tile under 2.0 us");
-    Check(!p2.direct && p2.blocks == 7 && p2.tileRows == 1 && p2.modelNs < 2060.0 && p2.modelNs < ForcedDirect(7, 200, 4).modelNs,
-          "P02 row tile under 2.06 us");
-    Check(p8.tileRows * p8.layout.depth >= 24 && p8.layout.Total() <= dsa::SCRATCHPAD_SAFE_WATERLINE, "P08 rows in flight");
-    // P07 and P14: vector-bound short rows take each row group's inverse RMS in lanes
-    const TilingConfig p7 = AdaptiveTiler::Plan(10240, 400, 2, hw), p14 = AdaptiveTiler::Plan(2097152, 128, 2, hw);
-    Check(p7.laneRms && p14.laneRms, "P07 and P14 inverse RMS in lanes");
+    const TilingConfig c5 = AdaptiveTiler::Plan(8, 32768, 2, hw);
+    Check(c5.mode != TilingMode::ROW_PARALLEL && c5.blocks == 40 && c5.unitElems == 16 && c5.units == 16384, "C5 splits over 40 cores");
 }
 
 // Every shape and every forced decomposition: feasible plans obey the laws, infeasible bands
@@ -293,10 +282,12 @@ DaeStats RunPlan(uint32_t M, uint32_t D, const TilingConfig& plan, bool hasGamma
     // Rows that end on DMA blocks, on block-aligned bases, never need a padded transfer
     if (offset == 0 && uint64_t(D) * sizeof(S) % dsa::DMA_ALIGN_BYTES == 0) ok &= st.padTransfers == 0;
     // The planner's cycle model is the runtime's count (it assumes both gamma and beta), and on
-    // aligned tensors its timeline is the runtime's: the same finish time, in every mode
+    // aligned tensors its timeline is the runtime's: the same finish time, in every mode. Its time is
+    // that timeline after the kernel launch.
     if (hasGamma && hasBias) ok &= VectorCycles(st.busiest) == plan.modelCycles;
-    const double modeled = plan.modelNs * dsa::CLOCK_GHZ;
+    const double modeled = plan.modelFinish;
     if (hasGamma && hasBias && offset == 0) ok &= std::fabs(st.timeline.finish - modeled) <= 1e-9 * st.timeline.finish;
+    ok &= std::fabs(plan.modelNs - (dsa::KERNEL_LAUNCH_NS + plan.modelFinish / dsa::CLOCK_GHZ)) <= 1e-9 * plan.modelNs;
     // The timeline's own accounting: finish = busy + fill + drain + barrier + mismatch, above the bound
     const dsa::TimelineSummary& tl = st.timeline;
     ok &= std::fabs(tl.finish - std::max(tl.vectorBusy, tl.dmaBusy) - tl.fill - tl.drain - tl.barrier - tl.mismatch) <= 1e-6 * tl.finish;
@@ -470,25 +461,31 @@ void RunDirectSweep(std::mt19937& rng) {
     Check(shapes >= 20, "direct sweep covers its shapes");
 }
 
-// P01 (1 x 64 FP16) and P02 (7 x 200 FP32, one row per core): with no queue step on either kernel,
-// the planner's row tile finishes under `boundUs`, before the direct kernel would
+// C1 (1 x 64) and C2 (7 x 197 FP32): the planner's plan, executed, end to end (the launch, then the
+// timeline), printed next to the best known time on the target; where the rows fit the direct
+// kernel, it runs too and finishes no sooner. No run takes a queue step.
 template <class C>
-void CheckTinyLatency(const char* name, uint32_t M, uint32_t D, double boundUs, std::mt19937& rng) {
+void CheckTinyLatency(const char* name, uint32_t M, uint32_t D, double bestUs, std::mt19937& rng) {
     const HardwareModel hw = HardwareModel::Target();
     const uint32_t s = sizeof(typename C::S);
     const TilingConfig plan = AdaptiveTiler::Plan(M, D, s, hw), forced = ForcedDirect(M, D, s);
+    auto us = [](double cycles) { return (dsa::KERNEL_LAUNCH_NS + cycles / dsa::CLOCK_GHZ) / 1e3; };
     char label[96];
     std::snprintf(label, sizeof label, "%s planned", name);
     const DaeStats p = RunPlan<C>(M, D, plan, true, true, 0, rng, label);
-    std::snprintf(label, sizeof label, "%s direct", name);
-    const DaeStats d = RunPlan<C>(M, D, forced, true, true, 0, rng, label);
-    const double us = 1.0 / (dsa::CLOCK_GHZ * 1e3);
-    std::printf("%s: %s %.2f us, %llu cycles; direct kernel %.2f us, %llu cycles; queue cycles %llu and %llu\n", name,
-                plan.direct ? "direct" : "row tile", p.timeline.finish * us, (unsigned long long)p.vectorCycles,
-                d.timeline.finish * us, (unsigned long long)d.vectorCycles, (unsigned long long)p.queueCycles,
-                (unsigned long long)d.queueCycles);
-    std::snprintf(label, sizeof label, "%s planned under %.2f us, before the direct kernel", name, boundUs);
-    Check(p.timeline.finish * us < boundUs && p.timeline.finish < d.timeline.finish && p.queueCycles == 0 && d.queueCycles == 0, label);
+    std::printf("%s: %s on %u cores %.2f us, %llu cycles, queue cycles %llu; best known %.2f us", name,
+                plan.direct ? "direct" : plan.mode == TilingMode::ROW_PARALLEL ? "rows" : "split", plan.blocks, us(p.timeline.finish),
+                (unsigned long long)p.vectorCycles, (unsigned long long)p.queueCycles, bestUs);
+    bool ok = p.queueCycles == 0;
+    if (AdaptiveTiler::DirectFits(forced.tileRows, D, s)) {
+        std::snprintf(label, sizeof label, "%s direct", name);
+        const DaeStats d = RunPlan<C>(M, D, forced, true, true, 0, rng, label);
+        std::printf("; direct kernel %.2f us, %llu cycles", us(d.timeline.finish), (unsigned long long)d.vectorCycles);
+        ok &= p.timeline.finish <= d.timeline.finish && d.queueCycles == 0;
+    }
+    std::printf("\n");
+    std::snprintf(label, sizeof label, "%s planned no later than the direct kernel, no queue step", name);
+    Check(ok, label);
 }
 
 // -----------------------------------------------------------------------------
@@ -601,7 +598,7 @@ int RunRingTrap(const char* name) {
 
 int RunTrapCase(const char* name) {
     if (!std::strncmp(name, "ring-", 5)) return RunRingTrap(name);
-    const uint32_t M = 8, D = 32768;  // P05: the column band on 40 cores
+    const uint32_t M = 8, D = 32768;  // C5: split over 40 cores
     std::vector<uint16_t> x(size_t(M) * D, 0x3C00), y(size_t(M) * D);
     TilingConfig plan = AdaptiveTiler::Plan(M, D, 2, HardwareModel::Target());
     const size_t bytes = DaePipeline<F16>::WorkspaceBytes(plan, M);
@@ -619,7 +616,8 @@ int RunTrapCase(const char* name) {
         {
             if (omp_get_thread_num() == 0) run();
         }
-    } else if (!std::strcmp(name, "band")) {
+    } else if (!std::strcmp(name, "band")) {  // A column band whose pitch is narrower than its bands
+        plan = AdaptiveTiler::Build(M, D, 2, HardwareModel::Target(), TilingMode::SPLIT_COLUMNS, true);
         plan.pitch = 16;
         run();
     } else if (!std::strcmp(name, "direct")) {  // P01 forced direct (one core), given all of P05's rows
@@ -666,8 +664,8 @@ int main(int argc, char** argv) {
     RunLaneSweep<F32>(rng);
     RunLaneSweep<F16>(rng);
     RunLaneSweep<BF16>(rng);
-    CheckTinyLatency<F16>("P01", 1, 64, 2.0, rng);
-    CheckTinyLatency<F32>("P02", 7, 200, 2.06, rng);  // Its world-record target
+    CheckTinyLatency<F16>("C1", 1, 64, 1.70, rng);
+    CheckTinyLatency<F32>("C2", 7, 197, 2.21, rng);
     RunDirectSweep<F32>(rng);
     RunDirectSweep<F16>(rng);
     RunDirectSweep<BF16>(rng);

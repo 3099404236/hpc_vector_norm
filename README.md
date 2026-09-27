@@ -30,7 +30,7 @@ Systems programmers and kernel developers must distinguish between the **Target 
 | **Execution Concurrency** | 4-core Cascade Lake VM (used for CI & logic verification) | **40 Dedicated Symmetric Cores (`P = 40`)** with zero fork/join cost |
 | **DMA Memory Quantum** | 64-byte x86 Cache Line | **Strict 32-Byte DMA Block (`DMA_ALIGN_BYTES = 32`)** |
 | **Scratchpad Buffer** | 191 KB L1 resident Z scratchpad | **Strict 191 KB (195,584 B) Scratchpad (SPM)** per core |
-| **Memory Bandwidth** | ~40 GB/s DDR4 (host bus limitation) | **Aggregated High-Throughput Memory Subsystem (~850 GB/s)** |
+| **Memory Bandwidth** | ~40 GB/s DDR4 (host bus limitation) | **Measured: min(working-set regime, transfer-size ceiling) × min(1, P/27)**, up to 1,090 GB/s for ≥ 6 KB transfers (`dsa::MemorySystem`) |
 | **SIMD Instruction Width** | AVX-512 (64B) / AVX2 (32B) | **256-Byte Repeat SIMD Vector Pipeline (2048-bit)** |
 
 > **⚠️ CRITICAL ARCHITECTURAL DIRECTIVE (40-CORE TARGET FOCUS)**:
@@ -39,7 +39,7 @@ Systems programmers and kernel developers must distinguish between the **Target 
 > 3. **The Target is a 40-Core Decoupled Access-Execute (DAE) Vector CPU**: Each core features an in-order scalar instruction pipeline, a 2048-bit wide SIMD vector unit (64 FP32 lanes), a dedicated DMA stream transfer engine (32-byte burst alignment), and a 191 KB on-chip software-managed Scratchpad Memory (SPM / Local Store). Hardware scoreboard event flags ensure hazard-free synchronization between DMA and vector units.
 > 4. **Do NOT overfit to the 4-core host!** While `AdaptiveTiler` should gracefully handle `threads <= 4` on the host to avoid OS thrashing during tests, the **mathematical planning model must be explicitly architected for 40 symmetric cores**.
 > 5. **Alignment must honor 32 bytes**: The hardware DMA engine transfers memory in 32-byte blocks. All dimension slicing in Split-D should support 32-byte granularity.
-> 6. **Latency Targets Reflect Peak Theoretical Memory Roofline**: Target latencies (e.g. P13 $223\ \mu\text{s}$) assume an aggregated ~850 GB/s memory subsystem roofline. On the 4-core VM, reaching host memory saturation (~40 GB/s) confirms the algorithm is optimal!
+> 6. **Target numbers are measured on the target** ([`docs/TARGET_MEASUREMENTS.md`](docs/TARGET_MEASUREMENTS.md)): the 15 benchmark cases C1–C15, their reference and best-known times, the kernel launch (1.70 µs), `SyncAll` (0.924 µs), the memory system and the vector throughput. The runtime and the planner use those numbers; host CI timings say nothing about the target.
 > 7. **Coordinator-Worker Decoupling & Zero-Allocation Freestanding Execution**:
 >    - The Master Coordinator (`DaePipeline::Execute`) evaluates `TilingConfig` on the master CPU thread before the OpenMP region and manages a pre-allocated 64-byte aligned reduction workspace buffer (`float* workspace`) passed to worker threads.
 >    - Worker threads must be purely freestanding: **zero dynamic allocation** (`malloc`, `new`, `std::vector`), zero exception unwinding (`throw`), and pass `LocalTensor` by value.
@@ -66,9 +66,12 @@ To bridge the gap between high-level C++ and the target decoupled access-execute
   - Automatically profiles instruction costs: `Add`(2 cycles/repeat), `Mul`(2 cycles/repeat), `BlockReduceSum`(1 cycle/repeat), `WholeReduceSum`(14 cycles/repeat).
   - Run verification via `ctest -R dsa_runtime_sanitizer` or `./build/test_dsa_runtime`.
 - **Timeline model** (`dsa::CoreTimeline`, reported by `./hpc_vector_norm_bench --timeline`). Every primitive also advances a per-core timeline, so the runtime knows *when* each operation runs, not only what it costs:
-  - Three in-order units per core. **VECTOR** runs every vector instruction for its cycle cost. **DMA** is one system-memory channel shared by loads and stores: 850 GB/s over 40 cores is 21.25 GB/s, 14.2 B/cycle at the assumed 1.5 GHz, and each transfer's data lands 800 ns (1200 cycles) after it has streamed, so back-to-back transfers overlap their latency. **LOCAL** runs scratchpad-to-scratchpad copies at 256 B/cycle.
+  - Three in-order units per core. **VECTOR** runs every vector instruction for its cycle cost. **DMA** is one system-memory channel shared by loads and stores. A transfer of `b` bytes occupies it for `b` at the core's share of the measured memory system (`dsa::MemorySystem`, below), and its data lands one DMA latency later, so back-to-back transfers overlap their latency. **LOCAL** runs scratchpad-to-scratchpad copies at 256 B/cycle.
+  - **The memory system** (measured, `docs/TARGET_MEASUREMENTS.md` sections 3–5). The `P` cores of a launch share `min(regime(working set), ceiling(b)) × min(1, P/27)` GB/s. The transfer-size ceiling is 277 / 475 / 677 / 1,090 GB/s at 1 / 2 / 4 / ≥ 6 KB. The working-set regime runs from 1,945–2,046 GB/s (30–80 MiB) down to 943 GB/s (5.5 GiB). The two combine by `min`. Below 27 cores each core's DMA issue rate is the limit (8 cores reach 8/27 of the bandwidth).
+  - **Time base.** A vector instruction costs 2 cycles per 256-byte repeat, and one repeat of a 4-byte pass measures 64 × 0.0182 ns, so a cycle is 0.582 ns (`CLOCK_GHZ` = 1.717 is this conversion, not a measured clock). The fixed per-instruction terms (+13, +14, +15, +18 cycles) are not measured.
+  - **Not measured: the DMA latency.** It is set to 100 ns. The earlier 800 ns (inferred from an older benchmark's targets) contradicts the measured launch: C1 would take at least 3.4 µs and C5 7.9 µs, against 1.70 and 5.20 µs measured. The planner's decompositions are the same for 100 and 800 ns; only the queue depths of C6–C9 change.
   - A 32-byte block scoreboard orders the units: a block is read once its last write has landed, and rewritten once its last read has ended.
-  - `SyncAll`: a core arrives when its vector and local units are idle and its stores have landed; every core leaves 7500 cycles after the last arrival.
+  - `SyncAll`: a core arrives when its vector and local units are idle and its stores have landed (loads may keep streaming); every core leaves 0.924 µs (1,587 cycles) after the last arrival. The kernel launch, 1.70 µs whatever the core count, precedes every core's timeline.
   - `TimelineSummary` splits the finish time of a core into busy time plus **fill**, **drain**, **mismatch** and **barrier** idle time of its critical unit, and computes a **latency floor** (below).
 
 ---
@@ -140,12 +143,12 @@ has no shape special cases and nothing specific to 4 cores:
 | `cores` | 40 (`dsa::MAX_HARDWARE_CORES`) | `min(P, 40)`, `P = omp_get_max_threads()` (1 inside a parallel region) |
 | `quantumBytes` | 32 (`dsa::DMA_ALIGN_BYTES`) | 32 |
 | `spmBytes` | 195,584 (`dsa::SCRATCHPAD_SAFE_WATERLINE`) | 195,584 (per-thread resident-Z scratchpad) |
-| `launchNs` (fork/join) | 0 | 3500, measured |
+| `launchNs` | 1700, measured: the kernel launch, the same for any core count, paid by every plan | 3500 (fork/join), measured |
 | Vector work | The runtime's cycle costs, instruction by instruction (`DaeIsa`) | `elemNs` = 0.3 ns per element, measured |
-| `clockGHz` | 1.5 (`dsa::CLOCK_GHZ`), assumed: converts cycles to time | — |
-| `syncNs` (one all-core barrier) | `SyncAll`'s 7500 cycles / clock = 5000 | 1000, measured |
-| `byteNs` (streaming, per byte and core) | 40 / 850: ~850 GB/s shared by 40 cores (`dsa::DMA_BYTES_PER_CYCLE`) | 0: cache-resident rows are compute-bound |
-| `latencyNs` (a DMA transfer's data lands this long after it streamed) | 800 (`dsa::DMA_LATENCY_CYCLES` = 1200 cycles), inferred from the P01–P03 targets | 0: hardware prefetchers, no explicit DMA |
+| `clockGHz` | 1.717 (`dsa::CLOCK_GHZ`): 2 cycles per repeat, a repeat of a 4-byte pass measured at 1.165 ns | — |
+| `syncNs` (one all-core barrier) | 924, measured (1,587 cycles) | 1000, measured |
+| Streaming | `Memory(cores, workingSet)`: the measured memory system (`dsa::MemorySystem`), each transfer priced by its size | none: cache-resident rows are compute-bound |
+| `latencyNs` (a DMA transfer's data lands this long after it streamed) | 100, not measured (see the timeline model above) | 0: hardware prefetchers, no explicit DMA |
 
 On the target, the planner minimizes the slowest core's finish time on the runtime's own timeline: it replays each candidate
 schedule in the kernel's issue order under the timeline rules above (see **2.** below). It counts vector cycles instruction by
@@ -160,15 +163,16 @@ instruction with the runtime's costs (`DaeIsa`):
 | `Brcb` | 1 per 64-lane repeat + 8 |
 | `Duplicate` | 1 per repeat + 18 |
 | `VectorInvRms` | 16 |
-| `SyncAll` | 7500 |
+| `SyncAll` | 1,587 (0.924 µs, measured) |
+| `PipeBarrier<PIPE_ALL>` | drains every pipe, then 21 (12 ns, measured) |
+| `GetValue` | 2 (≤ 1.3 ns, measured) once its value is written |
 | `TQue` lifecycle step | 625, on the queue sequencer (not a vector cycle, not on the timeline) |
 
 `tests/test_dae_pipeline.cpp` requires the planner's cycle count to equal the runtime's on every plan it executes, and its
-modeled finish time to equal the runtime timeline's (γ and β present, aligned tensors), in every mode. Both hold.
-The clock sets how many vector cycles a DMA byte and the DMA latency are worth. For each of the 15 profiles, every clock from 1.0 to
-4.0 GHz picks the same decomposition; the tile schedule is re-tuned for each clock.
-[`docs/ARCHITECTURE_CHALLENGES.md`](docs/ARCHITECTURE_CHALLENGES.md#-cost-model--methodology) derives every constant. The clock and
-`latencyNs` should be recalibrated on physical target hardware; the models stay the same.
+modeled finish time to equal the runtime timeline's (γ and β present, aligned tensors), in every mode. Both hold. A plan's
+modeled time is the kernel launch plus that timeline.
+The per-repeat cost is measured; the fixed per-instruction terms and the DMA latency are not, so no decision should rest on
+their magnitude alone.
 
 **1. Decomposition, balanced to one DMA block (Challenge 1).** The planner treats the `M·D` elements as one flattened stream and
 cuts it into units. Core `t` of `n` gets units `[⌊U·t/n⌋, ⌊U·(t+1)/n⌋)`, so any two cores differ by at most one unit for every
