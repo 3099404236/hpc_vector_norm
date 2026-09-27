@@ -12,9 +12,14 @@ An ultra-high-throughput, cache-conscious, vectorized C++ numerical kernel libra
 
 In modern numerical scientific computing, digital signal processing, multidimensional physical simulations, and dense linear algebra, normalizing multi-channel vectors while accumulating residual streams is a fundamental computational primitive:
 
-$$Z_{i} = X_{1,i} + X_{2,i} + \text{bias}$$
+$$Z_{i} = X_{1,i} + X_{2,i}$$
 $$\sigma_i = \sqrt{\frac{1}{D} \sum_{j=0}^{D-1} Z_{i,j}^2 + \epsilon}$$
-$$Y_{i,j} = \frac{Z_{i,j}}{\sigma_i} \cdot \gamma_j$$
+$$Y_{i,j} = \frac{Z_{i,j}}{\sigma_i} \cdot \gamma_j + \text{bias}_j$$
+
+Bias is not part of Z: it never enters the sum of squares, and it is added after the normalization and γ. This is the
+target's convention ([`docs/TARGET_MEASUREMENTS.md`](docs/TARGET_MEASUREMENTS.md), section 0). Earlier revisions folded bias
+into Z, and their golden references did the same, so the tests agreed with the kernels while both computed a different
+function (deviation 3.4 on the target's scoring). The references in `tests/` and `src/benchmark.cpp` now follow the target.
 
 ### 🏛️ Target Hardware Laws vs Host CI Environment (Crucial Directive)
 
@@ -209,7 +214,7 @@ plan byte for byte, so the runtime's 191 KB trap checks the planner's arithmetic
   - So `B*(D) = ⌊(195,584 − 9,216 − 2·Align32(4·rep·D)) / (b·D)⌋` rows: 25 rows at `D = 512` without replication, 23 with `rep = 4` (double-buffered, one egress buffer).
   - The search tries both options. Replication wins wherever spare scratchpad pays for it; P14 spends 10 of its 121 possible rows on it to cut 22% of its vector cycles.
 - **Column band** (`SPLIT_COLUMNS`). Tiles hold `k` band rows at the band's pitch. The band's FP32 Z for all `M` rows stays resident across the barrier, next to the replicated γ/β band and the partial-sum records.
-- **Column tiles** (row-major Split-D fragments, and rows too long for a row tile). X1, X2, a γ/β chunk and the egress buffer are double-buffered, plus FP32 Z: `8s + 4` B per element. The segment's FP32 Z stays resident when it fits, so the normalize sweep reads nothing from main memory a second time.
+- **Column tiles** (row-major Split-D fragments, and rows too long for a row tile). X1, X2, a γ/β chunk pair and the egress buffer are double-buffered, plus FP32 Z: `10s + 4` B per element. Sweep 1 builds Z = X1 + X2 and its squares; the row's Z is spent before bias could be applied, so sweep 2 streams γ and β together, as the two ways of one ring slot. The segment's FP32 Z stays resident when it fits, so the normalize sweep reads nothing from main memory a second time but γ/β.
 
 - **Direct kernel** (Challenge 8). A share of at most 1,024 B per tensor runs from fixed static buffers: 20,736 B for 16-bit data, 11,520 B for FP32.
 
@@ -267,7 +272,7 @@ simulated core (`GetCoreIdx`), and everything goes through `include/dsa_runtime.
   - **Scoreboard event flags, no flushes.** Each load sets its own `MTE2_V` flag on a literal event ID (`EVENT_ID0`–`EVENT_ID3`: without a `TPipe` there is none to fetch). The vector unit waits on each flag just before that input's first use, so X1 is widened while X2, β and γ are still landing. `V_MTE3` hands the result to the egress channel, and `MTE3_S` ends the kernel. The queue kernel's stores take the same `V_MTE3` event flag, since its egress buffers are never enqueued. No kernel issues `PIPE_ALL`.
   - **64-lane reductions.** Each row's squares go to a row of whole 64-lane repeats whose pad lanes are zeroed first. The zeroing has no operand to wait for, so it runs under the DMA latency. One `ReduceSum` per row then writes that row's lane of the row-sum partition. Destination, source and workpad never overlap. The mean, inverse RMS, Newton-Raphson term and `Brcb` destination each have a partition of their own.
   - **Inverse RMS without the scalar unit.** The kernel runs `Muls` by the coordinator's `invD`, `Adds` ε, then `Rsqrt`. v1.5's `Rsqrt` is a table of about 11 bits, so Newton-Raphson steps follow until the bits exceed the output's significand: one step for 16-bit outputs, two for FP32. `Brcb` then broadcasts each row's value across its repeats for the scaling `Mul`, so the scalar unit never reads the scratchpad.
-  - **Strided rows.** β and γ apply to every row in one strided `Add`/`Mul` when FP32 rows are whole 32-byte blocks, because the repeat stride counts blocks. Otherwise they take one instruction per row.
+  - **Strided rows.** γ and then β apply to every row in one strided `Mul`/`Add` when FP32 rows are whole 32-byte blocks, because the repeat stride counts blocks. Otherwise they take one instruction per row.
   - **Flat launch.** The coordinator launches the kernel with 64-bit addresses and 32-bit scalars only; the plan travels as the address of its tiling data. A `static_assert` rejects any other argument at compile time, and `ValidateLaunchArgs` checks each argument at run time (Trap #409).
   - **Descriptors and converters.** Padded transfers carry a `DataCopyExtParams` descriptor. Widening and narrowing stay on the runtime's `Cast` with the codec's exact converters, at the same cycle cost. The simulator's `dsa::half` converts all 2,046 FP16 subnormals to garbage, and its `FromFloat` truncates instead of rounding.
   - **P01 and P02:** their row tiles take 1.73 and 1.87 µs with no queue step, 183 and 144 cycles. With the queue they took 6,250 sequencer cycles on top (5.90 and 6.04 µs end to end); the direct kernel takes 1.81 and 1.95 µs.
@@ -280,7 +285,7 @@ simulated core (`GetCoreIdx`), and everything goes through `include/dsa_runtime.
 - **Row-major Split-D.**
   - Each core publishes `{Σ₀, 0 ×7}{Σ₁, 0 ×7}` in two 32-byte records.
   - The owners of a row fetch the contiguous record range that holds the row's partials, with zeros in between, and reduce it with one `VectorReduceSum`.
-  - The first γ chunk of sweep 2 is already in flight during the `SyncAll`.
+  - The first γ/β chunk pair of sweep 2 is already in flight during the `SyncAll`.
 - **Coordinator and freestanding workers (Challenge 6).**
   - `DaePipeline::Execute` runs on the calling thread. It checks the plan, owns the reduction workspace (caller-provided, or its own buffer reused across calls) and launches every core with a flat frame of addresses and scalars (Challenge 8).
   - Each core runs `Core::Execute` with no heap allocation and no exceptions. Row sums and band columns sit in fixed 128-row arrays on the worker's stack; longer tiles run in groups of 128 rows, and the cycle model counts the groups.
@@ -400,7 +405,6 @@ else the timeline is its program's latency floor, and what remains is DMA latenc
 The candidates left each gain under 1% on the large profiles:
 
 - a geometric ramp of head tiles (1, 2, 4, … rows) for the vector-bound P07 and P14, whose fill is still 1.44 and 1.00 µs;
-- β before γ, with γ widened just before its first use, worth up to 0.8 µs of P15's startup;
 - a store queue of its own on hardware that has one.
 
 **Host executor** (`KernelUnifiedPipeline<Codec>`, CI). It uses the same partition code (`AdaptiveTiler::Range` and
@@ -416,8 +420,8 @@ previous revision's (compared on 14,664 shapes):
 | Stores | Non-temporal Y stores + 512 B software prefetch once `X1+X2+Y > LLC` | Saves the read-for-ownership stream; keeps more line fills in flight |
 | Traversal | Serpentine at 64 KB chunk granularity (chunk order flips every call) | The chunks touched last are consumed first while still cached |
 
-The host kernel runs two passes per row. Pass 1 computes `Z = X1 + X2 + bias` with 4 independent FMA accumulators, in FP32 within
-4096-element blocks and FP64 across blocks. Pass 2 computes `Y = Z · invRms · gamma`.
+The host kernel runs two passes per row. Pass 1 computes `Z = X1 + X2` and its sum of squares with 4 independent FMA
+accumulators, in FP32 within 4096-element blocks and FP64 across blocks. Pass 2 computes `Y = Z · invRms · gamma + bias`.
 
 The ISA layer (`src/simd.hpp`) provides AVX-512 (masked tails), AVX2 + FMA + F16C, and a portable scalar path. FP16/BF16 are widened
 on load and rounded to nearest-even on store. For 16-bit tensors, bias/gamma are widened to FP32 once per call when a thread owns at

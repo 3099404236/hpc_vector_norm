@@ -141,7 +141,8 @@ int main(int argc, char** argv) {
             hpc::FusedResidualNormalize(x1.get(), x2.get(), gamma.get(), bias.get(), y.get(), tc.M, tc.D, dt, 1e-6f);
         };
 
-        // 1. Correctness check against an FP64 reference computed from the quantized inputs
+        // 1. Correctness check against an FP64 reference computed from the quantized inputs, in
+        //    the target's convention: Z = X1 + X2, Y = Z / sigma * gamma + bias
         run();
         const double relTol = dt == DataType::FP32 ? 1e-5 : dt == DataType::FP16 ? 1.0 / 1024 : 1.0 / 128;
         double maxErr = 0.0;
@@ -149,12 +150,12 @@ int main(int argc, char** argv) {
         #pragma omp parallel for schedule(static) reduction(max : maxErr) reduction(+ : bad)
         for (int64_t i = 0; i < static_cast<int64_t>(tc.M); ++i) {
             const size_t row = static_cast<size_t>(i) * tc.D;
-            auto z = [&](uint32_t j) { return Get(dt, x1.get(), row + j) + Get(dt, x2.get(), row + j) + Get(dt, bias.get(), j); };
+            auto z = [&](uint32_t j) { return Get(dt, x1.get(), row + j) + Get(dt, x2.get(), row + j); };
             double sumSq = 0.0;
             for (uint32_t j = 0; j < tc.D; ++j) sumSq += z(j) * z(j);
             const double invRms = 1.0 / std::sqrt(sumSq / tc.D + 1e-6);
             for (uint32_t j = 0; j < tc.D; ++j) {
-                const double ref = z(j) * invRms * Get(dt, gamma.get(), j);
+                const double ref = z(j) * invRms * Get(dt, gamma.get(), j) + Get(dt, bias.get(), j);
                 const double err = std::fabs(Get(dt, y.get(), row + j) - ref);
                 maxErr = std::max(maxErr, err);
                 bad += err > 1e-5 + relTol * std::fabs(ref);

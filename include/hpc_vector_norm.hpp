@@ -15,10 +15,11 @@ enum class DataType {
 /**
  * FusedResidualNormalize
  *
- * Mathematical definition:
- *   Z[i, j] = X1[i, j] + X2[i, j] + bias[j]
+ * Mathematical definition (the target's convention: bias is not part of Z, so it never enters
+ * the sum of squares; it is added after the normalization and gamma):
+ *   Z[i, j] = X1[i, j] + X2[i, j]
  *   sigma[i] = sqrt( (1 / D) * sum_{j=0}^{D-1} (Z[i, j]^2) + eps )
- *   Y[i, j] = (Z[i, j] / sigma[i]) * gamma[j]
+ *   Y[i, j] = (Z[i, j] / sigma[i]) * gamma[j] + bias[j]
  *
  * x1, x2, y are dense row-major [rows, cols]; gamma and bias are [cols] and may be null
  * (gamma = 1, bias = 0). All tensors use `dtype`; arithmetic is FP32 with FP64 row sums.

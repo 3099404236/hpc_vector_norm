@@ -266,16 +266,18 @@ DaeStats RunPlan(uint32_t M, uint32_t D, const TilingConfig& plan, bool hasGamma
     g_running[0] = '\0';
     bool ok = true;
     double maxErr = 0.0;
+    // FP64 reference in the target's convention: Z = X1 + X2 (bias never enters the sum of
+    // squares), Y = Z / sigma * gamma + bias
     for (uint32_t i = 0; i < M; ++i) {
         double ss = 0.0;
         for (uint32_t j = 0; j < D; ++j) {
-            const double z = Dec<C>(x1.p[size_t(i) * D + j]) + Dec<C>(x2.p[size_t(i) * D + j]) + (hasBias ? Dec<C>(b.p[j]) : 0.0);
+            const double z = Dec<C>(x1.p[size_t(i) * D + j]) + Dec<C>(x2.p[size_t(i) * D + j]);
             ss += z * z;
         }
         const double inv = 1.0 / std::sqrt(ss / D + 1e-6);
         for (uint32_t j = 0; j < D; ++j) {
-            const double z = Dec<C>(x1.p[size_t(i) * D + j]) + Dec<C>(x2.p[size_t(i) * D + j]) + (hasBias ? Dec<C>(b.p[j]) : 0.0);
-            const double ref = z * inv * (hasGamma ? Dec<C>(g.p[j]) : 1.0);
+            const double z = Dec<C>(x1.p[size_t(i) * D + j]) + Dec<C>(x2.p[size_t(i) * D + j]);
+            const double ref = z * inv * (hasGamma ? Dec<C>(g.p[j]) : 1.0) + (hasBias ? Dec<C>(b.p[j]) : 0.0);
             const double err = std::fabs(Dec<C>(y.p[size_t(i) * D + j]) - ref);
             maxErr = std::max(maxErr, err);
             ok &= err <= 1e-4 + RelTol<C>() * std::fabs(ref);
@@ -498,8 +500,8 @@ void CheckTinyLatency(const char* name, uint32_t M, uint32_t D, double boundUs, 
 uint64_t SimulatorBuffers(const TilingConfig& plan) {  // TPipe::InitBuffer blocks of one core
     if (plan.direct) return 0;  // Static buffers on the worker's stack (LocalMemAllocator): no heap at all
     const DaeLayout& L = plan.layout;
-    // One TBuf per ring way (X1, X2, gamma/beta chunks, Y), then the scratch buffer and the others
-    return 2 + (L.paramQueue ? 1 : 0) + 1 + 1 + (L.z ? 1 : 0) + (L.params ? 1 : 0) + (L.resident ? 1 : 0) + (L.misc ? 1 : 0) +
+    // One TBuf per ring way (X1, X2, the gamma and beta chunks, Y), then the scratch buffer and the others
+    return 2 + (L.paramQueue ? 2 : 0) + 1 + 1 + (L.z ? 1 : 0) + (L.params ? 1 : 0) + (L.resident ? 1 : 0) + (L.misc ? 1 : 0) +
            (L.rec ? 1 : 0);
 }
 
@@ -561,7 +563,6 @@ const TrapCase kTraps[] = {
     {"ring-overflow", "[BufferRing]: every slot is in use"},
     {"ring-enqueue", "[BufferRing]: EnQue of a slot that is not allocated"},
     {"ring-empty", "[BufferRing]: DeQue on an empty ring"},
-    {"ring-landed", "[BufferRing]: a slot used on the spot must be allocated"},
     {"ring-double-free", "[BufferRing]: freeing a slot that is free or still in flight"},
     {"ring-free-in-flight", "[BufferRing]: freeing a slot that is free or still in flight"},
     {"ring-unconsumed", "[BufferRing]: a slot was enqueued and never taken"},
@@ -580,8 +581,6 @@ int RunRingTrap(const char* name) {
         ring.EnQue(s);
     } else if (!std::strcmp(name, "ring-empty")) {
         ring.DeQue();
-    } else if (!std::strcmp(name, "ring-landed")) {
-        ring.Landed(0);
     } else if (!std::strcmp(name, "ring-double-free")) {
         const uint32_t s = ring.Alloc();
         ring.Free(s);

@@ -76,19 +76,20 @@ void RunShape(uint32_t M, uint32_t D, std::mt19937& rng) {
 
     for (int pc = 0; pc < (big ? 1 : 4); ++pc) {
         const bool hasGamma = !(pc & 1), hasBias = !(pc & 2);
-        // FP64 reference on the decoded (already quantized) inputs
+        // FP64 reference on the decoded (already quantized) inputs, in the target's convention:
+        // Z = X1 + X2 (bias never enters the sum of squares), Y = Z / sigma * gamma + bias
         std::vector<double> ref(N);
         for (uint32_t i = 0; i < M; ++i) {
             double ss = 0.0;
             for (uint32_t j = 0; j < D; ++j) {
                 const size_t k = static_cast<size_t>(i) * D + j;
-                ref[k] = double(Dec<C>(x1[k])) + Dec<C>(x2[k]) + (hasBias ? Dec<C>(bias[j]) : 0.0);
+                ref[k] = double(Dec<C>(x1[k])) + Dec<C>(x2[k]);
                 ss += ref[k] * ref[k];
             }
             const double inv = 1.0 / std::sqrt(ss / D + 1e-6);
             for (uint32_t j = 0; j < D; ++j) {
                 const size_t k = static_cast<size_t>(i) * D + j;
-                ref[k] *= inv * (hasGamma ? Dec<C>(gamma[j]) : 1.0);
+                ref[k] = ref[k] * inv * (hasGamma ? Dec<C>(gamma[j]) : 1.0) + (hasBias ? Dec<C>(bias[j]) : 0.0);
             }
         }
         for (uint32_t offset : {0u, 1u}) {

@@ -111,13 +111,13 @@ struct DaeLayout {
     uint32_t params;        // Resident FP32 gamma + beta, each replicated repRows times
     uint32_t resident;      // Resident FP32 Z: column-tiled segments, or a core's whole column band
     uint32_t misc;          // Split-D partial-sum records gathered from every core
-    bool paramQueue;        // Column tiles stream bias/gamma chunks
+    bool paramQueue;        // Column tiles stream gamma and beta chunks, a pair per tile
     uint32_t depth = 2;     // Buffers per input queue: tiles in flight
     uint32_t out = 0;       // One egress buffer (VECOUT, native dtype): Y leaves only from these
     uint32_t outDepth = 1;  // Egress buffers: a result streams out while the next ones are written
     uint32_t rec = 0;       // Split-D: this core's published record (VECOUT)
     uint32_t Total() const {
-        return depth * tile * (paramQueue ? 3 : 2) + outDepth * out + z + tmp + params + resident + misc + rec;
+        return depth * tile * (paramQueue ? 4 : 2) + outDepth * out + z + tmp + params + resident + misc + rec;
     }
 };
 
@@ -357,7 +357,7 @@ public:
                 depth, Align32(rows * pitch * s), outDepth, rec};
     }
 
-    // Column tiles: X1, X2 and parameter chunks double-buffered, two egress buffers
+    // Column tiles: X1, X2 and gamma/beta chunk pairs double-buffered, two egress buffers
     static inline DaeLayout ColumnLayout(uint64_t tile, uint64_t resident, uint32_t s, uint32_t misc, uint32_t rec) {
         return {Align32(tile * s), Align32(tile * 4), SCRATCH_BYTES, 0u, Align32(resident * 4), misc, true, 2, Align32(tile * s), 2, rec};
     }
@@ -421,8 +421,8 @@ public:
     // Vector-cycle model of DaePipeline, instruction by instruction (DaeIsa costs). The
     // planner uses it to weigh plans; tests hold it to the runtime's own cycle counts.
     // -------------------------------------------------------------------------
-    // One tile of k rows at pitch w: Z = X1 + X2 + beta, squares and row sums, inverse RMS,
-    // scale, gamma, narrow. `lens` gives band rows (SPLIT_COLUMNS) their own column counts
+    // One tile of k rows at pitch w: Z = X1 + X2, squares and row sums, inverse RMS, scale,
+    // gamma, beta, narrow. `lens` gives band rows (SPLIT_COLUMNS) their own column counts
     // (0: empty row); null means k full rows of w. Row sums go in groups of ROW_GROUP rows, the
     // squares of a group through the scratch chunk as many rows at a time as fit. `lanes` (full rows
     // that fit the scratch chunk): each group's inverse RMS in vector lanes, spread by one Brcb per
@@ -436,7 +436,7 @@ public:
         if (s < 4) {
             for (uint64_t o = 0; o < e; o += TMP_FLOATS) c += 2 * I::Op(std::min<uint64_t>(TMP_FLOATS, e - o));
         }
-        for (uint64_t g = 0; g < k; g += rep) c += 2 * I::Op(std::min(rep, k - g) * w);  // beta, gamma
+        c += 2 * AffineCycles(k, w, rep);  // gamma, beta
         if (w <= TMP_FLOATS) {
             const uint64_t per = TMP_FLOATS / w;
             for (uint64_t g = 0; g < k; g += ROW_GROUP) {
@@ -465,6 +465,14 @@ public:
         return c;
     }
 
+    // One resident parameter block (gamma or beta) applied to k rows of pitch w, rep rows per
+    // instruction (DaePipeline's ApplyRows)
+    static inline uint64_t AffineCycles(uint64_t k, uint64_t w, uint64_t rep) {
+        uint64_t c = 0;
+        for (uint64_t g = 0; g < k; g += rep) c += DaeIsa::Op(std::min(rep, k - g) * w);
+        return c;
+    }
+
     // Sum of squares of one contiguous run, in scratch-sized pieces
     static inline uint64_t SquareSumCycles(uint64_t n) {
         uint64_t c = 0;
@@ -483,33 +491,6 @@ public:
         uint64_t c = 0;
         const uint64_t chunk = TMP_BYTES / s;
         for (uint64_t o = 0; o < w; o += chunk) c += 2 * DaeIsa::Op(std::min(chunk, w - o));
-        return c;
-    }
-
-    // Column tiles over [start, end) of the flattened tensor: at most `tile` elements each,
-    // interior boundaries on the 32-byte grid (q elements), as DaePipeline cuts them
-    static inline uint64_t NextTile(uint64_t e, uint64_t end, uint64_t tile, uint32_t q) {
-        return std::min(end, e / q * q + tile);
-    }
-
-    // One column-tiled row segment: sweep 1 (+ beta) and sweep 2 (+ gamma)
-    static inline uint64_t SegmentCycles(uint64_t start, uint64_t end, uint64_t tile, uint32_t q, uint32_t s, bool resident) {
-        using I = DaeIsa;
-        auto chunks = [&](uint64_t n) {  // A widen + op pair per scratch-sized piece (16-bit data)
-            uint64_t c = 0;
-            for (uint64_t o = 0; o < n; o += TMP_FLOATS) c += 2 * I::Op(std::min<uint64_t>(TMP_FLOATS, n - o));
-            return c;
-        };
-        uint64_t c = I::kInvRms;
-        for (uint64_t e = start; e < end;) {
-            const uint64_t next = NextTile(e, end, tile, q), n = next - e;
-            const uint64_t z = s < 4 ? I::Op(n) + chunks(n) : I::Op(n);  // Z = X1 + X2
-            const uint64_t param = s < 4 ? chunks(n) : I::Op(n);         // (+|*) a parameter chunk
-            c += z + param + SquareSumCycles(n);                          // Sweep 1
-            if (!resident) c += z + param;                                // Sweep 2 recomputes Z
-            c += I::Op(n) + param + I::Op(n);                             // Muls, gamma, narrow
-            e = next;
-        }
         return c;
     }
 
@@ -673,11 +654,11 @@ public:
         };
         replicate(readyG, copiedG);
         replicate(readyB, copiedB);
-        auto betaRows = [&](uint32_t n) {  // Beta rows [0, n) in place: a tile adds min(rep, k) at once
-            double t = readyB;
+        // Rows [0, n) of a parameter block in place: a tile applies min(rep, k) rows at once
+        auto rowsReady = [&](double ready, const double* copied, uint32_t n) {
             uint32_t j = 0;
-            for (uint32_t h = 1; h < pp.rep && h < n; h *= 2, ++j) t = copiedB[j];
-            return t;
+            for (uint32_t h = 1; h < pp.rep && h < n; h *= 2, ++j) ready = copied[j];
+            return ready;
         };
         // Steady-state detection: snapshots of the state, rotated to the next tile's buffers
         constexpr uint32_t HIST = 8;
@@ -702,12 +683,15 @@ public:
         for (uint32_t row = 0; row < R;) {
             const uint32_t k = tiles.Rows(row), slot = static_cast<uint32_t>(done % d), ys = static_cast<uint32_t>(done % od);
             const uint64_t e = uint64_t(k) * D, C = TileCycles(k, D, s, pp.rep, nullptr, pp.lanes);
-            const double parB = betaRows(std::min(pp.rep, k));
+            // gamma, then beta, each once the rows its first instruction reads are in place
+            const uint64_t A = AffineCycles(k, D, pp.rep);
+            const double parG = rowsReady(readyG, copiedG, std::min(pp.rep, k)), parB = rowsReady(readyB, copiedB, std::min(pp.rep, k));
+            auto affine = [&](double scaled) { return std::max(std::max(scaled, parG) + A, parB) + A; };
             if (s == 4) {  // Z = X1 + X2 straight into the egress buffer, once its last store streamed out
                 const double start = std::max({vec, land1[slot], land2[slot], yFree[ys]});
                 x1Read[slot] = x2Read[slot][0] = start + I::Op(e);  // X1 and X2 are read by the add, all at once
                 x2Chunks[slot] = 1;
-                vec = std::max(start + I::Op(e), parB) + static_cast<double>(C - I::Op(e));
+                vec = affine(start + static_cast<double>(C - 2 * A));  // Z, squares, row sums and scaling first
             } else {
                 const double start = std::max(vec, land1[slot]), x2 = std::max(start + I::Op(e), land2[slot]);
                 x1Read[slot] = start + I::Op(e);  // X1 is read by its widening into Z
@@ -719,9 +703,10 @@ public:
                     else x2Read[slot][CHUNKS - 1] = x2 + phase + I::Op(m);
                     phase += 2.0 * I::Op(m);
                 }
-                // Bias through gamma, then the narrowing into the egress buffer once its last store streamed out
-                const double narrow = std::max(x2 + phase, parB) + static_cast<double>(C - 2 * I::Op(e)) - phase;
-                vec = std::max(narrow, yFree[ys]) + static_cast<double>(I::Op(e));
+                // Squares, row sums and scaling, gamma and beta, then the narrowing into the egress
+                // buffer once its last store streamed out
+                const double scaled = x2 + static_cast<double>(C - 2 * I::Op(e) - 2 * A);
+                vec = std::max(affine(scaled), yFree[ys]) + static_cast<double>(I::Op(e));
             }
             out.vector += static_cast<double>(C);
             vectorLeft -= C;
@@ -785,8 +770,8 @@ public:
     // Timeline of a column band (SPLIT_COLUMNS), mirroring BandPhase1 / SyncAll / BandPhase2 for
     // every core: phase 1 loads k band rows per tile (one DMA per row and input) and publishes a
     // record of partials; all cores leave SyncAll SYNC_ALL_CYCLES after the last one stored its
-    // record; phase 2 gathers the records, scales the resident Z, narrows (16-bit) or copies
-    // (FP32) each tile into the next egress buffer and stores it row by row.
+    // record; phase 2 gathers the records, scales the resident Z, applies gamma and beta, narrows
+    // (16-bit) or copies (FP32) each tile into the next egress buffer and stores it row by row.
     struct BandPipe {
         uint32_t k, rep, depth;  // Tile rows, replicated parameter rows, tiles in flight
         uint32_t outDepth;       // Egress buffers (VECOUT), 1 or 2
@@ -847,28 +832,20 @@ public:
             landG = transfer(0, Align32(uint64_t(w) * s));
             landB = transfer(0, Align32(uint64_t(w) * s));
             for (uint32_t i = 1; i < bp.depth && loaded < M; ++i) load();
+            // gamma and beta are widened and replicated now, used after SyncAll (which waits for the copies)
             double readyG = landG, readyB = landB;
             if (s < 4) {
                 readyG = compute(landG, I::Op(w));
                 readyB = compute(landB, I::Op(w));
             }
-            double copiedB[32];
-            auto replicate = [&](double ready, double* copied) {
-                uint32_t j = 0;
-                for (uint32_t h = 1; h < bp.rep; h *= 2, ++j) {
+            auto replicate = [&](double ready) {
+                for (uint32_t h = 1; h < bp.rep; h *= 2) {
                     local = std::max(local, ready) + static_cast<double>(std::min(h, bp.rep - h)) * pitch * 4 / lbw;
-                    if (copied) copied[j] = local;
                     ready = local;
                 }
             };
-            replicate(readyG, nullptr);
-            replicate(readyB, copiedB);
-            auto betaRows = [&](uint32_t n) {
-                double t0 = readyB;
-                uint32_t j = 0;
-                for (uint32_t h = 1; h < bp.rep && h < n; h *= 2, ++j) t0 = copiedB[j];
-                return t0;
-            };
+            replicate(readyG);
+            replicate(readyB);
             compute(0, I::Fill(R));  // The record, zeroed
             uint32_t tile = 0;
             for (uint32_t row = 0; row < M; row += bp.k, ++tile) {
@@ -894,8 +871,6 @@ public:
                         compute(0, I::Op(m));
                     }
                 }
-                const double parB = betaRows(std::min(bp.rep, k));
-                for (uint32_t g = 0; g < k; g += bp.rep) compute(g == 0 ? parB : 0, I::Op(uint64_t(std::min(bp.rep, k - g)) * pitch));
                 for (uint32_t g = 0; g < k; g += ROW_GROUP) {
                     const uint32_t end = std::min(k, g + ROW_GROUP);
                     for (uint32_t r0 = g; r0 < end; r0 += per) {
@@ -947,7 +922,7 @@ public:
                 const uint64_t e = uint64_t(k) * pitch;
                 for (uint32_t i = 0; i < k; ++i) compute(0, I::Reduce(1));
                 for (uint32_t i = 0; i < k; ++i) if (lens[row + i]) compute(0, I::kInvRms + I::Op(lens[row + i]));
-                for (uint32_t g = 0; g < k; g += bp.rep) compute(0, I::Op(uint64_t(std::min(bp.rep, k - g)) * pitch));  // gamma
+                compute(0, 2 * AffineCycles(k, pitch, bp.rep));  // gamma, beta
                 // Tiles rotate through the egress buffers; the narrowing (16-bit) or copy (FP32)
                 // waits until the rows it overwrites have streamed out
                 const uint32_t buf = tile % od;
@@ -974,7 +949,7 @@ public:
 
     // Timeline of column tiles (row-major Split-D fragments, and rows too long for a row tile),
     // mirroring ColumnPhase1 / SyncAll / ColumnPhase2 with their Sweep1 / Sweep2 for every core.
-    // X1, X2 and the parameter chunks each alternate between two buffers; a buffer is refilled
+    // X1, X2 and the gamma and beta chunks each alternate between two buffers; a buffer is refilled
     // once the reads of the elements it overwrites ended (16-bit reads go a scratch chunk at a time).
     // Every tile's result goes out through the next of two egress buffers.
     struct ColumnSim {
@@ -991,7 +966,7 @@ public:
         uint64_t tile;
         double bw, L;
         double ch = 0, vec = 0, loads = 0, stores = 0, cycles = 0, dma = 0;
-        Buffer x1[2], x2[2], p[2], y[2];
+        Buffer x1[2], x2[2], g[2], b[2], y[2];  // g, b: the two ways of the gamma/beta ring
         uint32_t yNext = 0;  // Egress buffers rotate across every sweep of the core
 
         double Transfer(double ready, double bytes) {
@@ -1047,60 +1022,59 @@ public:
                 Compute(0, DaeIsa::Op(m) + DaeIsa::ReduceRuns(1, m));
             }
         }
-        // Sweep 1 over [start, end): X1, X2 and beta of tile j+1 load before tile j computes
+        // Sweep 1 over [start, end): X1 and X2 of tile j+1 load before tile j computes
         void Sweep1(uint64_t start, uint64_t end) {
             uint32_t j = 0;
             uint64_t e = start;
             uint32_t n = start < end ? TileLength(start, end) : 0;
-            auto load = [&](uint32_t slot, uint64_t k) { Load(x1[slot], k), Load(x2[slot], k), Load(p[slot], k); };
+            auto load = [&](uint32_t slot, uint64_t k) { Load(x1[slot], k), Load(x2[slot], k); };
             if (n) load(0, n);
             while (e < end) {
                 const uint64_t next = e + n;
                 const uint32_t nn = next < end ? TileLength(next, end) : 0, slot = j % 2;
                 if (nn) load((j + 1) % 2, nn);
                 AddInputs(x1[slot], x2[slot], n);
-                Combine(p[slot], n);  // beta
                 SquareSums(n);
                 e = next, n = nn, ++j;
             }
         }
-        // Sweep 2 from resident Z: gamma chunks stream (the first may be in flight: `primed`)
+        // The gamma and beta chunks of a tile: loaded as a pair, applied in turn (* gamma + beta)
+        void LoadParams(uint32_t slot, uint64_t n) { Load(g[slot], n), Load(b[slot], n); }
+        void UseParams(uint32_t slot, uint64_t n) { Combine(g[slot], n), Combine(b[slot], n); }
+        // Sweep 2 from resident Z: gamma/beta pairs stream (the first may be in flight: `primed`)
         void Sweep2Resident(uint64_t start, uint64_t end, bool primed) {
             Compute(0, DaeIsa::kInvRms);
             uint32_t j = 0;
             uint64_t e = start;
             uint32_t n = start < end ? TileLength(start, end) : 0;
-            if (n && !primed) Load(p[0], n);
+            if (n && !primed) LoadParams(0, n);
             while (e < end) {
                 const uint64_t next = e + n;
                 const uint32_t nn = next < end ? TileLength(next, end) : 0, slot = j % 2;
-                if (nn) Load(p[(j + 1) % 2], nn);
+                if (nn) LoadParams((j + 1) % 2, nn);
                 Compute(0, DaeIsa::Op(n));  // Muls
-                Combine(p[slot], n);        // gamma
+                UseParams(slot, n);
                 Buffer& out = y[yNext++ % 2];
                 Compute(out.FreeFor(n), DaeIsa::Op(n));  // Narrow into the egress buffer once its last store streamed out
                 Store(out, n);
                 e = next, n = nn, ++j;
             }
         }
-        // Sweep 2 recomputing Z: X1, X2 and beta re-stream; each gamma chunk loads on the spot
+        // Sweep 2 recomputing Z: X1, X2 and the gamma/beta pair of tile j+1 load before tile j computes
         void Sweep2Recompute(uint64_t start, uint64_t end) {
             Compute(0, DaeIsa::kInvRms);
             uint32_t j = 0;
             uint64_t e = start;
             uint32_t n = start < end ? TileLength(start, end) : 0;
-            auto load = [&](uint32_t slot, uint64_t k) { Load(x1[slot], k), Load(x2[slot], k), Load(p[slot], k); };
+            auto load = [&](uint32_t slot, uint64_t k) { Load(x1[slot], k), Load(x2[slot], k), LoadParams(slot, k); };
             if (n) load(0, n);
             while (e < end) {
                 const uint64_t next = e + n;
                 const uint32_t nn = next < end ? TileLength(next, end) : 0, slot = j % 2;
                 if (nn) load((j + 1) % 2, nn);
                 AddInputs(x1[slot], x2[slot], n);
-                Combine(p[slot], n);        // beta
                 Compute(0, DaeIsa::Op(n));  // Muls
-                Buffer& g = nn ? p[slot] : p[0];  // gamma: the lowest free buffer (the next beta holds the other)
-                Load(g, n);
-                Combine(g, n);
+                UseParams(slot, n);
                 Buffer& out = y[yNext++ % 2];
                 Compute(out.FreeFor(n), DaeIsa::Op(n));  // Narrow into the egress buffer once its last store streamed out
                 Store(out, n);
@@ -1153,9 +1127,9 @@ public:
                 else c.Sweep2Recompute(uint64_t(row) * D, uint64_t(row + 1) * D);
                 if (std::max(c.vec, c.ch) >= bound) return out.finish = std::numeric_limits<double>::infinity(), out;
             }
-            if (split && r.nFrag > 0 && fragResident[t][0]) {  // The first gamma chunk streams in during SyncAll
+            if (split && r.nFrag > 0 && fragResident[t][0]) {  // The first gamma/beta pair streams in during SyncAll
                 const uint64_t start = uint64_t(r.frag[0].row) * D + r.frag[0].cb;
-                c.Load(c.p[0], c.TileLength(start, start + (r.frag[0].ce - r.frag[0].cb)));
+                c.LoadParams(0, c.TileLength(start, start + (r.frag[0].ce - r.frag[0].cb)));
             }
             if (split) release = std::max(release, std::max(c.vec, c.stores));
             if (std::max({c.vec, c.ch, c.stores}) >= bound) return out.finish = std::numeric_limits<double>::infinity(), out;
@@ -1211,7 +1185,7 @@ public:
     // so the planner runs the direct kernel only where its timeline finishes first.
     //
     // Timeline of a core with k rows, replaying DirectCore::Run with dsa::CoreTimeline's rules:
-    // the loads stream back to back (X1, X2, beta, gamma), the vector unit waits for each input
+    // the loads stream back to back (X1, X2, gamma, beta), the vector unit waits for each input
     // as it lands, and the store follows the last vector instruction. The zero padding has no
     // operand to wait for: it runs under the DMA latency.
     // -------------------------------------------------------------------------
@@ -1219,7 +1193,7 @@ public:
         using I = DaeIsa;
         const double bw = hw.BytesPerCycle(), L = hw.LatencyCycles();
         const uint64_t n = k * D, padded = LanePad(D);
-        // + beta and * gamma: one strided instruction for all rows when FP32 rows are whole 32-byte
+        // * gamma and + beta: one strided instruction for all rows when FP32 rows are whole 32-byte
         // blocks (the repeat stride counts blocks), else one per row
         const uint64_t perRow = D % 8 == 0 ? I::Op(n) : k * I::Op(D);
         RowTimeline out{0.0, 0.0, 0.0};
@@ -1235,21 +1209,20 @@ public:
             out.vector += static_cast<double>(cycles);
         };
         if (padded != D) compute(0, I::Fill(k * padded));  // Zero padding of the squares
-        const double x1 = load(n * s), x2 = load(n * s), beta = load(uint64_t(D) * s), gamma = load(uint64_t(D) * s);
+        const double x1 = load(n * s), x2 = load(n * s), gamma = load(uint64_t(D) * s), beta = load(uint64_t(D) * s);
         if (s == 4) {
             compute(std::max(x1, x2), I::Op(n));  // Z = X1 + X2
-            compute(beta, perRow);                // + beta
         } else {
             compute(x1, I::Op(n));                // Widen X1 into Z
             compute(x2, I::Op(n));                // Widen X2
             compute(0, I::Op(n));                 // Z += X2
-            compute(beta, I::Op(D) + perRow);     // Widen beta, + beta
         }
         compute(0, padded == D ? I::Op(n) : k * I::Op(D));  // Squares
         compute(0, k * I::Reduce(padded));                  // ReduceSum per row
         compute(0, LaneRmsCycles(k, s));                    // mean = sum * invD + eps, Rsqrt, Newton-Raphson
         compute(0, k * (I::Brcb(padded / LANES) + I::Op(D)));  // Broadcast and scale, per row
         compute(gamma, (s < 4 ? I::Op(D) : 0) + perRow);    // (Widen gamma), * gamma
+        compute(beta, (s < 4 ? I::Op(D) : 0) + perRow);     // (Widen beta), + beta
         if (s < 4) compute(0, I::Op(n));                    // Narrow into the egress buffer
         const double occupied = Align32(n * s) / bw, start = std::max(ch, vec);
         ch = start + occupied;
@@ -1294,8 +1267,8 @@ private:
     //                 when the inverse RMS runs in lanes)
     // No candidate takes a queue step: X1, X2, gamma/beta chunks and egress buffers are static rings.
     //   column band   k rows at the band pitch, the band's FP32 Z resident across the barrier
-    //   column tiles  (8s + 4) bytes per element (X1, X2, parameter chunks, egress, each twice;
-    //                 FP32 Z), plus the resident FP32 Z
+    //   column tiles  (10s + 4) bytes per element (X1, X2, gamma and beta chunks, egress, each
+    //                 twice; FP32 Z), plus the resident FP32 Z
     // modelNs is the slowest core's finish time; modelCycles its vector cycles.
     // -------------------------------------------------------------------------
     // `bound`: the modeled cycles a plan has to beat (a plan that cannot keeps modelNs = infinity)
@@ -1460,7 +1433,7 @@ private:
     }
 
     // Column tiles: Split-D fragments, or rows too long for a row tile. Keep the segment's
-    // FP32 Z resident when a useful tile still fits (sweep 2 then re-reads nothing but gamma).
+    // FP32 Z resident when a useful tile still fits (sweep 2 then re-reads nothing but gamma and beta).
     static inline void PlanColumnTiles(TilingConfig& cfg, uint32_t M, uint32_t D, uint32_t s, const HardwareModel& hw, double bound) {
         const uint64_t total = static_cast<uint64_t>(M) * D;
         const bool split = cfg.mode == TilingMode::SPLIT_D;

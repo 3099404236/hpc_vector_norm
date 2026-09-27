@@ -39,8 +39,8 @@ inline float* ThreadScratch(size_t floats) {
     return buf.p;
 }
 
-// Bias / gamma operands in codec PC (the tensor codec, or FP32 after the per-call widening).
-// A null tensor becomes a stride-0 constant (mask 0) so the hot loops stay branch-free.
+// Bias / gamma operands of pass 2 in codec PC (the tensor codec, or FP32 after the per-call
+// widening). A null tensor becomes a stride-0 constant (mask 0) so the hot loops stay branch-free.
 template <class PC> struct Params {
     const typename PC::S *b, *g;
     size_t bMask, gMask;
@@ -48,18 +48,17 @@ template <class PC> struct Params {
 };
 
 // -----------------------------------------------------------------------------
-// Pass 1: Z = X1 + X2 + bias (optionally kept resident) -> sum(Z^2).
+// Pass 1: Z = X1 + X2 (optionally kept resident) -> sum(Z^2). Bias is not part of Z: it
+// never enters the sum of squares (it is added after the normalization, in pass 2).
 // 4 x W independent FP32 accumulators (the 64-lane sliding window on AVX-512) within
 // 4096-element blocks, FP64 across blocks: no FMA latency chain, no drift on long rows.
 // -----------------------------------------------------------------------------
 constexpr uint32_t kPrefetchBytes = 512;
 
-template <class C, class PC, bool kKeep, bool kPrefetch>
-double SumSquares(const typename C::S* x1, const typename C::S* x2, const Params<PC>& p, float* z, uint32_t n) {
+template <class C, bool kKeep, bool kPrefetch>
+double SumSquares(const typename C::S* x1, const typename C::S* x2, float* z, uint32_t n) {
     using namespace simd;
-    const auto* b = p.b; // Locals: the Z stores cannot alias them, so they stay in registers
-    const size_t bMask = p.bMask;
-    auto zAt = [&](uint32_t c) { return Add(Add(Load(C{}, x1 + c), Load(C{}, x2 + c)), Load(PC{}, b + (c & bMask))); };
+    auto zAt = [&](uint32_t c) { return Add(Load(C{}, x1 + c), Load(C{}, x2 + c)); };
     double total = 0.0;
     for (uint32_t c = 0; c < n;) {
         const uint32_t e = std::min(n, c + 4096u);
@@ -90,7 +89,7 @@ double SumSquares(const typename C::S* x1, const typename C::S* x2, const Params
         }
         if (c < e) { // Masked tail: padding lanes load as 0 and add nothing
             const uint32_t k = e - c;
-            const V v = Add(Add(LoadN(C{}, x1 + c, k), LoadN(C{}, x2 + c, k)), LoadN(PC{}, b + (c & bMask), k));
+            const V v = Add(LoadN(C{}, x1 + c, k), LoadN(C{}, x2 + c, k));
             if (kKeep) StoreN(F32{}, z + c, v, k);
             a1 = Fma(v, v, a1);
             c = e;
@@ -101,7 +100,7 @@ double SumSquares(const typename C::S* x1, const typename C::S* x2, const Params
 }
 
 // -----------------------------------------------------------------------------
-// Pass 2: Y = Z * invRms * gamma, with Z read from the resident scratchpad (kKeep) or
+// Pass 2: Y = Z * invRms * gamma + bias, with Z read from the resident scratchpad (kKeep) or
 // recomputed from cache-hot inputs. kStream writes Y with non-temporal stores.
 // -----------------------------------------------------------------------------
 template <class C, class PC, bool kKeep, bool kStream>
@@ -113,13 +112,12 @@ void Normalize(const typename C::S* x1, const typename C::S* x2, const Params<PC
     const size_t bMask = p.bMask, gMask = p.gMask;
     const V s = Set1(invRms);
     auto out = [&](uint32_t c) {
-        const V zv = kKeep ? Load(F32{}, z + c) : Add(Add(Load(C{}, x1 + c), Load(C{}, x2 + c)), Load(PC{}, b + (c & bMask)));
-        return Mul(Mul(zv, s), Load(PC{}, g + (c & gMask)));
+        const V zv = kKeep ? Load(F32{}, z + c) : Add(Load(C{}, x1 + c), Load(C{}, x2 + c));
+        return Fma(Mul(zv, s), Load(PC{}, g + (c & gMask)), Load(PC{}, b + (c & bMask)));
     };
     auto outN = [&](uint32_t c, uint32_t k) {
-        const V zv = kKeep ? LoadN(F32{}, z + c, k)
-                           : Add(Add(LoadN(C{}, x1 + c, k), LoadN(C{}, x2 + c, k)), LoadN(PC{}, b + (c & bMask), k));
-        return Mul(Mul(zv, s), LoadN(PC{}, g + (c & gMask), k));
+        const V zv = kKeep ? LoadN(F32{}, z + c, k) : Add(LoadN(C{}, x1 + c, k), LoadN(C{}, x2 + c, k));
+        return Fma(Mul(zv, s), LoadN(PC{}, g + (c & gMask), k), LoadN(PC{}, b + (c & bMask), k));
     };
     uint32_t c = 0;
     if (kStream) { // Peel up to the vector alignment that streaming stores require
@@ -207,11 +205,10 @@ private:
     };
     struct Fragment { uint32_t row, cb, ce; float* z; double sum; };
 
-    template <bool kStream, class PC>
-    static double Pass1(const Job& j, const Params<PC>& p, uint32_t r, uint32_t cb, uint32_t n, float* z) {
+    template <bool kStream>
+    static double Pass1(const Job& j, uint32_t r, uint32_t cb, uint32_t n, float* z) {
         const size_t o = static_cast<size_t>(r) * j.D + cb;
-        return z ? SumSquares<C, PC, true, kStream>(j.x1 + o, j.x2 + o, p.At(cb), z, n)
-                 : SumSquares<C, PC, false, kStream>(j.x1 + o, j.x2 + o, p.At(cb), nullptr, n);
+        return z ? SumSquares<C, true, kStream>(j.x1 + o, j.x2 + o, z, n) : SumSquares<C, false, kStream>(j.x1 + o, j.x2 + o, nullptr, n);
     }
 
     template <bool kStream, class PC>
@@ -259,7 +256,7 @@ private:
         for (uint32_t k = 0; k < nFrag; ++k) {
             const uint32_t len = frag[k].ce - frag[k].cb;
             if (used + len <= cap) { frag[k].z = scratch + used; used += len; }
-            frag[k].sum = Pass1<kStream>(j, p, frag[k].row, frag[k].cb, len, frag[k].z);
+            frag[k].sum = Pass1<kStream>(j, frag[k].row, frag[k].cb, len, frag[k].z);
         }
         const bool split = j.cfg.mode == TilingMode::SPLIT_D;
         if (split) {
@@ -280,7 +277,7 @@ private:
             const uint32_t s = rA + (j.reverse ? K - 1 - kk : kk) * CR, e = std::min(rZ, s + CR);
             for (uint32_t i = s; i < e; i += B) {
                 const uint32_t nb = std::min(B, e - i);
-                for (uint32_t k = 0; k < nb; ++k) sums[k] = Pass1<kStream>(j, p, i + k, 0, D, zb ? zb + static_cast<size_t>(k) * D : nullptr);
+                for (uint32_t k = 0; k < nb; ++k) sums[k] = Pass1<kStream>(j, i + k, 0, D, zb ? zb + static_cast<size_t>(k) * D : nullptr);
                 for (uint32_t k = 0; k < nb; ++k) Pass2<kStream>(j, p, i + k, 0, D, zb ? zb + static_cast<size_t>(k) * D : nullptr, sums[k]);
             }
         }
@@ -392,11 +389,6 @@ public:
         state[slot] = DEQUEUED;
         dsa::WaitFlag<READY>(Event(slot));
         return slot;
-    }
-    // A slot used on the spot, outside the FIFO: its data is ready for its consumer
-    void Landed(uint32_t slot) {
-        DSA_ASSERT(slot < n && state[slot] == ALLOCATED, "[BufferRing]: a slot used on the spot must be allocated");
-        dsa::CrossPipe<READY>(Event(slot));
     }
     void Free(uint32_t slot) {
         DSA_ASSERT(slot < n && (state[slot] == ALLOCATED || state[slot] == DEQUEUED),
@@ -617,10 +609,10 @@ private:
 
         dsa::TPipe pipe;
         // Static rings, no queue sequencer (BufferRing). Ingress: X1 and X2 of `depth` tiles in
-        // flight, and gamma/beta chunks for column tiles (event IDs after the tiles'). Egress: every
-        // result leaves from a slot of qY.
+        // flight, and for column tiles the gamma and beta chunks of a tile, which travel together
+        // (event IDs after the tiles'). Egress: every result leaves from a slot of qY.
         BufferRing<dsa::QuePosition::VECIN, 2, dsa::HardEvent::MTE2_V, dsa::HardEvent::V_MTE2> qX;
-        BufferRing<dsa::QuePosition::VECIN, 1, dsa::HardEvent::MTE2_V, dsa::HardEvent::V_MTE2> qP;
+        BufferRing<dsa::QuePosition::VECIN, 2, dsa::HardEvent::MTE2_V, dsa::HardEvent::V_MTE2> qP;
         BufferRing<dsa::QuePosition::VECOUT, 1, dsa::HardEvent::V_MTE3, dsa::HardEvent::MTE3_V> qY;
         dsa::TBuf<dsa::QuePosition::VECCALC> bZ, bTmp, bPar, bRes, bMisc;
         dsa::TBuf<dsa::QuePosition::VECOUT> bRec;            // Split-D: the record this core publishes
@@ -728,7 +720,7 @@ private:
                 uint32_t o = 0;
                 dsa::LocalTensor<float> zt = z;
                 if constexpr (std::is_same<C, F32>::value) zt = Out(o = TakeOut());
-                TileZ(zt, qX.template View<S>(t, 0), qX.template View<S>(t, 1), k);
+                AddInputs(zt, qX.template View<S>(t, 0), qX.template View<S>(t, 1), k * pitch);  // Z = X1 + X2
                 qX.Free(t);  // Both inputs are consumed: Y never lives in an input buffer
                 if (plan.earlyLoads) refill();  // X1/X2 of a later tile stream in now
                 // Every row sum of a group is issued before the group's first scaling
@@ -738,7 +730,7 @@ private:
                     if (plan.laneRms) ScaleRowsInLanes(zt[g * pitch], n, sums);
                     else ScaleRows(zt[g * pitch], n, nullptr, sums);
                 }
-                if (gamma) ApplyRows(zt, k, par, true);
+                Affine(zt, k);  // * gamma + beta, after the normalization
                 if constexpr (!std::is_same<C, F32>::value) {
                     o = TakeOut();
                     Narrow(Out(o), zt, k * D);
@@ -758,9 +750,11 @@ private:
             qX.EnQue(t);
         }
 
-        // Z = X1 + X2 (+ beta) for the k rows of a tile at pitch `pitch`
-        void TileZ(dsa::LocalTensor<float> zt, dsa::LocalTensor<S> a, dsa::LocalTensor<S> bt, uint32_t k) {
-            AddInputs(zt, a, bt, k * pitch);
+        // Y = Z * gamma + beta for the k normalized rows of a tile at pitch `pitch`, from the resident
+        // parameter blocks: beta is applied after the normalization and gamma, never before the
+        // sum of squares
+        void Affine(dsa::LocalTensor<float> zt, uint32_t k) {
+            if (gamma) ApplyRows(zt, k, par, true);
             if (bias) ApplyRows(zt, k, par[BetaAt()], false);
         }
 
@@ -909,7 +903,7 @@ private:
             for (uint32_t row = r.rowA; row < r.rowZ; row += B) {
                 const uint32_t k = dsa::Min(B, r.rowZ - row), t = qX.DeQue();
                 const dsa::LocalTensor<float> zt = res[(row - r.rowA) * pitch];
-                TileZ(zt, qX.template View<S>(t, 0), qX.template View<S>(t, 1), k);
+                AddInputs(zt, qX.template View<S>(t, 0), qX.template View<S>(t, 1), k * pitch);  // Z = X1 + X2
                 qX.Free(t);
                 for (uint32_t g = 0; g < k; g += AdaptiveTiler::ROW_GROUP) {
                     const uint32_t n = dsa::Min(AdaptiveTiler::ROW_GROUP, k - g);
@@ -943,7 +937,7 @@ private:
                     BandCols(r, row + g, n, c0, cols);
                     ScaleRows(zt[g * pitch], n, cols, sums);
                 }
-                if (gamma) ApplyRows(zt, k, par, true);
+                Affine(zt, k);
                 StoreBand(r, row, k, c0, zt);
             }
         }
@@ -1007,11 +1001,11 @@ private:
                 Sweep2(row, 0, D, zr, Sweep1(row, 0, D, zr), false);
                 used = mark;
             }
-            // The first gamma chunk of fragment 0 streams in while this core waits at SyncAll
-            primed = split && r.nFrag > 0 && Resident(fragZ[0]) && gamma != nullptr;
+            // The first gamma/beta chunks of fragment 0 stream in while this core waits at SyncAll
+            primed = split && r.nFrag > 0 && Resident(fragZ[0]) && (gamma || bias);
             if (primed) {
                 const uint64_t start = uint64_t(r.frag[0].row) * D + r.frag[0].cb;
-                LoadParam(gamma + r.frag[0].cb, TileLength(start, start + (r.frag[0].ce - r.frag[0].cb)));
+                LoadParams(r.frag[0].cb, TileLength(start, start + (r.frag[0].ce - r.frag[0].cb)));
             }
         }
 
@@ -1031,41 +1025,36 @@ private:
             }
         }
 
-        // Sweep 1 over row segment [cb, ce): Z = X1 + X2 + beta and sum(Z^2), Z kept in `zr` when
-        // it is resident. X1, X2 and the beta chunk of tile k+1 are in flight while tile k is
-        // processed.
+        // Sweep 1 over row segment [cb, ce): Z = X1 + X2 and sum(Z^2), Z kept in `zr` when it is
+        // resident. X1 and X2 of tile k+1 are in flight while tile k is processed.
         float Sweep1(uint32_t row, uint32_t cb, uint32_t ce, dsa::LocalTensor<float> zr) {
             const uint64_t base = uint64_t(row) * D, start = base + cb;
             const bool keep = Resident(zr);
             float sum = 0.0f;
-            Tiles(start, base + ce, false,
-                  [&](uint64_t e, uint32_t n) {
-                      LoadTile(e, n);
-                      if (bias) LoadParam(bias + (e - base), n);
-                  },
+            Tiles(start, base + ce, false, [&](uint64_t e, uint32_t n) { LoadTile(e, n); },
                   [&](uint64_t e, uint32_t n) {
                       const uint32_t t = qX.DeQue();
                       dsa::LocalTensor<float> zt = keep ? zr[static_cast<uint32_t>(e - start)] : z;
                       AddInputs(zt, qX.template View<S>(t, 0), qX.template View<S>(t, 1), n);
                       qX.Free(t);
-                      if (bias) UseParam(zt, n, false);
                       sum += SumSquares(zt, n);
                   });
             return sum;
         }
 
-        // Sweep 2: Y = Z * invRms * gamma. From resident Z only gamma streams (its first chunk may
-        // already be in flight: `primed`); otherwise X1/X2 and beta re-stream to recompute Z.
+        // Sweep 2: Y = Z * invRms * gamma + beta. The row's Z is spent by then, so the gamma and beta
+        // chunks of every tile stream in as a pair (qP's two ways), the next pair while a tile is
+        // processed. From resident Z only the pairs stream (the first may already be in flight:
+        // `primed`); otherwise X1/X2 re-stream alongside them to recompute Z.
         void Sweep2(uint32_t row, uint32_t cb, uint32_t ce, dsa::LocalTensor<float> zr, float sumSq, bool primed) {
             const uint64_t base = uint64_t(row) * D, start = base + cb, end = base + ce;
             const float inv = InvRms(sumSq);
             if (Resident(zr)) {
-                Tiles(start, end, primed,
-                      [&](uint64_t e, uint32_t n) { if (gamma) LoadParam(gamma + (e - base), n); },
+                Tiles(start, end, primed, [&](uint64_t e, uint32_t n) { LoadParams(static_cast<uint32_t>(e - base), n); },
                       [&](uint64_t e, uint32_t n) {
                           const dsa::LocalTensor<float> zt = zr[static_cast<uint32_t>(e - start)];
                           dsa::Muls(zt, zt, inv, n);
-                          if (gamma) UseParam(zt, n, true);
+                          UseParams(zt, n);
                           const uint32_t o = TakeOut();
                           Narrow(Out(o), zt, n);
                           DmaOut(y + e, Out(o), n);
@@ -1076,15 +1065,14 @@ private:
             Tiles(start, end, false,
                   [&](uint64_t e, uint32_t n) {
                       LoadTile(e, n);
-                      if (bias) LoadParam(bias + (e - base), n);
+                      LoadParams(static_cast<uint32_t>(e - base), n);
                   },
                   [&](uint64_t e, uint32_t n) {
                       const uint32_t t = qX.DeQue();
                       AddInputs(z, qX.template View<S>(t, 0), qX.template View<S>(t, 1), n);
                       qX.Free(t);
-                      if (bias) UseParam(z, n, false);
                       dsa::Muls(z, z, inv, n);
-                      if (gamma) ApplyParamNow(z, gamma + (e - base), n, true);  // qP holds the next beta
+                      UseParams(z, n);
                       const uint32_t o = TakeOut();
                       Narrow(Out(o), z, n);
                       DmaOut(y + e, Out(o), n);
@@ -1120,25 +1108,22 @@ private:
             qX.EnQue(t);
         }
 
-        void LoadParam(const S* src, uint32_t n) {
+        // The gamma and beta chunks of columns [c0, c0 + n) into the next parameter slot (way 0:
+        // gamma, way 1: beta; an absent parameter leaves its way untouched)
+        void LoadParams(uint32_t c0, uint32_t n) {
+            if (!gamma && !bias) return;
             const uint32_t t = qP.Alloc();
-            DmaIn(qP.template View<S>(t), src, n);
+            if (gamma) DmaIn(qP.template View<S>(t, 0), gamma + c0, n);
+            if (bias) DmaIn(qP.template View<S>(t, 1), bias + c0, n);
             qP.EnQue(t);
         }
 
-        // zt (+|*)= the parameter chunk at the head of qP
-        void UseParam(dsa::LocalTensor<float> zt, uint32_t n, bool multiply) {
+        // zt = zt * gamma + beta with the chunks at the head of qP
+        void UseParams(dsa::LocalTensor<float> zt, uint32_t n) {
+            if (!gamma && !bias) return;
             const uint32_t t = qP.DeQue();
-            Combine(zt, qP.template View<S>(t), n, multiply);
-            qP.Free(t);
-        }
-
-        // The same with a chunk loaded on the spot, outside the FIFO order
-        void ApplyParamNow(dsa::LocalTensor<float> zt, const S* src, uint32_t n, bool multiply) {
-            const uint32_t t = qP.Alloc();
-            DmaIn(qP.template View<S>(t), src, n);
-            qP.Landed(t);
-            Combine(zt, qP.template View<S>(t), n, multiply);
+            if (gamma) Combine(zt, qP.template View<S>(t, 0), n, true);
+            if (bias) Combine(zt, qP.template View<S>(t, 1), n, false);
             qP.Free(t);
         }
 
@@ -1298,20 +1283,21 @@ private:
             // The pad lanes of the squares are zeroed first: nothing to wait for, so this runs under
             // the DMA latency
             if (padded != D) dsa::Duplicate(sq, 0.0f, k * padded);
-            // Ingress: each transfer hands its buffer to the vector unit with an event flag of its own
+            // Ingress: each transfer hands its buffer to the vector unit with an event flag of its own,
+            // in the order the vector unit uses them (gamma before beta)
             DmaIn(in1, x1 + e, n);
             dsa::SetFlag<dsa::HardEvent::MTE2_V>(dsa::EVENT_ID0);
             DmaIn(in2, x2 + e, n);
             dsa::SetFlag<dsa::HardEvent::MTE2_V>(dsa::EVENT_ID1);
-            if (bias) {
-                DmaIn(bet, bias, D);
-                dsa::SetFlag<dsa::HardEvent::MTE2_V>(dsa::EVENT_ID2);
-            }
             if (gamma) {
                 DmaIn(gam, gamma, D);
+                dsa::SetFlag<dsa::HardEvent::MTE2_V>(dsa::EVENT_ID2);
+            }
+            if (bias) {
+                DmaIn(bet, bias, D);
                 dsa::SetFlag<dsa::HardEvent::MTE2_V>(dsa::EVENT_ID3);
             }
-            // Z = X1 + X2 + beta in FP32, each input used as soon as it has landed
+            // Z = X1 + X2 in FP32, each input used as soon as it has landed
             dsa::WaitFlag<dsa::HardEvent::MTE2_V>(dsa::EVENT_ID0);
             if constexpr (kF32) {
                 dsa::WaitFlag<dsa::HardEvent::MTE2_V>(dsa::EVENT_ID1);
@@ -1321,10 +1307,6 @@ private:
                 dsa::WaitFlag<dsa::HardEvent::MTE2_V>(dsa::EVENT_ID1);
                 dsa::Cast(xw, in2, n, ToF32);
                 dsa::Add(z, z, xw, n);
-            }
-            if (bias) {
-                dsa::WaitFlag<dsa::HardEvent::MTE2_V>(dsa::EVENT_ID2);
-                EachRow(z, Widen(bw, bet), k, false);
             }
             // Row sums: squares on whole 64-lane repeats, then one ReduceSum per row into its own
             // lane of `sums`; destination, source and workpad are disjoint partitions
@@ -1340,9 +1322,14 @@ private:
                 dsa::Brcb(bc, inv[i], padded / AdaptiveTiler::LANES, dsa::BrcbRepeatParams{1, 8});
                 dsa::Mul(z[i * D], z[i * D], bc, D);
             }
+            // Y = Z * gamma + beta: beta after the normalization and gamma
             if (gamma) {
-                dsa::WaitFlag<dsa::HardEvent::MTE2_V>(dsa::EVENT_ID3);
+                dsa::WaitFlag<dsa::HardEvent::MTE2_V>(dsa::EVENT_ID2);
                 EachRow(z, Widen(gw, gam), k, true);
+            }
+            if (bias) {
+                dsa::WaitFlag<dsa::HardEvent::MTE2_V>(dsa::EVENT_ID3);
+                EachRow(z, Widen(bw, bet), k, false);
             }
             if constexpr (!kF32) dsa::Cast(out, z, n, FromF32);  // Narrow into the egress buffer
             DmaOut(y + e, out, n);
