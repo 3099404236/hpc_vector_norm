@@ -2,11 +2,13 @@
 // model equals the runtime's cycle count, and the DAE pipeline that executes the plans
 // (dsa_runtime, one OpenMP thread per simulated core) is exact, free of scalar stalls,
 // sanitizer-clean (DAE v1.4 errata included: no egress from VECIN, no aliased folds; v1.5: no
-// unpadded or aliased ReduceSum, no undersized Brcb), claims exactly the planned scratchpad,
-// only pads DMA transfers where a row does not end on a 32-byte block, and allocates nothing
-// but the simulator's scratchpad. No kernel takes a queue step: the streaming kernel's buffers are
-// static rings, the direct kernel's static buffers. Workers are freestanding: a trap aborts the
-// process (DSA_ASSERT), which the death tests check, and the abort report names the run in progress.
+// unpadded or aliased ReduceSum, no undersized Brcb; the target's semantics: ReduceSum into
+// block-aligned slots, Brcb as a block broadcast, strided masks of one repeat, no scalar read of
+// the scratchpad, nothing consumed that the kernel did not write), claims exactly the planned
+// scratchpad, only pads DMA transfers where a row does not end on a 32-byte block, and allocates
+// nothing but the simulator's scratchpad. No kernel takes a queue step: its buffers are static
+// rings. Workers are freestanding: a trap aborts the process (DSA_ASSERT), which the death tests
+// check, and the abort report names the run in progress.
 #include "hpc_vector_norm.hpp"
 #include "kernel_unified.hpp"
 #include <omp.h>
@@ -116,45 +118,38 @@ template <class S> struct HostBuffer {
 // -----------------------------------------------------------------------------
 // 1. Plan invariants: 191 KB, 32-byte units and tiles, one-unit balance, feasible layouts
 // -----------------------------------------------------------------------------
-// The direct kernel's rule from the spec [Challenge 8], rather than the planner's: the busiest core's
-// share takes at most 1,024 bytes of X1 (X2, Y), and its squares, each row padded to whole 64-lane
-// repeats, at most 1,024 floats
-bool DirectShare(uint64_t rows, uint32_t D, uint32_t s) { return rows * D * s <= 1024 && rows * ((D + 63) / 64 * 64) <= 1024; }
-
-// A shape forced onto the direct kernel: the row decomposition, each core's rows in one shot
-TilingConfig ForcedDirect(uint32_t M, uint32_t D, uint32_t s) {
+// A shape's rows on the row decomposition, each core's rows in a single tile: the schedule the
+// removed direct kernel ran [Challenge 8], now just the one-tile row plan. gamma/beta load after
+// X1/X2, as the direct kernel issued them.
+TilingConfig OneTile(uint32_t M, uint32_t D, uint32_t s) {
     const HardwareModel hw = HardwareModel::Target();
     TilingConfig plan = AdaptiveTiler::Build(M, D, s, hw, TilingMode::ROW_PARALLEL, true);
-    AdaptiveTiler::ApplyDirect(plan, M, D, s, hw);
+    const uint32_t rows = static_cast<uint32_t>((AdaptiveTiler::MaxLoad(uint64_t(M) * D, plan.unitElems, plan.blocks) + D - 1) / D);
+    AdaptiveTiler::ApplyRowPipe(plan, M, D, s, hw, {rows, 0, 0, 2, 1, false, false});
     return plan;
 }
 
 void CheckPlan(const TilingConfig& t, uint32_t M, uint32_t D, uint32_t s, const char* what) {
-    const HardwareModel hw = HardwareModel::Target();
     const uint32_t q = dsa::DMA_ALIGN_BYTES / s;
     const uint64_t total = static_cast<uint64_t>(M) * D;
     char msg[320];
-    std::snprintf(msg, sizeof msg, "%s: M=%u D=%u s=%u mode=%s blocks=%u tileRows=%u tile=%u pitch=%u rep=%u spm=%u", what, M, D, s,
-                  ModeName(t.mode), t.blocks, t.tileRows, t.tileElems, t.pitch, t.repRows, t.layout.Total());
+    std::snprintf(msg, sizeof msg, "%s: M=%u D=%u s=%u mode=%s blocks=%u tileRows=%u tile=%u pitch=%u spm=%u", what, M, D, s,
+                  ModeName(t.mode), t.blocks, t.tileRows, t.tileElems, t.pitch, t.layout.Total());
     Check(std::isfinite(t.modelNs) && t.tileElems > 0, msg);
     Check(t.blocks >= 1 && t.blocks <= dsa::MAX_HARDWARE_CORES, msg);
     Check(t.layout.Total() <= dsa::SCRATCHPAD_SAFE_WATERLINE, msg);
     Check(t.unitElems * s % dsa::DMA_ALIGN_BYTES == 0 || t.mode == TilingMode::ROW_PARALLEL, msg);  // Split units: DMA blocks
-    // Egress buffers for every result, the fold partition (direct: the reduction partitions; laneRms:
-    // the lane partitions too), and a VECOUT record for split plans. Lanes serve row tiles of rows that
-    // fit the scratch chunk.
+    // Egress buffers for every result, the scratch buffer with its reduction partitions, and a VECOUT
+    // record for split plans
     Check(t.layout.out == t.layout.tile && t.layout.outDepth >= 1 && t.layout.outDepth <= 2 &&
-              t.layout.tmp == (t.direct ? AdaptiveTiler::DirectLayout(s).tmp
-                                        : AdaptiveTiler::SCRATCH_BYTES + (t.laneRms ? AdaptiveTiler::LANE_BYTES : 0u)), msg);
-    Check(!t.laneRms || (t.mode == TilingMode::ROW_PARALLEL && !t.direct && t.tileRows && D <= AdaptiveTiler::TMP_FLOATS), msg);
+              t.layout.tmp == AdaptiveTiler::SCRATCH_BYTES, msg);
     Check((t.layout.rec != 0) == (t.mode != TilingMode::ROW_PARALLEL), msg);
-    // Rows run direct only when the busiest core's share fits the direct kernel's static buffers
-    // [Challenge 8]. Neither kernel takes a queue step, so a row plan whose share fits finishes no
-    // later than the direct kernel would: the planner keeps whichever finishes first.
+    // Every core's rows in one tile is a row plan too (the schedule of the former direct kernel): the
+    // planner keeps a plan no slower than it
     const uint64_t rows = (AdaptiveTiler::MaxLoad(total, t.unitElems, t.blocks) + D - 1) / D;
-    const bool fits = t.mode == TilingMode::ROW_PARALLEL && DirectShare(rows, D, s);
-    Check(!t.direct || fits, msg);
-    if (fits) Check(t.modelNs <= ForcedDirect(M, D, s).modelNs, msg);
+    if (t.mode == TilingMode::ROW_PARALLEL && AdaptiveTiler::RowLayout(rows, D, s).Total() <= dsa::SCRATCHPAD_SAFE_WATERLINE) {
+        Check(t.modelNs <= OneTile(M, D, s).modelNs * (1 + 1e-12), msg);
+    }
     uint64_t lo = ~0ull, hi = 0;  // Balanced to one unit
     for (uint32_t b = 0; b < t.blocks; ++b) {
         const uint64_t e0 = std::min(t.units * b / t.blocks * t.unitElems, total);
@@ -163,20 +158,18 @@ void CheckPlan(const TilingConfig& t, uint32_t M, uint32_t D, uint32_t s, const 
         hi = std::max(hi, e1 - e0);
     }
     Check(hi - lo <= t.unitElems, msg);
-    if (t.direct) {  // One tile of the busiest core's rows, in the direct kernel's static buffers
-        Check(t.tileRows == rows && t.tileElems == rows * D && t.pitch == D && t.repRows == 1 && t.headRows == 0 &&
-                  t.tailRows == 0 && t.layout.depth == 1 && t.layout.Total() == AdaptiveTiler::DirectLayout(s).Total(), msg);
-    } else if (t.mode == TilingMode::ROW_PARALLEL && t.tileRows) {  // Row tiles: whole DMA-aligned row groups
-        const uint32_t p = static_cast<uint32_t>(AdaptiveTiler::RowUnit(D, s, hw) / D);
-        Check(t.pitch == D && t.tileRows % p == 0 && t.headRows % p == 0 && t.tailRows % p == 0, msg);
+    if (t.mode == TilingMode::ROW_PARALLEL && t.tileRows) {  // Row tiles: whole rows at the 32-byte row pitch
+        Check(t.unitElems == D && t.pitch == AdaptiveTiler::RowPitch(D, s) && t.pitch * s % dsa::DMA_ALIGN_BYTES == 0 &&
+                  t.tileElems == t.tileRows * t.pitch, msg);
         Check(t.headRows < t.tileRows && t.tailRows < t.tileRows && t.layout.depth >= 2 && t.layout.depth <= 4, msg);
-        Check(t.layout.Total() == AdaptiveTiler::RowLayout(t.tileRows, D, s, t.repRows, t.layout.depth, t.layout.outDepth, t.laneRms).Total(), msg);
-    } else if (t.mode == TilingMode::SPLIT_COLUMNS) {  // Band: rows on the grid, band rows fit the scratch chunk
-        Check(D % q == 0 && t.pitch % q == 0 && t.pitch <= AdaptiveTiler::TMP_FLOATS && t.zResident == M * t.pitch, msg);
+        Check(t.layout.Total() == AdaptiveTiler::RowLayout(t.tileRows, D, s, t.layout.depth, t.layout.outDepth).Total(), msg);
+    } else if (t.mode == TilingMode::SPLIT_COLUMNS) {
+        // Band: rows on the grid, band rows within the strided form's reach, tiles of whole record blocks
+        Check(D % q == 0 && t.pitch % q == 0 && AdaptiveTiler::StridedRows(t.pitch) && t.zResident == M * t.pitch &&
+                  (t.tileRows % 8 == 0 || t.tileRows == M), msg);
     } else {
         Check(t.tileRows == 0 && t.tileElems % q == 0, msg);  // Column tiles: interior boundaries on the grid
     }
-    if (t.tileRows) Check(t.repRows >= 1 && t.repRows <= t.tileRows && (t.repRows == 1 || t.pitch % 8 == 0), msg);
 }
 
 // The target benchmark's 15 shapes (docs/TARGET_MEASUREMENTS.md, section 9), with the best known
@@ -206,17 +199,11 @@ void CheckProfilePlans() {
 // say so (tileElems == 0) instead of overflowing
 void CheckPlannerScan() {
     const HardwareModel hw = HardwareModel::Target();
-    // Every tensor of at most 1,024 bytes fits the direct kernel, whatever its shape [Challenge 8], and
-    // plans rows no slower than it (CheckPlan)
+    // Every tensor of at most 1,024 bytes (the shares the direct kernel took [Challenge 8]): a
+    // feasible plan, no slower than every core's rows in one tile (CheckPlan)
     for (uint32_t s : {2u, 4u}) {
-        for (uint32_t D = 1; D * s <= AdaptiveTiler::DIRECT_BYTES; ++D) {
-            for (uint32_t M = 1; M * D * s <= AdaptiveTiler::DIRECT_BYTES; ++M) {
-                const TilingConfig t = AdaptiveTiler::Plan(M, D, s, hw);
-                char msg[96];
-                std::snprintf(msg, sizeof msg, "tiny tensor M=%u D=%u s=%u fits the direct kernel", M, D, s);
-                Check(t.mode == TilingMode::ROW_PARALLEL && DirectShare((AdaptiveTiler::MaxLoad(uint64_t(M) * D, t.unitElems, t.blocks) + D - 1) / D, D, s), msg);
-                CheckPlan(t, M, D, s, "tiny");
-            }
+        for (uint32_t D = 1; D * s <= 1024; ++D) {
+            for (uint32_t M = 1; M * D * s <= 1024; ++M) CheckPlan(AdaptiveTiler::Plan(M, D, s, hw), M, D, s, "tiny");
         }
     }
     for (uint32_t s : {2u, 4u}) {
@@ -247,9 +234,9 @@ DaeStats RunPlan(uint32_t M, uint32_t D, const TilingConfig& plan, bool hasGamma
     std::memset(y.mem.data(), 0x5A, y.mem.size() * sizeof(S));
 
     char msg[320];
-    std::snprintf(msg, sizeof msg, "%s %s M=%u D=%u gamma=%d bias=%d offset=%u blocks=%u mode=%s tileRows=%u tile=%u pitch=%u rep=%u zRes=%u lanes=%d",
+    std::snprintf(msg, sizeof msg, "%s %s M=%u D=%u gamma=%d bias=%d offset=%u blocks=%u mode=%s tileRows=%u tile=%u pitch=%u zRes=%u",
                   Name<C>(), label, M, D, hasGamma, hasBias, offset, plan.blocks, ModeName(plan.mode), plan.tileRows,
-                  plan.tileElems, plan.pitch, plan.repRows, plan.zResident, plan.laneRms);
+                  plan.tileElems, plan.pitch, plan.zResident);
     std::snprintf(g_running, sizeof g_running, "%s", msg);
     const DaeStats st = DaePipeline<C>::Execute(x1.p, x2.p, hasGamma ? g.p : nullptr, hasBias ? b.p : nullptr, y.p, M, D, 1e-6f, plan);
     g_running[0] = '\0';
@@ -333,21 +320,20 @@ void RunAll(std::mt19937& rng) {
 
 // A plan that fills the scratchpad to the byte must run: the kernel may claim nothing the
 // layout does not list (an unplanned 64-byte placeholder buffer once overflowed such plans).
-// FP32, 72-row tiles: X1/X2 double-buffered and one egress buffer (5 x 36,864 B), 9,216 B of
-// scratch and 2,048 B of gamma/beta replicated twice
+// FP16 rows of 12 columns at a 16-column pitch, 805-row tiles: X1/X2 double-buffered and one egress
+// buffer (5 x 25,760 B), the FP32 Z tile (51,520 B), 15,136 B of scratch and 128 B of gamma/beta
 void RunWaterlinePlan(std::mt19937& rng) {
-    const uint32_t D = 128, B = 72, M = 2 * B * dsa::MAX_HARDWARE_CORES;
+    const uint32_t D = 12, B = 805, M = 2 * B * dsa::MAX_HARDWARE_CORES;
     const HardwareModel hw = HardwareModel::Target();
-    TilingConfig plan = AdaptiveTiler::Build(M, D, 4, hw, TilingMode::ROW_PARALLEL, true);
-    AdaptiveTiler::ApplyRowPipe(plan, M, D, 4, hw, {B, 0, 0, 2, 2, 1, false, false});  // 2 tiles of 72 rows per core
+    TilingConfig plan = AdaptiveTiler::Build(M, D, 2, hw, TilingMode::ROW_PARALLEL, true);
+    AdaptiveTiler::ApplyRowPipe(plan, M, D, 2, hw, {B, 0, 0, 2, 1, false, false});  // 2 tiles of 805 rows per core
     Check(plan.layout.Total() == dsa::SCRATCHPAD_SAFE_WATERLINE, "waterline plan is exactly 195584 bytes");
-    RunPlan<F32>(M, D, plan, true, true, 0, rng, "waterline");
+    RunPlan<F16>(M, D, plan, true, true, 0, rng, "waterline");
 }
 
 // Every scheduling choice of row tiles, forced one combination at a time: queue depth, egress
-// buffers, head and tail tiles, gamma/beta first or second, early input loads, the inverse RMS in
-// lanes or per row. The kernel must follow each schedule exactly: right output, and the model's
-// cycle count and finish time (RunPlan)
+// buffers, head and tail tiles, gamma/beta first or second, early input loads. The kernel must
+// follow each schedule exactly: right output, and the model's cycle count and finish time (RunPlan)
 template <class C>
 void RunScheduleSweep(std::mt19937& rng) {
     const HardwareModel hw = HardwareModel::Target();
@@ -357,12 +343,12 @@ void RunScheduleSweep(std::mt19937& rng) {
         for (const uint32_t outDepth : {1u, 2u}) {
             for (const uint32_t head : {0u, 1u, 4u}) {
                 for (const uint32_t tail : {0u, 2u}) {
-                    for (int order = 0; order < 8; ++order) {
-                        const bool first = order & 1, early = order & 2, lanes = order & 4;
-                        AdaptiveTiler::ApplyRowPipe(plan, M, D, s, hw, {6, head, tail, 3, depth, outDepth, first, early, lanes});
+                    for (int order = 0; order < 4; ++order) {
+                        const bool first = order & 1, early = order & 2;
+                        AdaptiveTiler::ApplyRowPipe(plan, M, D, s, hw, {6, head, tail, depth, outDepth, first, early});
                         char label[128];
-                        std::snprintf(label, sizeof label, "schedule depth=%u outDepth=%u head=%u tail=%u paramsFirst=%d earlyLoads=%d lanes=%d",
-                                      depth, outDepth, head, tail, first, early, lanes);
+                        std::snprintf(label, sizeof label, "schedule depth=%u outDepth=%u head=%u tail=%u paramsFirst=%d earlyLoads=%d",
+                                      depth, outDepth, head, tail, first, early);
                         RunPlan<C>(M, D, plan, true, true, 0, rng, label);
                     }
                 }
@@ -371,121 +357,114 @@ void RunScheduleSweep(std::mt19937& rng) {
     }
 }
 
-// Tiles of many row groups (a worker keeps the sums of ROW_GROUP rows at a time): row tiles as
-// large as the scratchpad admits, and a column band run as one tile per core
+// Tiles of many row groups (a worker normalizes ROW_GROUP rows at a time): row tiles as large as the
+// scratchpad admits, and a column band run as one tile per core
 template <class C>
 void RunWidePlans(std::mt19937& rng) {
     using S = typename C::S;
     const HardwareModel hw = HardwareModel::Target();
-    struct Case { uint32_t M, D; TilingMode mode; bool lanes; } cases[] = {
-        {12000, 8, TilingMode::ROW_PARALLEL, false},    // 300-row tiles: groups of 128, 128, 44
-        {12000, 8, TilingMode::ROW_PARALLEL, true},     // The same with a lane chain per group
-        {65536, 24, TilingMode::ROW_PARALLEL, false},   // Squares chunks of 85 rows straddle the groups
-        {65536, 24, TilingMode::ROW_PARALLEL, true},    // ... and so do the lanes' Brcb chunks, whose
-                                                        // 64-lane repeats overrun each 24-column row
-        {300, 640, TilingMode::SPLIT_COLUMNS, false}};  // One 300-row band tile per core
+    struct Case { uint32_t M, D; TilingMode mode; } cases[] = {
+        {12000, 8, TilingMode::ROW_PARALLEL},     // 300-row tiles: groups of 128, 128, 44
+        {65536, 24, TilingMode::ROW_PARALLEL},    // Squares chunks of 85 (FP32) or 64 rows straddle the groups
+        {300, 640, TilingMode::SPLIT_COLUMNS}};   // One 300-row band tile per core
     for (const Case& c : cases) {
         TilingConfig plan = AdaptiveTiler::Build(c.M, c.D, sizeof(S), hw, c.mode, true);
         if (c.mode == TilingMode::ROW_PARALLEL) {  // The largest double-buffered tile, up to the core's rows
             const uint32_t rows = (c.M + plan.blocks - 1) / plan.blocks;
             uint32_t B = 1;
-            while (B < rows && AdaptiveTiler::RowLayout(B + 1, c.D, sizeof(S), 1, 2, 1, c.lanes).Total() <= hw.spmBytes) ++B;
-            AdaptiveTiler::ApplyRowPipe(plan, c.M, c.D, sizeof(S), hw, {B, 0, 0, 1, 2, 1, false, false, c.lanes});
+            while (B < rows && AdaptiveTiler::RowLayout(B + 1, c.D, sizeof(S), 2, 1).Total() <= hw.spmBytes) ++B;
+            AdaptiveTiler::ApplyRowPipe(plan, c.M, c.D, sizeof(S), hw, {B, 0, 0, 2, 1, false, false});
         } else {
-            AdaptiveTiler::ApplyBandPipe(plan, c.M, c.D, sizeof(S), hw, {c.M, 1, 2, 2});
+            AdaptiveTiler::ApplyBandPipe(plan, c.M, c.D, sizeof(S), hw, {c.M, 2, 1});
         }
         char msg[160];
-        std::snprintf(msg, sizeof msg, "%s wide plan M=%u D=%u mode=%s tileRows=%u lanes=%d", Name<C>(), c.M, c.D, ModeName(plan.mode),
-                      plan.tileRows, plan.laneRms);
-        Check(plan.tileElems > 0 && plan.tileRows > 2 * AdaptiveTiler::ROW_GROUP && plan.laneRms == c.lanes, msg);
+        std::snprintf(msg, sizeof msg, "%s wide plan M=%u D=%u mode=%s tileRows=%u", Name<C>(), c.M, c.D, ModeName(plan.mode),
+                      plan.tileRows);
+        Check(plan.tileElems > 0 && plan.tileRows > 2 * AdaptiveTiler::ROW_GROUP && plan.layout.Total() <= hw.spmBytes, msg);
         RunPlan<C>(c.M, c.D, plan, true, true, 0, rng, "wide");
         RunPlan<C>(c.M, c.D, plan, false, true, 1, rng, "wide");
     }
 }
 
-// Row tiles with each row group's inverse RMS in vector lanes (laneRms), forced: rows narrower than a
-// 64-lane repeat and rows that end mid-repeat, so every Brcb overruns its row; one scratch chunk per
-// tile and several; replicated gamma/beta where rows allow it. Each shape runs with and without
-// gamma/beta, on aligned and offset bases.
+// Row tiles across the row pitch's cases, forced: rows narrower than a 32-byte block, off the grid,
+// of whole 64-lane repeats or ending mid-repeat (the squares take the strided form, or one Mul per
+// row once a padded row is 2,048 lanes), rows past the strided form's 8-bit repeat stride (scaled row
+// by row) and rows longer than the scratch chunk (summed in pieces); one tile per core and several.
+// Each shape runs with and without gamma/beta, on aligned and offset bases.
 template <class C>
-void RunLaneSweep(std::mt19937& rng) {
+void RunPitchSweep(std::mt19937& rng) {
     const HardwareModel hw = HardwareModel::Target();
     const uint32_t s = sizeof(typename C::S);
-    for (const uint32_t D : {24u, 100u, 200u, 400u}) {
-        for (const uint32_t rows : {3u, 30u}) {  // Per core
-            const uint32_t M = rows * dsa::MAX_HARDWARE_CORES, rep = D % 8 == 0 ? dsa::Max(1u, dsa::Min(rows, 2048u / D)) : 1u;
+    for (const uint32_t D : {1u, 7u, 24u, 64u, 100u, 200u, 1000u, 2000u, 2047u, 2100u, 4100u}) {
+        for (const uint32_t rows : {1u, 3u, 30u}) {  // Per core
+            const uint32_t M = rows * dsa::MAX_HARDWARE_CORES;
             TilingConfig plan = AdaptiveTiler::Build(M, D, s, hw, TilingMode::ROW_PARALLEL, true);
             uint32_t B = 1;  // The core's rows in one tile, or the largest that fits
-            while (B < rows && AdaptiveTiler::RowLayout(B + 1, D, s, dsa::Min(rep, B + 1), 2, 1, true).Total() <= hw.spmBytes) ++B;
-            AdaptiveTiler::ApplyRowPipe(plan, M, D, s, hw, {B, 0, 0, dsa::Min(rep, B), 2, 1, false, false, true});
+            while (B < rows && AdaptiveTiler::RowLayout(B + 1, D, s, 2, 1).Total() <= hw.spmBytes) ++B;
+            AdaptiveTiler::ApplyRowPipe(plan, M, D, s, hw, {B, 0, 0, 2, 1, false, false});
             char msg[128];
-            std::snprintf(msg, sizeof msg, "%s lane plan M=%u D=%u tileRows=%u rep=%u", Name<C>(), M, D, plan.tileRows, plan.repRows);
-            Check(plan.laneRms && plan.tileElems > 0, msg);
+            std::snprintf(msg, sizeof msg, "%s pitch plan M=%u D=%u tileRows=%u pitch=%u", Name<C>(), M, D, plan.tileRows, plan.pitch);
+            Check(plan.tileElems > 0 && plan.pitch == AdaptiveTiler::RowPitch(D, s), msg);
             for (int pc = 0; pc < 4; ++pc) {
-                for (const uint32_t offset : {0u, 1u}) RunPlan<C>(M, D, plan, !(pc & 1), !(pc & 2), offset, rng, "lanes");
+                for (const uint32_t offset : {0u, 1u}) RunPlan<C>(M, D, plan, !(pc & 1), !(pc & 2), offset, rng, "pitch");
             }
         }
     }
 }
 
-// Direct kernel [ARCH CHALLENGE 8], forced onto every kind of share it takes (1 to 16 rows, rows of up
-// to 1,024 bytes, padded to 64 lanes or not, on and off the 32-byte grid, one core or many), with and
-// without gamma/beta, on aligned and offset bases: RunPlan holds each run to the reference and the
-// model. The planner's plan for the same shape runs too, and finishes no later on the runtime's own
-// timeline: it keeps the direct kernel only where that finishes first.
+// Shares of at most 1,024 bytes, the ones the removed direct kernel took [ARCH CHALLENGE 8] (1 to 16
+// rows, rows of up to 1,024 bytes, padded to 64 lanes or not, on and off the 32-byte grid, one core or
+// many): the planner's plan and every core's rows in one tile, the direct kernel's schedule, run with
+// and without gamma/beta, on aligned and offset bases (RunPlan holds each run to the reference and the
+// model). The planner's plan finishes no later on the runtime's own timeline.
 template <class C>
-void RunDirectSweep(std::mt19937& rng) {
+void RunTinySweep(std::mt19937& rng) {
     const uint32_t s = sizeof(typename C::S);
     const HardwareModel hw = HardwareModel::Target();
     uint32_t shapes = 0;
     for (const uint32_t D : {1u, 7u, 8u, 24u, 60u, 64u, 65u, 100u, 128u, 200u, 256u, 400u, 512u}) {
         for (const uint32_t M : {1u, 2u, 3u, 5u, 16u, 40u, 100u}) {
-            const TilingConfig plan = AdaptiveTiler::Plan(M, D, s, hw);
-            if (plan.mode != TilingMode::ROW_PARALLEL || !DirectShare((AdaptiveTiler::MaxLoad(uint64_t(M) * D, plan.unitElems, plan.blocks) + D - 1) / D, D, s)) continue;
+            const TilingConfig plan = AdaptiveTiler::Plan(M, D, s, hw), one = OneTile(M, D, s);
+            const uint64_t rows = (AdaptiveTiler::MaxLoad(uint64_t(M) * D, one.unitElems, one.blocks) + D - 1) / D;
+            if (rows * D * s > 1024) continue;
             ++shapes;
-            const TilingConfig forced = ForcedDirect(M, D, s);
-            DaeStats direct{};
+            DaeStats single{};
             for (int pc = 0; pc < 4; ++pc) {
                 for (const uint32_t offset : {0u, 1u}) {
-                    const DaeStats st = RunPlan<C>(M, D, forced, !(pc & 1), !(pc & 2), offset, rng, "direct");
-                    if (pc == 0 && offset == 0) direct = st;
+                    const DaeStats st = RunPlan<C>(M, D, one, !(pc & 1), !(pc & 2), offset, rng, "one tile");
+                    if (pc == 0 && offset == 0) single = st;
+                    RunPlan<C>(M, D, plan, !(pc & 1), !(pc & 2), offset, rng, "planned");
                 }
             }
-            const DaeStats planned = RunPlan<C>(M, D, plan, true, true, 0, rng, plan.direct ? "planned direct" : "planned rows");
+            const DaeStats planned = RunPlan<C>(M, D, plan, true, true, 0, rng, "planned");
             char msg[160];
-            std::snprintf(msg, sizeof msg, "%s M=%u D=%u: planned %.0f cycles, direct kernel %.0f", Name<C>(), M, D,
-                          planned.timeline.finish, direct.timeline.finish);
-            Check(planned.timeline.finish <= direct.timeline.finish, msg);
+            std::snprintf(msg, sizeof msg, "%s M=%u D=%u: planned %.0f cycles, one tile per core %.0f", Name<C>(), M, D,
+                          planned.timeline.finish, single.timeline.finish);
+            Check(planned.timeline.finish <= single.timeline.finish * (1 + 1e-12), msg);
         }
     }
-    Check(shapes >= 20, "direct sweep covers its shapes");
+    Check(shapes >= 40, "tiny sweep covers its shapes");
 }
 
 // C1 (1 x 64) and C2 (7 x 197 FP32): the planner's plan, executed, end to end (the launch, then the
-// timeline), printed next to the best known time on the target; where the rows fit the direct
-// kernel, it runs too and finishes no sooner. No run takes a queue step.
+// timeline), printed next to the best known time on the target, and next to every core's rows in one
+// tile (the former direct kernel's schedule), which finishes no sooner. No run takes a queue step.
 template <class C>
 void CheckTinyLatency(const char* name, uint32_t M, uint32_t D, double bestUs, std::mt19937& rng) {
     const HardwareModel hw = HardwareModel::Target();
     const uint32_t s = sizeof(typename C::S);
-    const TilingConfig plan = AdaptiveTiler::Plan(M, D, s, hw), forced = ForcedDirect(M, D, s);
+    const TilingConfig plan = AdaptiveTiler::Plan(M, D, s, hw), one = OneTile(M, D, s);
     auto us = [](double cycles) { return (dsa::KERNEL_LAUNCH_NS + cycles / dsa::CLOCK_GHZ) / 1e3; };
     char label[96];
     std::snprintf(label, sizeof label, "%s planned", name);
     const DaeStats p = RunPlan<C>(M, D, plan, true, true, 0, rng, label);
-    std::printf("%s: %s on %u cores %.2f us, %llu cycles, queue cycles %llu; best known %.2f us", name,
-                plan.direct ? "direct" : plan.mode == TilingMode::ROW_PARALLEL ? "rows" : "split", plan.blocks, us(p.timeline.finish),
-                (unsigned long long)p.vectorCycles, (unsigned long long)p.queueCycles, bestUs);
-    bool ok = p.queueCycles == 0;
-    if (AdaptiveTiler::DirectFits(forced.tileRows, D, s)) {
-        std::snprintf(label, sizeof label, "%s direct", name);
-        const DaeStats d = RunPlan<C>(M, D, forced, true, true, 0, rng, label);
-        std::printf("; direct kernel %.2f us, %llu cycles", us(d.timeline.finish), (unsigned long long)d.vectorCycles);
-        ok &= p.timeline.finish <= d.timeline.finish && d.queueCycles == 0;
-    }
-    std::printf("\n");
-    std::snprintf(label, sizeof label, "%s planned no later than the direct kernel, no queue step", name);
-    Check(ok, label);
+    std::snprintf(label, sizeof label, "%s one tile", name);
+    const DaeStats d = RunPlan<C>(M, D, one, true, true, 0, rng, label);
+    std::printf("%s: %s on %u cores, %u-row tiles: %.2f us, %llu cycles, queue cycles %llu; one tile per core %.2f us; best known %.2f us\n",
+                name, plan.mode == TilingMode::ROW_PARALLEL ? "rows" : "split", plan.blocks, plan.tileRows, us(p.timeline.finish),
+                (unsigned long long)p.vectorCycles, (unsigned long long)p.queueCycles, us(d.timeline.finish), bestUs);
+    std::snprintf(label, sizeof label, "%s planned no later than one tile per core, no queue step", name);
+    Check(p.queueCycles == 0 && d.queueCycles == 0 && p.timeline.finish <= d.timeline.finish * (1 + 1e-12), label);
 }
 
 // -----------------------------------------------------------------------------
@@ -495,26 +474,26 @@ void CheckTinyLatency(const char* name, uint32_t M, uint32_t D, double bestUs, s
 // The coordinator's own workspace gives bit-identical results.
 // -----------------------------------------------------------------------------
 uint64_t SimulatorBuffers(const TilingConfig& plan) {  // TPipe::InitBuffer blocks of one core
-    if (plan.direct) return 0;  // Static buffers on the worker's stack (LocalMemAllocator): no heap at all
     const DaeLayout& L = plan.layout;
-    // One TBuf per ring way (X1, X2, the gamma and beta chunks, Y), then the scratch buffer and the others
-    return 2 + (L.paramQueue ? 2 : 0) + 1 + 1 + (L.z ? 1 : 0) + (L.params ? 1 : 0) + (L.resident ? 1 : 0) + (L.misc ? 1 : 0) +
-           (L.rec ? 1 : 0);
+    // One TBuf per ring slot and way (X1 and X2, the gamma and beta chunks, Y), the seven scratch
+    // partitions, then the others
+    return 2 * L.depth + (L.paramQueue ? 2 * L.depth : 0) + L.outDepth + 7 + (L.z ? 1 : 0) + (L.params ? 1 : 0) + (L.resident ? 1 : 0) +
+           (L.misc ? 1 : 0) + (L.rec ? 1 : 0);
 }
 
 template <class C>
 void CheckAllocations(std::mt19937& rng) {
     using S = typename C::S;
     const HardwareModel hw = HardwareModel::Target();
-    struct Case { uint32_t M, D; TilingMode mode; bool direct; } cases[] = {
-        {768, 192, TilingMode::ROW_PARALLEL, false},  {65536, 24, TilingMode::ROW_PARALLEL, false},
-        {1, 70001, TilingMode::ROW_PARALLEL, false},  {8, 32768, TilingMode::SPLIT_COLUMNS, false},
-        {17, 4097, TilingMode::SPLIT_D, false},       {3, 100003, TilingMode::SPLIT_D, false},
-        {1, 64, TilingMode::ROW_PARALLEL, false},     {40, 64, TilingMode::ROW_PARALLEL, false},  // One core, 40 cores
-        {1, 64, TilingMode::ROW_PARALLEL, true},      {40, 64, TilingMode::ROW_PARALLEL, true}};  // The same, direct
+    struct Case { uint32_t M, D; TilingMode mode; } cases[] = {
+        {768, 192, TilingMode::ROW_PARALLEL},  {65536, 24, TilingMode::ROW_PARALLEL},
+        {1, 70001, TilingMode::ROW_PARALLEL},  {8, 32768, TilingMode::SPLIT_COLUMNS},
+        {17, 4097, TilingMode::SPLIT_D},       {3, 100003, TilingMode::SPLIT_D},
+        {1, 64, TilingMode::ROW_PARALLEL},     {40, 64, TilingMode::ROW_PARALLEL},  // One core, 40 cores
+        {7, 197, TilingMode::ROW_PARALLEL}};   // Rows off the 32-byte grid: multi-row padded descriptors
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
     for (const Case& c : cases) {
-        const TilingConfig plan = c.direct ? ForcedDirect(c.M, c.D, sizeof(S)) : AdaptiveTiler::Build(c.M, c.D, sizeof(S), hw, c.mode, true);
+        const TilingConfig plan = AdaptiveTiler::Build(c.M, c.D, sizeof(S), hw, c.mode, true);
         const size_t N = size_t(c.M) * c.D;
         HostBuffer<S> x1(N, 0), x2(N, 0), g(c.D, 0), b(c.D, 0), y(N, 0), y2(N, 0);
         for (size_t i = 0; i < N; ++i) { x1.p[i] = Enc<C>(dist(rng)); x2.p[i] = Enc<C>(dist(rng)); }
@@ -522,8 +501,8 @@ void CheckAllocations(std::mt19937& rng) {
         const size_t bytes = DaePipeline<C>::WorkspaceBytes(plan, c.M);
         float* workspace = bytes ? static_cast<float*>(std::aligned_alloc(64, bytes)) : nullptr;
         char msg[200];
-        std::snprintf(msg, sizeof msg, "%s zero-allocation M=%u D=%u mode=%s%s workspace=%zu B", Name<C>(), c.M, c.D, ModeName(plan.mode),
-                      plan.direct ? " direct" : "", bytes);
+        std::snprintf(msg, sizeof msg, "%s zero-allocation M=%u D=%u mode=%s workspace=%zu B", Name<C>(), c.M, c.D, ModeName(plan.mode),
+                      bytes);
         std::snprintf(g_running, sizeof g_running, "%s", msg);
         g_newCalls = 0;
         g_countNew = true;
@@ -555,7 +534,6 @@ const TrapCase kTraps[] = {
     {"workspace", "[DaePipeline]: the reduction workspace"},      // Coordinator: workspace off the 64-byte grid
     {"team", "[DaePipeline]: the OpenMP team does not have the plan's core count"},  // Worker: nested region, one thread
     {"band", "[DaePipeline]: column band wider than the plan"},   // Worker: band pitch below the band width
-    {"direct", "[DaePipeline]: a direct plan's rows exceed its static scratchpad tiles"},  // Direct worker: too large a share
     // Static rings [Challenge 8]: every misuse a TQue's sanitizer trapped, and a ring's own limits
     {"ring-overflow", "[BufferRing]: every slot is in use"},
     {"ring-enqueue", "[BufferRing]: EnQue of a slot that is not allocated"},
@@ -620,9 +598,6 @@ int RunTrapCase(const char* name) {
         plan = AdaptiveTiler::Build(M, D, 2, HardwareModel::Target(), TilingMode::SPLIT_COLUMNS, true);
         plan.pitch = 16;
         run();
-    } else if (!std::strcmp(name, "direct")) {  // P01 forced direct (one core), given all of P05's rows
-        plan = ForcedDirect(1, 64, 2);
-        run();
     }
     return 0;  // Nothing trapped
 }
@@ -661,14 +636,14 @@ int main(int argc, char** argv) {
     RunWidePlans<F32>(rng);
     RunWidePlans<F16>(rng);
     RunWidePlans<BF16>(rng);
-    RunLaneSweep<F32>(rng);
-    RunLaneSweep<F16>(rng);
-    RunLaneSweep<BF16>(rng);
+    RunPitchSweep<F32>(rng);
+    RunPitchSweep<F16>(rng);
+    RunPitchSweep<BF16>(rng);
     CheckTinyLatency<F16>("C1", 1, 64, 1.70, rng);
     CheckTinyLatency<F32>("C2", 7, 197, 2.21, rng);
-    RunDirectSweep<F32>(rng);
-    RunDirectSweep<F16>(rng);
-    RunDirectSweep<BF16>(rng);
+    RunTinySweep<F32>(rng);
+    RunTinySweep<F16>(rng);
+    RunTinySweep<BF16>(rng);
     RunScheduleSweep<F32>(rng);
     RunScheduleSweep<F16>(rng);
     RunAll<F32>(rng);

@@ -24,14 +24,25 @@ Sections 1, 3, 4 and 5 below are therefore history: they record how those number
 obtained, not work that is outstanding. `DMA_BYTES_PER_CYCLE` and `byteNs` appear there as
 the values that used to be in their place; both are gone now.
 
+Applied since (the README's implementation section has the details):
+
+| Item | Where |
+| :--- | :--- |
+| The API forms the target does not have: the DAE kernel compiles against the refusing header (global memory through `GlobalTensor` only, `Cast` with a rounding mode, the 7-argument reductions, `TBuf` only), and `ctest -R target_api_shape` keeps every refused form a compile error | `src/kernel_unified.hpp`, [`TARGET_API_SHAPE.md`](TARGET_API_SHAPE.md) |
+| Section 6 in the runtime and the kernel: block `Brcb`, `ReduceSum` lane 0 only, no `VectorInvRms` (table `Rsqrt` + Newton-Raphson), no `LocalMemAllocator` / `pos`, fenced scalar reads, 32-byte segment starts, `invD` from the host, per-repeat masks | `include/dsa_runtime.hpp`, `tests/test_dsa_runtime.cpp` |
+| Software pipelining across row chunks: 2-4 tiles in flight on static buffer rings, each slot's flags set and waited once per tile, no `PIPE_ALL` between tiles, for any number of tiles per core | `DaePipeline::Core::RowTiles` |
+| The two shapes the direct path could not serve: C5 splits over all 40 cores (row-major Split-D), C15 runs one-row tiles pipelined | `AdaptiveTiler::Plan` |
+
+On 6.2: this runtime fills lanes 1..7 of a `ReduceSum` slot with NaN, stricter than "zero the slots before use". The kernel
+reads lane 0 of a slot and nothing else, so it is correct either way; its row sums do not go through `ReduceSum` at all.
+
 Still open:
 
 | Item | Where |
 | :--- | :--- |
-| The API forms the target does not have | [`TARGET_API_SHAPE.md`](TARGET_API_SHAPE.md), and section 6 below |
-| The per-instruction issue constants (13 / 14 / 15) and the 1.5 GHz clock are **not measured** | section 10 |
-| No software pipelining across row chunks — the measured cost is +93.9% and +57.8% on two shapes | section 11 |
-| Two shapes the direct path cannot serve at all | section 11 |
+| The per-instruction issue constants (13 / 14 / 15) are **not measured**; the time base is the measured repeat (1.717 cycles per ns), not a 1.5 GHz clock | section 10 |
+| The DMA latency (100 ns in the model) is **not measured** | `DMA_LATENCY_NS` |
+| C4, C7, C14 and C15: the model is optimistic against the best known times (0.58-0.79x), so the memory system does not yet explain them | section 9 |
 
 ---
 

@@ -63,4 +63,10 @@ enable_testing()
 add_test(NAME correctness COMMAND hpc_vector_norm_test)
 add_test(NAME dsa_runtime_sanitizer COMMAND test_dsa_runtime)
 add_test(NAME dae_pipeline COMMAND test_dae_pipeline)
+# The runtime refuses the API forms the target does not have (docs/TARGET_API_SHAPE.md): each one must
+# stay a compile error, and the target's own forms must compile
+add_test(NAME target_api_shape
+         COMMAND ${CMAKE_COMMAND} -DCXX=${CMAKE_CXX_COMPILER} "-DFLAGS=${OpenMP_CXX_FLAGS}"
+                 -DINC=${CMAKE_CURRENT_SOURCE_DIR}/include -DSRC=${CMAKE_CURRENT_SOURCE_DIR}/tests/api_shape_refused.cpp
+                 -DCASES=19 -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_refused_forms.cmake)
 

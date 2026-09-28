@@ -32,15 +32,17 @@ struct DaeIsa {
         return (floats * sizeof(float) + dsa::SIMD_REPEAT_BYTES - 1) / dsa::SIMD_REPEAT_BYTES;
     }
     static constexpr uint64_t Op(uint64_t n) { return 2 * Repeats(n) + 13; }      // Add, Adds, Mul, Muls, Cast
-    static constexpr uint64_t Fold(uint64_t n) { return Repeats(n) + 14; }        // BlockReduceSum (8 -> 1)
-    static constexpr uint64_t Reduce(uint64_t n) { return 2 * Repeats(n) + 15; }  // VectorReduceSum, ReduceSum
+    static constexpr uint64_t Strided(uint64_t repeats) { return 2 * repeats + 13; }  // Mul/Add, strided form
+    static constexpr uint64_t FoldReps(uint64_t repeats) { return repeats + 14; }  // BlockReduceSum (8 -> 1), per repeat
+    static constexpr uint64_t Fold(uint64_t n) { return FoldReps(Repeats(n)); }   // ... over n contiguous elements
+    static constexpr uint64_t Reduce(uint64_t n) { return 2 * Repeats(n) + 15; }  // ReduceSum
     static constexpr uint64_t Fill(uint64_t n) { return Repeats(n) + 18; }        // Duplicate
     static constexpr uint64_t Rsqrt(uint64_t n) { return 2 * Repeats(n) + 14; }   // Rsqrt
-    static constexpr uint64_t Brcb(uint64_t repeats) { return repeats + 8; }      // Brcb: 64 lanes per repeat
-    static constexpr uint64_t kInvRms = 16;                                       // VectorInvRms
-    // Sum `runs` runs of `len` squares: one 8 -> 1 fold first when that is cheaper
+    static constexpr uint64_t Brcb(uint64_t repeats) { return repeats + 8; }      // Brcb: 8 blocks per repeat
+    // Sum `runs` runs of `len` squares (whole 64-lane repeats): one 8 -> 1 fold first when that is
+    // cheaper and leaves whole repeats for ReduceSum
     static constexpr bool FoldFirst(uint64_t runs, uint64_t len) {
-        return len % 8 == 0 && Fold(runs * len) + runs * Reduce(len / 8) < runs * Reduce(len);
+        return len % 512 == 0 && Fold(runs * len) + runs * Reduce(len / 8) < runs * Reduce(len);
     }
     static constexpr uint64_t ReduceRuns(uint64_t runs, uint64_t len) {
         return FoldFirst(runs, len) ? Fold(runs * len) + runs * Reduce(len / 8) : runs * Reduce(len);
@@ -107,8 +109,8 @@ struct HardwareModel {
 struct DaeLayout {
     uint32_t tile;          // One X1 / X2 / parameter-chunk buffer (native dtype, VECIN), `depth` of each
     uint32_t z;             // FP32 Z of one tile (FP32 row tiles build Z in their egress buffer)
-    uint32_t tmp;           // FP32 scratch: casts, squares, staging of gamma/beta, then the fold partition
-    uint32_t params;        // Resident FP32 gamma + beta, each replicated repRows times
+    uint32_t tmp;           // FP32 scratch: the chunk (casts, squares, staged gamma/beta) and the reduction partitions
+    uint32_t params;        // Resident FP32 gamma + beta, one row each at the tile's pitch
     uint32_t resident;      // Resident FP32 Z: column-tiled segments, or a core's whole column band
     uint32_t misc;          // Split-D partial-sum records gathered from every core
     bool paramQueue;        // Column tiles stream gamma and beta chunks, a pair per tile
@@ -134,16 +136,13 @@ struct TilingConfig {
     bool streamStores;       // Non-temporal Y stores: working set overflows the last-level cache
     bool serpentine;         // Reverse the chunk order on every other call
     // Target DAE pipeline (per core)
-    bool direct;             // Row tiles: each core runs its rows in one shot from static buffers, no queues
     uint32_t tileRows;       // Rows per tile: row tiles and column bands (0: column tiles)
     uint32_t headRows;       // Row tiles: rows of a core's first tile (0: tileRows)
     uint32_t tailRows;       // Row tiles: rows of a core's last tile (0: what is left)
     bool paramsFirst;        // Row tiles: gamma/beta load before tile 0 (else right after it)
     bool earlyLoads;         // Row tiles: X1/X2 of a later tile load as soon as the tile's Z is built (else after its store)
-    bool laneRms;            // Row tiles: each row group's inverse RMS in vector lanes (else VectorInvRms and Muls per row)
-    uint32_t tileElems;      // Elements per X1/X2 tile
-    uint32_t pitch;          // Row pitch inside a tile: D, or the column band width (SPLIT_COLUMNS)
-    uint32_t repRows;        // gamma/beta rows replicated in the scratchpad: one op covers repRows rows
+    uint32_t tileElems;      // Elements per X1/X2 tile (row tiles: at the pitch)
+    uint32_t pitch;          // Row pitch inside a tile: D on the 32-byte grid (RowPitch), or the column band width
     uint32_t zResident;      // FP32 Z elements kept resident (column tiles and bands)
     DaeLayout layout;
     double modelNs;          // Modeled time: what Plan() minimizes (target: the launch, then the slowest core's timeline)
@@ -166,8 +165,7 @@ struct CoreRange {
 class AdaptiveTiler {
 public:
     // A core's row tiles over [rA, rZ): a head tile, body tiles of B rows, then a tail tile
-    // (head/tail 0: none). Head, body and tail are whole row units, so every tile starts on the
-    // 32-byte grid.
+    // (head/tail 0: none).
     struct RowSchedule {
         uint32_t rA, rZ, B, head, tail;
         uint32_t Rows(uint32_t row) const {
@@ -180,26 +178,28 @@ public:
 
     static constexpr uint32_t MAX_THREADS = dsa::MAX_HARDWARE_CORES;
     static constexpr uint32_t MAX_BATCH = 64;
-    static constexpr uint32_t TMP_BYTES = 8192;          // DAE FP32 scratch chunk
-    static constexpr uint32_t TMP_FLOATS = TMP_BYTES / sizeof(float);
-    // An 8 -> 1 fold of a chunk lands in a partition of its own after the chunk: a fold never
-    // reads and writes the same bytes [ARCH CHALLENGE 7: no ALU operand aliasing]
-    static constexpr uint32_t FOLD_BYTES = TMP_BYTES / 8;
-    static constexpr uint32_t SCRATCH_BYTES = TMP_BYTES + FOLD_BYTES;  // The scratch buffer: chunk + fold partition
-    static constexpr uint32_t REP_FLOATS = 2048;         // DAE replicated gamma (and beta): <= 8 KB each
-    static constexpr uint32_t ROW_GROUP = 128;           // DAE row sums in flight at once: a worker's fixed per-row arrays
     static constexpr double CHUNK_BYTES = 64 * 1024;     // Host serpentine chunk (prefetch-friendly run)
-    // Row tiles with laneRms: a row group's sums, then -mean / 2, its inverse RMS and a Newton-Raphson
-    // term, in three partitions of ROW_GROUP lanes after the fold partition
-    static constexpr uint32_t LANE_BYTES = 3 * ROW_GROUP * sizeof(float);
-    // Direct kernel [ARCH CHALLENGE 8]: static buffers sized for a share of at most DIRECT_BYTES per
-    // tensor (P02's 800-byte FP32 rows fit); ReduceSum runs on whole 64-lane repeats, so each row's
-    // squares are zero-padded to LANES and the padded rows of a share fit DIRECT_FLOATS (at most 16
-    // rows). Every tensor of at most DIRECT_BYTES fits both.
-    static constexpr uint32_t DIRECT_BYTES = 1024;
-    static constexpr uint32_t LANES = dsa::SIMD_REPEAT_BYTES / sizeof(float);
-    static constexpr uint32_t DIRECT_FLOATS = 1024;
-    static constexpr uint32_t RSQRT_BITS = 11;           // Rsqrt table precision (DAE v1.5): Newton-Raphson refines it
+    static constexpr uint32_t LANES = dsa::SIMD_REPEAT_BYTES / sizeof(float);  // FP32 lanes of one repeat
+    static constexpr uint32_t ROW_GROUP = 128;           // DAE rows whose inverse RMS one lane chain computes
+    static constexpr uint32_t RSQRT_BITS = dsa::RSQRT_TABLE_BITS;  // Rsqrt table precision: Newton-Raphson refines it
+    // The DAE scratch partitions, in FP32 elements, each a TBuf of its own:
+    //   chunk  casts, squares and staged gamma/beta
+    //   fold   an 8 -> 1 fold of the chunk [ARCH CHALLENGE 7: no ALU operand aliasing]
+    //   slots  a row group's 8 partial sums per row, which Brcb then overwrites with the group's
+    //          inverse RMS, a block per row; column tiles: a segment's 32-byte slot, whose lane 0 alone
+    //          a ReduceSum defines [6.2], and the block its inverse RMS is spread over; a spare slot
+    //   sums, inv, nr  a group's packed row sums, their inverse RMS and Newton-Raphson term
+    //   work   the ReduceSum workpad; long rows accumulate their 64-lane column sums in it
+    static constexpr uint32_t TMP_BYTES = 8192;
+    static constexpr uint32_t TMP_FLOATS = TMP_BYTES / sizeof(float);
+    static constexpr uint32_t FOLD_FLOATS = TMP_FLOATS / 8;
+    static constexpr uint32_t SLOT_FLOATS = 8 * (ROW_GROUP + 1);
+    static constexpr uint32_t LANE_FLOATS = ROW_GROUP;
+    static constexpr uint32_t WORK_FLOATS = LANES;
+    static constexpr uint32_t SCRATCH_BYTES = (TMP_FLOATS + FOLD_FLOATS + SLOT_FLOATS + 3 * LANE_FLOATS + WORK_FLOATS) * sizeof(float);
+    // Column tiles: slots 0 and 1 hold the Split-D fragments' sums, and a segment's inverse RMS is
+    // spread over the 8 blocks from COLUMN_BC_SLOT
+    static constexpr uint32_t COLUMN_BC_SLOT = 8;
 
     static inline CoreRange Range(const TilingConfig& cfg, uint32_t M, uint32_t D, uint32_t t, uint32_t n) {
         CoreRange r;
@@ -257,8 +257,10 @@ public:
     // -------------------------------------------------------------------------
     // (1) Decomposition. Every candidate is a balanced split of the flattened M*D stream
     // into units, and Plan() keeps the one whose busiest core finishes first:
-    //   inline         one core, no launch
-    //   ROW_PARALLEL   units of p rows, p = 32 / gcd(32, D*s): whole rows AND whole DMA blocks
+    //   inline         one core, no launch (host)
+    //   ROW_PARALLEL   units of one row: on the target a row off the 32-byte grid starts a block of
+    //                  its own in the scratchpad (a padded DMA descriptor per tile), so any row
+    //                  count balances to one row
     //   SPLIT_D        units of one 32-byte block [ARCH CHALLENGE 1]: every core within one
     //                  block of the mean for any M and any core count, plus one SyncAll
     //   SPLIT_COLUMNS  the same blocks numbered column-major (target only): same balance, and
@@ -344,33 +346,39 @@ public:
         return std::max(1u, hw.quantumBytes / elemBytes);
     }
 
-    // p whole rows per unit, with p = q / gcd(q, D*s): the smallest row group that ends on a DMA block
-    static inline uint64_t RowUnit(uint32_t D, uint32_t elemBytes, const HardwareModel& hw) {
-        const uint64_t rowBytes = static_cast<uint64_t>(D) * elemBytes;
-        if (rowBytes == 0) return 1;
-        return hw.quantumBytes / std::gcd<uint64_t>(hw.quantumBytes, rowBytes) * D;
-    }
+    // One row per unit: rows balance to one row for any width (a row off the 32-byte grid starts a
+    // scratchpad block of its own, RowPitch)
+    static inline uint64_t RowUnit(uint32_t D, uint32_t, const HardwareModel&) { return D ? D : 1; }
 
     static inline uint32_t Align32(uint64_t bytes) {
         return static_cast<uint32_t>((bytes + dsa::DMA_ALIGN_BYTES - 1) / dsa::DMA_ALIGN_BYTES * dsa::DMA_ALIGN_BYTES);
     }
 
-    // gamma and beta blocks of `rep` FP32 rows each, every block on the 32-byte grid
-    static inline uint32_t ParamBytes(uint64_t rep, uint64_t pitch) { return 2 * Align32(4 * rep * pitch); }
+    // A row's pitch in a tile, in elements: D rounded up to the 32-byte grid, so every row starts a
+    // block [6.6] (and its FP32 form does too): what lets a strided instruction take every row of a
+    // tile. The padded DMA fills the lanes past D with 0.
+    static inline uint32_t RowPitch(uint32_t D, uint32_t s) { return Align32(uint64_t(D) * s) / s; }
+
+    // Rows of `w` FP32 lanes on the 32-byte grid fit the strided form's 8-bit repeat stride (in blocks)
+    static constexpr bool StridedRows(uint64_t w) { return w % 8 == 0 && w / 8 <= 255; }
+
+    static constexpr uint64_t CeilDiv(uint64_t a, uint64_t b) { return (a + b - 1) / b; }
+    static constexpr uint64_t NextPow2(uint64_t n) { return n <= 1 ? 1 : 2 * NextPow2((n + 1) / 2); }
+
+    // gamma and beta: one FP32 row each at `pitch`, every row on the 32-byte grid
+    static inline uint32_t ParamBytes(uint64_t pitch) { return 2 * Align32(4 * pitch); }
 
     // Row tiles: X1/X2 (`depth` each), `outDepth` egress buffers of a tile, and for 16-bit data
-    // the FP32 Z tile (FP32 builds Z in the egress buffer); `lanes`: the scratch buffer also holds
-    // the lane partitions of the inverse RMS
-    static inline DaeLayout RowLayout(uint64_t rows, uint32_t D, uint32_t s, uint64_t rep, uint32_t depth = 2, uint32_t outDepth = 1,
-                                      bool lanes = false) {
-        const uint64_t e = rows * D;
-        return {Align32(e * s), s < 4 ? Align32(e * 4) : 0u, SCRATCH_BYTES + (lanes ? LANE_BYTES : 0u), ParamBytes(rep, D), 0u, 0u,
+    // the FP32 Z tile (FP32 builds Z in the egress buffer), rows at RowPitch
+    static inline DaeLayout RowLayout(uint64_t rows, uint32_t D, uint32_t s, uint32_t depth = 2, uint32_t outDepth = 1) {
+        const uint64_t e = rows * RowPitch(D, s);
+        return {Align32(e * s), s < 4 ? Align32(e * 4) : 0u, SCRATCH_BYTES, ParamBytes(RowPitch(D, s)), 0u, 0u,
                 false, depth, Align32(e * s), outDepth, 0u};
     }
 
-    static inline DaeLayout BandLayout(uint64_t rows, uint32_t pitch, uint32_t M, uint32_t s, uint64_t rep, uint32_t misc, uint32_t rec,
+    static inline DaeLayout BandLayout(uint64_t rows, uint32_t pitch, uint32_t M, uint32_t s, uint32_t misc, uint32_t rec,
                                        uint32_t depth = 2, uint32_t outDepth = 1) {
-        return {Align32(rows * pitch * s), 0u, SCRATCH_BYTES, ParamBytes(rep, pitch), Align32(uint64_t(M) * pitch * 4), misc, false,
+        return {Align32(rows * pitch * s), 0u, SCRATCH_BYTES, ParamBytes(pitch), Align32(uint64_t(M) * pitch * 4), misc, false,
                 depth, Align32(rows * pitch * s), outDepth, rec};
     }
 
@@ -381,12 +389,6 @@ public:
 
     // ReduceSum's rows: whole 64-lane repeats (a count off the lanes hangs the reduction: Trap #408)
     static constexpr uint32_t LanePad(uint64_t n) { return static_cast<uint32_t>((n + LANES - 1) / LANES * LANES); }
-
-    // A core's rows fit the direct kernel's static buffers: X1, X2 and Y of the share, and its
-    // zero-padded squares
-    static inline bool DirectFits(uint64_t rows, uint32_t D, uint32_t s) {
-        return rows >= 1 && D >= 1 && rows * D * s <= DIRECT_BYTES && rows * LanePad(D) <= DIRECT_FLOATS;
-    }
 
     // Newton-Raphson steps after Rsqrt: each doubles the bits, until they exceed the output's
     // significand (16-bit outputs: one step, FP32: two)
@@ -401,25 +403,6 @@ public:
     static inline uint64_t LaneRmsCycles(uint64_t n, uint32_t s) {
         const uint32_t steps = NewtonSteps(s);
         return 2 * DaeIsa::Op(n) + DaeIsa::Rsqrt(n) + (steps ? (1 + 4 * steps) * DaeIsa::Op(n) : 0);
-    }
-
-    // The direct kernel's static buffers (DaePipeline::DirectCore claims exactly these, so their
-    // total is its claim): X1 and X2 (`tile`, one each), one egress buffer (FP32 builds Z in it)
-    // and gamma/beta, at most DIRECT_BYTES each; for 16-bit data FP32 Z, widened X2 and widened
-    // gamma/beta; the padded squares, the ReduceSum workpad, four 64-lane partitions of row scalars
-    // (sums, mean, inverse RMS, Newton-Raphson term) and the Brcb destination. Every reduction
-    // operand has a partition of its own.
-    static inline DaeLayout DirectLayout(uint32_t s) {
-        const uint32_t wide = s < 4 ? DIRECT_BYTES / s * 4 : 0u;  // A share in FP32 (16-bit data)
-        DaeLayout L{};
-        L.tile = DIRECT_BYTES;
-        L.depth = 1;
-        L.out = DIRECT_BYTES;
-        L.outDepth = 1;
-        L.z = wide;
-        L.params = 2 * DIRECT_BYTES + 2 * wide;
-        L.tmp = wide + DIRECT_FLOATS * 4 + LANES * 4 + 4 * LANES * 4 + LanePad(DIRECT_BYTES / s) * 4;
-        return L;
     }
 
     static inline size_t LastLevelCacheBytes() {
@@ -438,76 +421,166 @@ public:
     // Vector-cycle model of DaePipeline, instruction by instruction (DaeIsa costs). The
     // planner uses it to weigh plans; tests hold it to the runtime's own cycle counts.
     // -------------------------------------------------------------------------
-    // One tile of k rows at pitch w: Z = X1 + X2, squares and row sums, inverse RMS, scale,
-    // gamma, beta, narrow. `lens` gives band rows (SPLIT_COLUMNS) their own column counts
-    // (0: empty row); null means k full rows of w. Row sums go in groups of ROW_GROUP rows, the
-    // squares of a group through the scratch chunk as many rows at a time as fit. `lanes` (full rows
-    // that fit the scratch chunk): each group's inverse RMS in vector lanes, spread by one Brcb per
-    // row over the scratch chunk and applied by one Mul per chunk of rows, instead of one
-    // VectorInvRms and one Muls per row.
-    static inline uint64_t TileCycles(uint64_t k, uint64_t w, uint32_t s, uint64_t rep, const uint32_t* lens, bool lanes = false) {
-        using I = DaeIsa;
-        const uint64_t e = k * w;
-        lanes = lanes && !lens && w <= TMP_FLOATS;
-        uint64_t c = I::Op(e);  // FP32: X1 + X2; 16-bit: widen X1
+    // Z = X1 + X2 over e elements (Core::AddInputs): FP32 one add; 16-bit the widened X1, then X2
+    // widened and added a chunk at a time
+    static inline uint64_t BuildCycles(uint64_t e, uint32_t s) {
+        uint64_t c = DaeIsa::Op(e);
         if (s < 4) {
-            for (uint64_t o = 0; o < e; o += TMP_FLOATS) c += 2 * I::Op(std::min<uint64_t>(TMP_FLOATS, e - o));
+            for (uint64_t o = 0; o < e; o += TMP_FLOATS) c += 2 * DaeIsa::Op(std::min<uint64_t>(TMP_FLOATS, e - o));
         }
-        c += 2 * AffineCycles(k, w, rep);  // gamma, beta
-        if (w <= TMP_FLOATS) {
-            const uint64_t per = TMP_FLOATS / w;
-            for (uint64_t g = 0; g < k; g += ROW_GROUP) {
-                const uint64_t end = std::min<uint64_t>(k, g + ROW_GROUP);
-                for (uint64_t r0 = g; r0 < end; r0 += per) {
-                    const uint64_t m = std::min(per, end - r0);
-                    c += I::Op(m * w);
-                    if (!lens) c += I::ReduceRuns(m, w);
-                    else for (uint64_t i = r0; i < r0 + m; ++i) c += lens[i] ? I::Reduce(lens[i]) : 0;
-                }
-                if (!lanes) continue;
-                c += LaneRmsCycles(end - g, s);  // The group's inverse RMS, then scale a chunk of rows at a time
-                for (uint64_t r0 = g; r0 < end; r0 += per) {
-                    const uint64_t m = std::min(per, end - r0);
-                    c += m * I::Brcb(I::Repeats(w)) + I::Op(m * w);
-                }
-            }
-        } else {
-            c += k * SquareSumCycles(w);
-        }
-        for (uint64_t i = 0; i < k && !lanes; ++i) {
-            const uint64_t len = lens ? lens[i] : w;
-            c += len ? I::kInvRms + I::Op(len) : 0;  // Inverse RMS and scale
-        }
-        if (s < 4) c += I::Op(e);  // Narrow into the egress buffer
         return c;
     }
 
-    // One resident parameter block (gamma or beta) applied to k rows of pitch w, rep rows per
-    // instruction (DaePipeline's ApplyRows)
-    static inline uint64_t AffineCycles(uint64_t k, uint64_t w, uint64_t rep) {
-        uint64_t c = 0;
-        for (uint64_t g = 0; g < k; g += rep) c += DaeIsa::Op(std::min(rep, k - g) * w);
-        return c;
-    }
-
-    // Sum of squares of one contiguous run, in scratch-sized pieces
-    static inline uint64_t SquareSumCycles(uint64_t n) {
+    // Lane 0 of a slot (+)= the sum of squares of a run of n elements (Core::RunSum): chunk-sized
+    // pieces, each squared after its last repeat was zeroed (so it pads with 0 to whole repeats) and
+    // reduced; every piece after its segment's first reduces into the spare slot and adds it. `first`:
+    // the run starts its segment.
+    static inline uint64_t RunSumCycles(uint64_t n, bool first) {
         uint64_t c = 0;
         for (uint64_t o = 0; o < n; o += TMP_FLOATS) {
-            const uint64_t m = std::min<uint64_t>(TMP_FLOATS, n - o);
-            c += DaeIsa::Op(m) + DaeIsa::ReduceRuns(1, m);
+            const uint64_t len = std::min<uint64_t>(TMP_FLOATS, n - o), padded = LanePad(len);
+            c += (padded != len ? DaeIsa::Fill(LANES) : 0) + DaeIsa::Op(len) + DaeIsa::ReduceRuns(1, padded);
+            if (!(first && o == 0)) c += DaeIsa::Op(1);
         }
         return c;
     }
 
-    // Widening gamma and beta of w columns (FP32 parameters arrive by DMA only): in one piece
-    // when both fit the staging buffer (`stageBytes`: the Z tile or the scratch buffer)
+    // Row sums as partials [6.2]. No ReduceSum: its lanes 1..7 are undefined, so a slot cannot be
+    // folded. Instead every row's squares are summed column-wise down to one 64-lane repeat and folded
+    // once (BlockReduceSum) into 8 partials per row, and a second fold packs 8 rows' partials into
+    // their sums (GroupNormCycles).
+    //
+    // The chunk's pitch for rows of pitch w: rows of whole repeats, at least one
+    static constexpr uint64_t ChunkPitch(uint64_t w) { return w < LANES ? LANES : w; }
+
+    // A piece of a row whose squares take the chunk alone (Core::PieceSum): `zeros` lanes of the chunk
+    // zeroed, L squares written, then the P2 lanes (a power of two of repeats) halved down to one repeat
+    static inline uint64_t PieceCycles(uint64_t L, uint64_t zeros, uint64_t P2) {
+        uint64_t c = (zeros ? DaeIsa::Fill(zeros) : 0) + (L ? DaeIsa::Op(L) : 0);
+        for (uint64_t h = P2 / 2; h >= LANES; h /= 2) c += DaeIsa::Op(h);
+        return c;
+    }
+    // A row piece of L squares: padded to P2 = a power of two of repeats, the lanes from its last whole
+    // repeat on zeroed before the squares are written
+    static constexpr uint64_t PiecePad(uint64_t L) { return LANES * NextPow2(CeilDiv(L, LANES)); }
+    static constexpr uint64_t PieceZeros(uint64_t L) { return PiecePad(L) != L ? PiecePad(L) - L / LANES * LANES : 0; }
+
+    // Rows of P squares that fold 8 -> 1 before their columns are added (Core::ChunkPartials): whole
+    // 64-lane repeats, so every folded row starts a block, and at least 512 lanes, so it fills a repeat
+    static constexpr bool FoldFirstRows(uint64_t P) { return P % LANES == 0 && P >= 8 * LANES && P <= TMP_FLOATS; }
+
+    // m rows' squares in the chunk at pitch P down to 8 partials each (Core::ChunkPartials): folded 8 -> 1
+    // first where FoldFirstRows allows (one fold of every repeat into the fold partition), then each
+    // row's 64-lane columns added onto its first (one strided Add per column for all m rows), then one
+    // fold of every row
+    static inline uint64_t ChunkPartialCycles(uint64_t m, uint64_t P) {
+        if (FoldFirstRows(P)) return DaeIsa::FoldReps(m * P / LANES) + (CeilDiv(P / 8, LANES) - 1) * DaeIsa::Strided(m) + DaeIsa::FoldReps(m);
+        return (CeilDiv(P, LANES) - 1) * DaeIsa::Strided(m) + DaeIsa::FoldReps(m);
+    }
+
+    // The 64-lane column sums of one piece of L squares of a long row (Core::PieceColumns): folded first
+    // where it can be, else halved (PieceCycles)
+    static inline uint64_t PieceColumnCycles(uint64_t L) {
+        if (FoldFirstRows(L)) return DaeIsa::Op(L) + DaeIsa::FoldReps(L / LANES) + (CeilDiv(L / 8, LANES) - 1) * DaeIsa::Strided(1);
+        return PieceCycles(L, PieceZeros(L), PiecePad(L));
+    }
+
+    // Rows whose squares the chunk takes a chunk of rows at a time (Core::RowPartials): two or more of
+    // them, or one that folds first; wider rows go one at a time, in pieces
+    static inline bool ChunkRows(uint64_t w) {
+        const uint64_t P = ChunkPitch(w), per = TMP_FLOATS / P;
+        return per >= 2 || (per == 1 && FoldFirstRows(P));
+    }
+
+    // 8 partials per row for n rows of pitch w into the slots (Core::RowPartials): rows the chunk takes
+    // (ChunkRows) go a chunk at a time: the squares (one Mul, or for rows narrower than a repeat the
+    // chunk zeroed and one strided Mul), then ChunkPartialCycles; a wider row goes alone, in chunk-sized
+    // pieces (PieceColumnCycles) accumulated in the work partition, then its fold
+    static inline uint64_t RowPartialCycles(uint64_t n, uint64_t w) {
+        const uint64_t P = ChunkPitch(w), per = TMP_FLOATS / P;
+        if (ChunkRows(w)) {
+            uint64_t c = 0;
+            for (uint64_t r0 = 0; r0 < n; r0 += per) {
+                const uint64_t m = std::min(per, n - r0);
+                c += (w < LANES ? DaeIsa::Fill(m * LANES) + DaeIsa::Strided(m) : DaeIsa::Op(m * w)) + ChunkPartialCycles(m, P);
+            }
+            return c;
+        }
+        uint64_t row = 0;
+        const uint64_t pieces = CeilDiv(w, TMP_FLOATS);
+        for (uint64_t o = 0; o < w; o += TMP_FLOATS) {
+            const uint64_t L = std::min<uint64_t>(TMP_FLOATS, w - o);
+            row += PieceColumnCycles(L) + (pieces > 1 ? DaeIsa::Op(LANES) : 0);
+        }
+        return n * (row + DaeIsa::FoldReps(1));
+    }
+
+    // n elements *= the value of one 32-byte block (Core::MulByBlock): 64-lane repeats, at most 255 per
+    // instruction, then the tail
+    static inline uint64_t BlockMulCycles(uint64_t n) {
+        const uint64_t full = n / LANES;
+        uint64_t c = 0;
+        for (uint64_t r = 0; r < full; r += 255) c += DaeIsa::Strided(std::min<uint64_t>(255, full - r));
+        return c + (n % LANES ? DaeIsa::Strided(1) : 0);
+    }
+
+    // n rows of pitch w (*|+)= a block per row (`perRow`) or one parameter row (Core::RowOp): one strided
+    // instruction per 64-lane column, a repeat per row, where the repeat stride reaches the rows and that
+    // is no dearer than row by row (a few wide rows are cheaper one at a time)
+    static inline bool StridedRowOp(uint64_t n, uint64_t w, bool perRow) {
+        return StridedRows(w) && CeilDiv(w, LANES) * DaeIsa::Strided(n) <= n * (perRow ? BlockMulCycles(w) : DaeIsa::Op(w));
+    }
+    static inline uint64_t RowOpCycles(uint64_t n, uint64_t w, bool perRow) {
+        if (StridedRowOp(n, w, perRow)) return CeilDiv(w, LANES) * DaeIsa::Strided(n);
+        return n * (perRow ? BlockMulCycles(w) : DaeIsa::Op(w));
+    }
+
+    // A group of n rows of pitch w up to its scaling (Core::NormalizeRows): the partials, the fold that
+    // packs them into row sums, the lane chain, the Brcb and the scaling. gamma and beta follow,
+    // RowOpCycles(n, w, false) each.
+    static inline uint64_t GroupNormCycles(uint64_t n, uint64_t w, uint32_t s) {
+        return RowPartialCycles(n, w) + DaeIsa::FoldReps(CeilDiv(n, 8)) + LaneRmsCycles(n, s) + DaeIsa::Brcb(CeilDiv(n, 8)) +
+               RowOpCycles(n, w, true);
+    }
+
+    // A band group's partials (Core::BandPartials): the band rows' own columns squared into a zeroed
+    // chunk, one Mul each, then summed and folded as RowPartialCycles does; `lens` the rows' own column
+    // counts (0: none of the row is the core's)
+    static inline uint64_t BandPartialCycles(const uint32_t* lens, uint64_t n, uint64_t pitch) {
+        const uint64_t P = ChunkPitch(pitch), per = TMP_FLOATS / P, k = CeilDiv(P, LANES);
+        uint64_t c = 0;
+        for (uint64_t r0 = 0; r0 < n; r0 += per) {
+            const uint64_t m = std::min(per, n - r0);
+            if (ChunkRows(pitch)) {
+                c += DaeIsa::Fill(m * P) + ChunkPartialCycles(m, P);
+                for (uint64_t i = r0; i < r0 + m; ++i) c += lens[i] ? DaeIsa::Op(lens[i]) : 0;
+            } else {
+                c += PieceCycles(lens[r0], LANES * NextPow2(k), LANES * NextPow2(k)) + DaeIsa::FoldReps(1);
+            }
+        }
+        return c;
+    }
+
+    // One row tile of k rows of pitch w (Core::RowTiles) with gamma and beta: Z, every group, then
+    // (16-bit) the narrowing into the egress buffer
+    static inline uint64_t RowTileCycles(uint64_t k, uint64_t w, uint32_t s) {
+        uint64_t c = BuildCycles(k * w, s) + (s < 4 ? DaeIsa::Op(k * w) : 0);
+        for (uint64_t g = 0; g < k; g += ROW_GROUP) {
+            const uint64_t n = std::min<uint64_t>(ROW_GROUP, k - g);
+            c += GroupNormCycles(n, w, s) + 2 * RowOpCycles(n, w, false);
+        }
+        return c;
+    }
+
+    // Widening gamma and beta of w columns (FP32 parameters arrive by DMA only, Core::WidenParams): one
+    // piece each when both fit the staging buffer (`stageBytes`: the Z tile or the scratch chunk), else
+    // a chunk at a time; every piece with its padding to the 32-byte grid
     static inline uint64_t ParamCycles(uint64_t w, uint32_t s, uint64_t stageBytes = TMP_BYTES) {
         if (s == 4) return 0;
-        if (2ull * Align32(w * s) <= stageBytes) return 2 * DaeIsa::Op(w);
+        if (2ull * Align32(w * s) <= stageBytes) return 2 * DaeIsa::Op(Align32(w * s) / s);
         uint64_t c = 0;
         const uint64_t chunk = TMP_BYTES / s;
-        for (uint64_t o = 0; o < w; o += chunk) c += 2 * DaeIsa::Op(std::min(chunk, w - o));
+        for (uint64_t o = 0; o < w; o += chunk) c += 2 * DaeIsa::Op(Align32(std::min(chunk, w - o) * s) / s);
         return c;
     }
 
@@ -520,15 +593,14 @@ public:
     // -------------------------------------------------------------------------
     struct RowPipe {             // Scheduling choices of a row-tile plan
         uint32_t B, head, tail;  // Body, head and tail tile rows (head/tail 0: none)
-        uint32_t rep, depth;     // Replicated parameter rows; tiles in flight per input queue
+        uint32_t depth;          // Tiles in flight per input queue
         uint32_t outDepth;       // Egress buffers (VECOUT), 1 or 2
         bool paramsFirst, earlyLoads;
-        bool lanes = false;      // Inverse RMS of each row group in vector lanes (rows within the scratch chunk)
     };
     struct RowTimeline { double finish, vector, dma; };
 
     // A row-tile plan with the given scheduling choices. Its modeled time and vector cycles
-    // are its slowest core's (cores differ by one row unit: every distinct row count counts).
+    // are its slowest core's (cores differ by one row: every distinct row count counts).
     static inline void ApplyRowPipe(TilingConfig& cfg, uint32_t M, uint32_t D, uint32_t s, const HardwareModel& hw,
                                     const RowPipe& pp) {
         double finish = 0, vector = 0;
@@ -543,18 +615,15 @@ public:
             finish = std::max(finish, x.finish);
             vector = std::max(vector, x.vector);
         }
-        cfg.direct = false;
         cfg.tileRows = pp.B;
-        cfg.tileElems = pp.B * D;
+        cfg.pitch = RowPitch(D, s);
+        cfg.tileElems = pp.B * cfg.pitch;
         cfg.headRows = pp.head;
         cfg.tailRows = pp.tail;
-        cfg.pitch = D;
-        cfg.repRows = pp.rep;
         cfg.paramsFirst = pp.paramsFirst;
         cfg.earlyLoads = pp.earlyLoads;
-        cfg.laneRms = pp.lanes && D <= TMP_FLOATS;
         cfg.zResident = 0;
-        cfg.layout = RowLayout(pp.B, D, s, pp.rep, pp.depth, pp.outDepth, cfg.laneRms);
+        cfg.layout = RowLayout(pp.B, D, s, pp.depth, pp.outDepth);
         SetModel(cfg, finish, vector, hw);
     }
 
@@ -565,18 +634,18 @@ public:
     static inline RowTimeline RowTilesTimeline(uint64_t rows, uint32_t D, uint32_t s, const RowPipe& pp, const HardwareModel& hw,
                                                const dsa::MemorySystem& mem, double bound = std::numeric_limits<double>::infinity()) {
         using I = DaeIsa;
-        const double L = hw.LatencyCycles(), lbw = dsa::LOCAL_BYTES_PER_CYCLE;
-        const uint32_t d = pp.depth, od = pp.outDepth, R = static_cast<uint32_t>(rows), B = pp.B;
+        const double L = hw.LatencyCycles();
+        const uint32_t d = pp.depth, od = pp.outDepth, R = static_cast<uint32_t>(rows), B = pp.B, W = RowPitch(D, s);
         RowTimeline out{std::numeric_limits<double>::infinity(), 0.0, 0.0};
         if (od < 1 || od > 4) return out;
         // The core's tiles, as RowSchedule cuts them: [head] [B x body] [partial] [tail]
         const uint32_t head = pp.head && pp.head < R ? pp.head : 0, rest = R - head;
         const uint32_t tail = pp.tail && rest > pp.tail ? pp.tail : 0;
         const uint32_t body = (rest - tail) / B, partial = (rest - tail) % B;
-        auto tileVector = [&](uint32_t k) { return k ? TileCycles(k, D, s, pp.rep, nullptr, pp.lanes) : 0; };
-        auto tileBytes = [&](uint32_t k) { return static_cast<double>(Align32(uint64_t(k) * D * s)); };
+        auto tileVector = [&](uint32_t k) { return k ? RowTileCycles(k, W, s) : 0; };
+        auto tileBytes = [&](uint32_t k) { return static_cast<double>(uint64_t(k) * W * s); };  // Rows on the 32-byte grid
         auto tileChannel = [&](uint32_t k) { return mem.Cycles(tileBytes(k)); };  // One tile's transfer on the channel
-        const uint64_t zBytes = RowLayout(B, D, s, pp.rep, d, od).z, stage = std::max<uint64_t>(TMP_BYTES, zBytes);
+        const uint64_t zBytes = RowLayout(B, D, s, d, od).z, stage = std::max<uint64_t>(TMP_BYTES, zBytes);
         const bool staged = s == 4 || 2ull * Align32(uint64_t(D) * s) <= stage;
         const uint64_t chunk = TMP_BYTES / s;  // Unstaged 16-bit parameters: scratch-sized pieces
         double paramChannel = 0;
@@ -592,7 +661,7 @@ public:
         if (std::max(L + vectorLeft + tileChannel(last) + L, channelLeft + L) >= bound) return out;
 
         const RowSchedule tiles{0, R, B, pp.head, pp.tail};
-        double ch = 0, vec = 0, local = 0, loads = 0, stores = 0;
+        double ch = 0, vec = 0, loads = 0, stores = 0;
         double land1[4] = {}, land2[4] = {}, x1Read[4] = {};  // Per input buffer: landed; X1 read by the tile's first instruction
         double yFree[4] = {};                                  // Per egress buffer: its last store streamed out
         // X2 of the tile a buffer last held is read a scratch chunk at a time: a smaller tile
@@ -621,7 +690,7 @@ public:
         };
         auto load2 = [&] {
             const uint32_t k = tiles.Rows(next2), slot = static_cast<uint32_t>(n2++ % d);
-            land2[slot] = transfer(x2Free(slot, uint64_t(k) * D), tileBytes(k));
+            land2[slot] = transfer(x2Free(slot, uint64_t(k) * W), tileBytes(k));
             loads = std::max(loads, land2[slot]);
             next2 += k;
         };
@@ -647,10 +716,10 @@ public:
             load1();
             load2();
         }
-        double readyG = landG, readyB = landB;  // gamma / beta row 0 widened in par
+        double readyG = landG, readyB = landB;  // gamma / beta widened in par
         if (s < 4 && staged) {
-            readyG = compute(landG, I::Op(D));
-            readyB = compute(landB, I::Op(D));
+            readyG = compute(landG, I::Op(W));
+            readyB = compute(landB, I::Op(W));
         } else if (s < 4) {  // Scratch-sized pieces, each loaded once the previous one is widened
             double tmpFree = 0;
             for (int k = 0; k < 2; ++k) {
@@ -658,27 +727,21 @@ public:
                     const uint64_t m = std::min<uint64_t>(chunk, D - o);
                     const double landed = transfer(tmpFree, Align32(m * s));
                     loads = std::max(loads, landed);
-                    tmpFree = compute(landed, I::Op(m));
+                    tmpFree = compute(landed, I::Op(Align32(m * s) / s));
                 }
                 (k == 0 ? readyG : readyB) = vec;
             }
         }
-        // Rows [1, rep) by doubling local copies; copied[j]: rows [0, 2^(j+1)) are in place
-        double copiedG[32], copiedB[32];
-        auto replicate = [&](double ready, double* copied) {
-            uint32_t j = 0;
-            for (uint32_t h = 1; h < pp.rep; h *= 2, ++j) {
-                local = std::max(local, ready) + static_cast<double>(std::min(h, pp.rep - h)) * D * 4 / lbw;
-                copied[j] = ready = local;
+        // The groups of a tile once its Z is built: each group's inverse RMS, then gamma and beta,
+        // each once its parameter row is in place
+        auto groups = [&](double t, uint32_t k) {
+            for (uint32_t g = 0; g < k; g += ROW_GROUP) {
+                const uint32_t n = std::min<uint32_t>(ROW_GROUP, k - g);
+                const double op = static_cast<double>(RowOpCycles(n, W, false));
+                t = std::max(t + static_cast<double>(GroupNormCycles(n, W, s)), readyG) + op;
+                t = std::max(t, readyB) + op;
             }
-        };
-        replicate(readyG, copiedG);
-        replicate(readyB, copiedB);
-        // Rows [0, n) of a parameter block in place: a tile applies min(rep, k) rows at once
-        auto rowsReady = [&](double ready, const double* copied, uint32_t n) {
-            uint32_t j = 0;
-            for (uint32_t h = 1; h < pp.rep && h < n; h *= 2, ++j) ready = copied[j];
-            return ready;
+            return t;
         };
         // Steady-state detection: snapshots of the state, rotated to the next tile's buffers
         constexpr uint32_t HIST = 8;
@@ -702,16 +765,12 @@ public:
         };
         for (uint32_t row = 0; row < R;) {
             const uint32_t k = tiles.Rows(row), slot = static_cast<uint32_t>(done % d), ys = static_cast<uint32_t>(done % od);
-            const uint64_t e = uint64_t(k) * D, C = TileCycles(k, D, s, pp.rep, nullptr, pp.lanes);
-            // gamma, then beta, each once the rows its first instruction reads are in place
-            const uint64_t A = AffineCycles(k, D, pp.rep);
-            const double parG = rowsReady(readyG, copiedG, std::min(pp.rep, k)), parB = rowsReady(readyB, copiedB, std::min(pp.rep, k));
-            auto affine = [&](double scaled) { return std::max(std::max(scaled, parG) + A, parB) + A; };
+            const uint64_t e = uint64_t(k) * W, C = RowTileCycles(k, W, s);
             if (s == 4) {  // Z = X1 + X2 straight into the egress buffer, once its last store streamed out
                 const double start = std::max({vec, land1[slot], land2[slot], yFree[ys]});
                 x1Read[slot] = x2Read[slot][0] = start + I::Op(e);  // X1 and X2 are read by the add, all at once
                 x2Chunks[slot] = 1;
-                vec = affine(start + static_cast<double>(C - 2 * A));  // Z, squares, row sums and scaling first
+                vec = groups(start + static_cast<double>(I::Op(e)), k);
             } else {
                 const double start = std::max(vec, land1[slot]), x2 = std::max(start + I::Op(e), land2[slot]);
                 x1Read[slot] = start + I::Op(e);  // X1 is read by its widening into Z
@@ -723,10 +782,8 @@ public:
                     else x2Read[slot][CHUNKS - 1] = x2 + phase + I::Op(m);
                     phase += 2.0 * I::Op(m);
                 }
-                // Squares, row sums and scaling, gamma and beta, then the narrowing into the egress
-                // buffer once its last store streamed out
-                const double scaled = x2 + static_cast<double>(C - 2 * I::Op(e) - 2 * A);
-                vec = std::max(affine(scaled), yFree[ys]) + static_cast<double>(I::Op(e));
+                // The groups, then the narrowing into the egress buffer once its last store streamed out
+                vec = std::max(groups(x2 + phase, k), yFree[ys]) + static_cast<double>(I::Op(e));
             }
             out.vector += static_cast<double>(C);
             vectorLeft -= C;
@@ -783,7 +840,7 @@ public:
                 break;
             }
         }
-        out.finish = std::max({vec, ch, local, loads, stores});
+        out.finish = std::max({vec, ch, loads, stores});
         return out;
     }
 
@@ -793,17 +850,16 @@ public:
     // record; phase 2 gathers the records, scales the resident Z, applies gamma and beta, narrows
     // (16-bit) or copies (FP32) each tile into the next egress buffer and stores it row by row.
     struct BandPipe {
-        uint32_t k, rep, depth;  // Tile rows, replicated parameter rows, tiles in flight
-        uint32_t outDepth;       // Egress buffers (VECOUT), 1 or 2
+        uint32_t k, depth;  // Tile rows (a multiple of 8, or every row), tiles in flight
+        uint32_t outDepth;  // Egress buffers (VECOUT), 1 or 2
     };
     static inline RowTimeline BandTimeline(const TilingConfig& cfg, uint32_t M, uint32_t D, uint32_t s, uint32_t pitch,
                                            const BandPipe& bp, const HardwareModel& hw,
                                            double bound = std::numeric_limits<double>::infinity()) {
         using I = DaeIsa;
-        const double L = hw.LatencyCycles(), lbw = dsa::LOCAL_BYTES_PER_CYCLE;
+        const double L = hw.LatencyCycles();
         const dsa::MemorySystem mem = Memory(cfg, M, D, s);
         const uint32_t q = QuantumElems(s, hw), R = RecordFloats(cfg, M), nb = cfg.blocks;
-        const uint32_t per = TMP_FLOATS / pitch;  // Band rows whose squares fit the scratch chunk
         RowTimeline out{0.0, 0.0, 0.0};
         double arrive[MAX_THREADS] = {}, phase1[MAX_THREADS] = {};  // Per core: SyncAll arrival, phase-1 vector cycles
         uint32_t lens[4096], offs[4096];
@@ -820,7 +876,7 @@ public:
                 lens[i] = cb < ce ? ce - cb : 0;
                 offs[i] = cb < ce ? cb - c0 : 0;
             }
-            double ch = 0, vec = 0, local = 0, cycles = 0, dma = 0;
+            double ch = 0, vec = 0, cycles = 0, dma = 0;
             double free1[4] = {};                       // Per buffer: when X1's last read ended
             double x2Read[4][64] = {};                  // Per buffer: X2 read ends, a scratch chunk at a time
             uint32_t x2Chunks[4] = {};
@@ -853,21 +909,11 @@ public:
             landG = transfer(0, Align32(uint64_t(w) * s));
             landB = transfer(0, Align32(uint64_t(w) * s));
             for (uint32_t i = 1; i < bp.depth && loaded < M; ++i) load();
-            // gamma and beta are widened and replicated now, used after SyncAll (which waits for the copies)
-            double readyG = landG, readyB = landB;
+            // gamma and beta are widened now, used after SyncAll
             if (s < 4) {
-                readyG = compute(landG, I::Op(w));
-                readyB = compute(landB, I::Op(w));
+                compute(landG, I::Op(w));
+                compute(landB, I::Op(w));
             }
-            auto replicate = [&](double ready) {
-                for (uint32_t h = 1; h < bp.rep; h *= 2) {
-                    local = std::max(local, ready) + static_cast<double>(std::min(h, bp.rep - h)) * pitch * 4 / lbw;
-                    ready = local;
-                }
-            };
-            replicate(readyG);
-            replicate(readyB);
-            compute(0, I::Fill(R));  // The record, zeroed
             uint32_t tile = 0;
             for (uint32_t row = 0; row < M; row += bp.k, ++tile) {
                 const uint32_t k = std::min(bp.k, M - row), slot = tile % bp.depth;
@@ -892,13 +938,11 @@ public:
                         compute(0, I::Op(m));
                     }
                 }
+                // Per group: the partials of the band rows' own columns, and the fold that packs their sums
+                // into the record
                 for (uint32_t g = 0; g < k; g += ROW_GROUP) {
-                    const uint32_t end = std::min(k, g + ROW_GROUP);
-                    for (uint32_t r0 = g; r0 < end; r0 += per) {
-                        const uint32_t m = std::min(per, end - r0);
-                        compute(0, I::Op(uint64_t(m) * pitch));
-                        for (uint32_t i = r0; i < r0 + m; ++i) if (lens[row + i]) compute(0, I::Reduce(lens[row + i]));
-                    }
+                    const uint32_t n = std::min(k - g, ROW_GROUP);
+                    compute(0, BandPartialCycles(lens + row + g, n, pitch) + I::FoldReps(CeilDiv(n, 8)));
                 }
                 if (loaded < M) load();
             }
@@ -906,7 +950,7 @@ public:
             const double start = std::max(ch, vec);
             ch = start + mem.Cycles(R * 4.0);
             dma += mem.Cycles(R * 4.0);
-            arrive[t] = std::max({vec, local, ch + L});
+            arrive[t] = std::max(vec, ch + L);
             phase1[t] = cycles;
             out.dma = std::max(out.dma, dma);
             if (arrive[t] >= bound) return out.finish = std::numeric_limits<double>::infinity(), out;
@@ -941,9 +985,11 @@ public:
             for (uint32_t row = 0; row < M; row += bp.k, ++tile) {
                 const uint32_t k = std::min(bp.k, M - row);
                 const uint64_t e = uint64_t(k) * pitch;
-                for (uint32_t i = 0; i < k; ++i) compute(0, I::Reduce(1));
-                for (uint32_t i = 0; i < k; ++i) if (lens[row + i]) compute(0, I::kInvRms + I::Op(lens[row + i]));
-                compute(0, 2 * AffineCycles(k, pitch, bp.rep));  // gamma, beta
+                // Per group: the lane chain on the totals, the Brcb, the scaling, gamma and beta
+                for (uint32_t g = 0; g < k; g += ROW_GROUP) {
+                    const uint64_t n = std::min(k - g, ROW_GROUP);
+                    compute(0, LaneRmsCycles(n, s) + I::Brcb(CeilDiv(n, 8)) + RowOpCycles(n, pitch, true) + 2 * RowOpCycles(n, pitch, false));
+                }
                 // Tiles rotate through the egress buffers; the narrowing (16-bit) or copy (FP32)
                 // waits until the rows it overwrites have streamed out
                 const uint32_t buf = tile % od;
@@ -967,6 +1013,11 @@ public:
         out.finish = worst;
         return out;
     }
+
+    // Resident Z of a segment starting at element `start`: its first tile at the segment's base, every
+    // later tile on the 32-byte grid, like its system-memory address (a vector operand starts a block),
+    // so the segment takes up to q - 1 more elements than it has
+    static constexpr uint64_t ResidentNeed(uint64_t start, uint64_t len, uint32_t q) { return len + (q - start % q) % q; }
 
     // Timeline of column tiles (row-major Split-D fragments, and rows too long for a row tile),
     // mirroring ColumnPhase1 / SyncAll / ColumnPhase2 with their Sweep1 / Sweep2 for every core.
@@ -1038,13 +1089,8 @@ public:
             a.ReadAll(Compute(a.land, DaeIsa::Op(n)));
             Combine(bt, n);
         }
-        void SquareSums(uint64_t n) {
-            for (uint64_t o = 0; o < n; o += TMP_FLOATS) {
-                const uint64_t m = std::min<uint64_t>(TMP_FLOATS, n - o);
-                Compute(0, DaeIsa::Op(m) + DaeIsa::ReduceRuns(1, m));
-            }
-        }
-        // Sweep 1 over [start, end): X1 and X2 of tile j+1 load before tile j computes
+        // Sweep 1 over [start, end): X1 and X2 of tile j+1 load before tile j computes; each tile's
+        // sum of squares goes into the segment's slot (RunSumCycles)
         void Sweep1(uint64_t start, uint64_t end) {
             uint32_t j = 0;
             uint64_t e = start;
@@ -1056,16 +1102,17 @@ public:
                 const uint32_t nn = next < end ? TileLength(next, end) : 0, slot = j % 2;
                 if (nn) load((j + 1) % 2, nn);
                 AddInputs(x1[slot], x2[slot], n);
-                SquareSums(n);
+                Compute(0, RunSumCycles(n, j == 0));
                 e = next, n = nn, ++j;
             }
         }
+        // A segment's inverse RMS from its slot, spread by one Brcb (Core::SegmentInvRms)
+        void SegmentInvRms() { Compute(0, LaneRmsCycles(1, s) + DaeIsa::Brcb(1)); }
         // The gamma and beta chunks of a tile: loaded as a pair, applied in turn (* gamma + beta)
         void LoadParams(uint32_t slot, uint64_t n) { Load(g[slot], n), Load(b[slot], n); }
         void UseParams(uint32_t slot, uint64_t n) { Combine(g[slot], n), Combine(b[slot], n); }
         // Sweep 2 from resident Z: gamma/beta pairs stream (the first may be in flight: `primed`)
         void Sweep2Resident(uint64_t start, uint64_t end, bool primed) {
-            Compute(0, DaeIsa::kInvRms);
             uint32_t j = 0;
             uint64_t e = start;
             uint32_t n = start < end ? TileLength(start, end) : 0;
@@ -1074,7 +1121,7 @@ public:
                 const uint64_t next = e + n;
                 const uint32_t nn = next < end ? TileLength(next, end) : 0, slot = j % 2;
                 if (nn) LoadParams((j + 1) % 2, nn);
-                Compute(0, DaeIsa::Op(n));  // Muls
+                Compute(0, BlockMulCycles(n));  // * invRms
                 UseParams(slot, n);
                 Buffer& out = y[yNext++ % 2];
                 Compute(out.FreeFor(n), DaeIsa::Op(n));  // Narrow into the egress buffer once its last store streamed out
@@ -1084,7 +1131,6 @@ public:
         }
         // Sweep 2 recomputing Z: X1, X2 and the gamma/beta pair of tile j+1 load before tile j computes
         void Sweep2Recompute(uint64_t start, uint64_t end) {
-            Compute(0, DaeIsa::kInvRms);
             uint32_t j = 0;
             uint64_t e = start;
             uint32_t n = start < end ? TileLength(start, end) : 0;
@@ -1095,7 +1141,7 @@ public:
                 const uint32_t nn = next < end ? TileLength(next, end) : 0, slot = j % 2;
                 if (nn) load((j + 1) % 2, nn);
                 AddInputs(x1[slot], x2[slot], n);
-                Compute(0, DaeIsa::Op(n));  // Muls
+                Compute(0, BlockMulCycles(n));  // * invRms
                 UseParams(slot, n);
                 Buffer& out = y[yNext++ % 2];
                 Compute(out.FreeFor(n), DaeIsa::Op(n));  // Narrow into the egress buffer once its last store streamed out
@@ -1131,21 +1177,22 @@ public:
             uint64_t used = 0;
             for (uint32_t k = 0; k < r.nFrag; ++k) {
                 const CoreRange::Fragment& f = r.frag[k];
-                const uint64_t len = f.ce - f.cb;
-                fragResident[t][k] = cfg.zResident && used + len <= cfg.zResident;
-                if (fragResident[t][k]) used += len;
+                const uint64_t need = ResidentNeed(uint64_t(f.row) * D + f.cb, f.ce - f.cb, q);
+                fragResident[t][k] = cfg.zResident && used + need <= cfg.zResident;
+                if (fragResident[t][k]) used = (used + need + q - 1) / q * q;
                 c.Sweep1(uint64_t(f.row) * D + f.cb, uint64_t(f.row) * D + f.ce);
             }
-            if (split) {  // The core's two records, zeroed and filled, go out
-                c.Compute(0, DaeIsa::Fill(16));
+            if (split) {  // The core's two records {sum, 0 x7}, built in VECOUT from the slots' lanes 0, go out
+                c.Compute(0, DaeIsa::Fill(16) + r.nFrag * DaeIsa::Op(1));
                 const double start = std::max(c.ch, c.vec);
                 c.ch = start + mem.Cycles(64.0);
                 c.dma += mem.Cycles(64.0);
                 c.stores = std::max(c.stores, c.ch + c.L);
             }
             for (uint32_t row = r.rowA; row < r.rowZ; ++row) {
-                const bool fits = cfg.zResident && used + D <= cfg.zResident;
+                const bool fits = cfg.zResident && used + ResidentNeed(uint64_t(row) * D, D, q) <= cfg.zResident;
                 c.Sweep1(uint64_t(row) * D, uint64_t(row + 1) * D);
+                c.SegmentInvRms();
                 if (fits) c.Sweep2Resident(uint64_t(row) * D, uint64_t(row + 1) * D, false);
                 else c.Sweep2Recompute(uint64_t(row) * D, uint64_t(row + 1) * D);
                 if (std::max(c.vec, c.ch) >= bound) return out.finish = std::numeric_limits<double>::infinity(), out;
@@ -1172,7 +1219,10 @@ public:
                     const uint32_t lo = 2 * first + std::max(1u, Range(cfg, M, D, first, nb).nFrag) - 1, count = 2 * last - lo + 1;
                     const double landed = c.Transfer(recsRead, count * 32.0);
                     c.loads = std::max(c.loads, landed);
-                    recsRead = c.Compute(landed, DaeIsa::Reduce(count * 8ull));
+                    const uint64_t n = count * 8ull, padded = LanePad(n);  // The records, zero-padded to whole repeats
+                    if (padded != n) c.Compute(0, DaeIsa::Fill(padded - n));
+                    recsRead = c.Compute(landed, DaeIsa::Reduce(padded));
+                    c.SegmentInvRms();
                     const uint64_t a = uint64_t(f.row) * D + f.cb, z = uint64_t(f.row) * D + f.ce;
                     if (fragResident[t][k]) c.Sweep2Resident(a, z, k == 0);
                     else c.Sweep2Recompute(a, z);
@@ -1192,105 +1242,25 @@ public:
         const RowTimeline t = BandTimeline(cfg, M, D, s, cfg.pitch, bp, hw);
         cfg.tileRows = bp.k;
         cfg.tileElems = bp.k * cfg.pitch;
-        cfg.repRows = bp.rep;
-        cfg.layout = BandLayout(bp.k, cfg.pitch, M, s, bp.rep, cfg.layout.misc, cfg.layout.rec, bp.depth, bp.outDepth);
+        cfg.layout = BandLayout(bp.k, cfg.pitch, M, s, cfg.layout.misc, cfg.layout.rec, bp.depth, bp.outDepth);
         SetModel(cfg, t.finish, t.vector, hw);
-    }
-
-    // -------------------------------------------------------------------------
-    // Direct kernel [ARCH CHALLENGE 8]. A core runs its rows in one shot from static scratchpad
-    // buffers (LocalMemAllocator: no queue, no sequencer): scoreboard event flags order the pipes,
-    // each row's squares are zero-padded to whole 64-lane repeats for ReduceSum, and the inverse RMS
-    // stays in the vector unit (Rsqrt, Newton-Raphson, Brcb) instead of crossing to the scalar unit.
-    // It first served shares that fit DIRECT_BYTES because a TQue lifecycle step costs the queue
-    // sequencer 625 cycles, ten per row tile. Row tiles now use static rings too (no step at all),
-    // so the planner runs the direct kernel only where its timeline finishes first.
-    //
-    // Timeline of a core with k rows, replaying DirectCore::Run with dsa::CoreTimeline's rules:
-    // the loads stream back to back (X1, X2, gamma, beta), the vector unit waits for each input
-    // as it lands, and the store follows the last vector instruction. The zero padding has no
-    // operand to wait for: it runs under the DMA latency.
-    // -------------------------------------------------------------------------
-    static inline RowTimeline DirectTimeline(uint64_t k, uint32_t D, uint32_t s, const HardwareModel& hw, const dsa::MemorySystem& mem) {
-        using I = DaeIsa;
-        const double L = hw.LatencyCycles();
-        const uint64_t n = k * D, padded = LanePad(D);
-        // * gamma and + beta: one strided instruction for all rows when FP32 rows are whole 32-byte
-        // blocks (the repeat stride counts blocks), else one per row
-        const uint64_t perRow = D % 8 == 0 ? I::Op(n) : k * I::Op(D);
-        RowTimeline out{0.0, 0.0, 0.0};
-        double ch = 0, vec = 0;
-        auto load = [&](uint64_t bytes) {
-            const double occupied = mem.Cycles(Align32(bytes));
-            ch += occupied;
-            out.dma += occupied;
-            return ch + L;
-        };
-        auto compute = [&](double ready, uint64_t cycles) {
-            vec = std::max(vec, ready) + static_cast<double>(cycles);
-            out.vector += static_cast<double>(cycles);
-        };
-        if (padded != D) compute(0, I::Fill(k * padded));  // Zero padding of the squares
-        const double x1 = load(n * s), x2 = load(n * s), gamma = load(uint64_t(D) * s), beta = load(uint64_t(D) * s);
-        if (s == 4) {
-            compute(std::max(x1, x2), I::Op(n));  // Z = X1 + X2
-        } else {
-            compute(x1, I::Op(n));                // Widen X1 into Z
-            compute(x2, I::Op(n));                // Widen X2
-            compute(0, I::Op(n));                 // Z += X2
-        }
-        compute(0, padded == D ? I::Op(n) : k * I::Op(D));  // Squares
-        compute(0, k * I::Reduce(padded));                  // ReduceSum per row
-        compute(0, LaneRmsCycles(k, s));                    // mean = sum * invD + eps, Rsqrt, Newton-Raphson
-        compute(0, k * (I::Brcb(padded / LANES) + I::Op(D)));  // Broadcast and scale, per row
-        compute(gamma, (s < 4 ? I::Op(D) : 0) + perRow);    // (Widen gamma), * gamma
-        compute(beta, (s < 4 ? I::Op(D) : 0) + perRow);     // (Widen beta), + beta
-        if (s < 4) compute(0, I::Op(n));                    // Narrow into the egress buffer
-        const double occupied = mem.Cycles(Align32(n * s)), start = std::max(ch, vec);
-        ch = start + occupied;
-        out.dma += occupied;
-        out.finish = ch + L;
-        return out;
-    }
-
-    // A direct plan: every core with rows runs them in one shot. The core with the most rows is the
-    // slowest (the timeline grows with the rows), so its time and vector cycles are the plan's.
-    static inline void ApplyDirect(TilingConfig& cfg, uint32_t M, uint32_t D, uint32_t s, const HardwareModel& hw) {
-        uint32_t most = 0;
-        for (uint32_t t = 0; t < cfg.blocks; ++t) {
-            const CoreRange r = Range(cfg, M, D, t, cfg.blocks);
-            most = std::max(most, r.rowZ - r.rowA);
-        }
-        const RowTimeline x = DirectTimeline(most, D, s, hw, Memory(cfg, M, D, s));
-        cfg.direct = true;
-        cfg.tileRows = most;
-        cfg.tileElems = most * D;
-        cfg.headRows = cfg.tailRows = 0;
-        cfg.pitch = D;
-        cfg.repRows = 1;
-        cfg.paramsFirst = cfg.earlyLoads = cfg.laneRms = false;
-        cfg.zResident = 0;
-        cfg.layout = DirectLayout(s);
-        SetModel(cfg, x.finish, x.vector, hw);
     }
 
 private:
     // -------------------------------------------------------------------------
     // (3) DAE tiles [ARCH CHALLENGE 2/3, pipeline bubbles]. Every candidate schedule is replayed
-    // on the timeline models above (RowTilesTimeline, BandTimeline, ColumnTimeline;
-    // DirectTimeline for direct shares), which equal the runtime's timeline cycle for cycle, and
-    // the one whose slowest core finishes first wins.
+    // on the timeline models above (RowTilesTimeline, BandTimeline, ColumnTimeline), which equal
+    // the runtime's timeline cycle for cycle, and the one whose slowest core finishes first wins.
     // The 191 KB layout bounds each candidate (the Challenge 2 knapsack):
-    //   direct        a share of at most DIRECT_BYTES per tensor: static buffers (Challenge 8)
-    //   row tiles     depth x 2 x B D s bytes of X1/X2 tiles, outDepth x B D s of egress buffers,
-    //                 4 B D more for the FP32 Z tile at 16 bits, the replicated gamma/beta and the
-    //                 9 KB scratch (the 8 KB chunk and its fold partition; 1.5 KB more of lanes
-    //                 when the inverse RMS runs in lanes)
+    //   row tiles     depth x 2 x B W s bytes of X1/X2 tiles (W = RowPitch), outDepth x B W s of
+    //                 egress buffers, 4 B W more for the FP32 Z tile at 16 bits, gamma/beta (one
+    //                 FP32 row each) and the scratch buffer (the chunk, its fold and the reduction
+    //                 partitions)
     // No candidate takes a queue step: X1, X2, gamma/beta chunks and egress buffers are static rings.
     //   column band   k rows at the band pitch, the band's FP32 Z resident across the barrier
     //   column tiles  (10s + 4) bytes per element (X1, X2, gamma and beta chunks, egress, each
     //                 twice; FP32 Z), plus the resident FP32 Z
-    // modelNs is the slowest core's finish time; modelCycles its vector cycles.
+    // modelNs is the kernel launch and the slowest core's finish time; modelCycles its vector cycles.
     // -------------------------------------------------------------------------
     // `bound`: the modeled cycles a plan has to beat (a plan that cannot keeps modelNs = infinity)
     static inline void PlanTiles(TilingConfig& cfg, uint32_t M, uint32_t D, uint32_t s, const HardwareModel& hw, double bound) {
@@ -1301,83 +1271,60 @@ private:
         PlanColumnTiles(cfg, M, D, s, hw, bound);
     }
 
-    // Row tiles: whole rows per tile, gamma/beta resident and replicated `rep` rows. The plan is
-    // the one whose modeled timeline (RowTilesTimeline) finishes first, over
+    // Row tiles: whole rows per tile at RowPitch, gamma/beta resident. The plan is the one whose
+    // modeled timeline (RowTilesTimeline) finishes first, over
     //   depth         2-4 tiles in flight per input queue: deeper queues hide DMA latency, at
     //                 the price of smaller tiles in the same 191 KB
     //   outDepth      1-2 egress buffers: a second lets a result stream out while the next is
     //                 written
-    //   rep           replicated gamma/beta rows (fewer vector instructions, more scratchpad)
     //   B             body tile rows, up to the largest the layout admits (Challenge 2 knapsack)
     //   head, tail    a small first tile starts the vector unit sooner (prologue fill), a small
     //                 last tile finishes the final store sooner (epilogue drain)
     //   issue order   gamma/beta before tile 0; X1/X2 of a later tile as soon as the tile's Z
     //                 is built (both buffers are free then) rather than after its store
-    //   lanes         each row group's inverse RMS in vector lanes, applied a scratch chunk of
-    //                 rows at a time: fewer instructions per row, a chain of them per group
-    // Every busy core holds the same rows up to one unit, so the busiest one is
-    // ceil(MaxLoad / D) rows.
+    // Every busy core holds the same rows up to one, so the busiest one is ceil(MaxLoad / D) rows.
     static inline bool PlanRowTiles(TilingConfig& cfg, uint32_t M, uint32_t D, uint32_t s, const HardwareModel& hw, double bound) {
         const uint64_t total = static_cast<uint64_t>(M) * D;
         const uint64_t rows = (MaxLoad(total, cfg.unitElems, cfg.blocks) + D - 1) / D;
-        // A share that fits the direct kernel's static buffers [ARCH CHALLENGE 8] is a candidate too.
-        // Neither kernel takes a queue step (both use static buffers), so the direct kernel runs only
-        // where it finishes first: its time is the bound the row tiles below have to beat.
-        const double outer = bound;
         const dsa::MemorySystem mem = Memory(cfg, M, D, s);
-        TilingConfig direct{};
-        const bool directFits = DirectFits(rows, D, s);
-        if (directFits) {
-            direct = cfg;
-            ApplyDirect(direct, M, D, s, hw);
-            bound = std::min(bound, direct.modelFinish);
-        }
-        const uint32_t p = static_cast<uint32_t>(RowUnit(D, s, hw) / D);
-        const uint32_t repMax = D % 8 == 0 ? std::max<uint32_t>(1, REP_FLOATS / D) : 1;  // 32-byte FP32 rows
-        const uint32_t most = static_cast<uint32_t>((rows + p - 1) / p * p);             // Rows worth one tile
-        // Stage 1: depth, replication and body size, plain issue order; the best few go on
+        const uint32_t most = static_cast<uint32_t>(rows);  // Rows worth one tile
+        // Stage 1: depth and body size, plain issue order; the best few go on
         constexpr uint32_t KEEP = 8;
         struct Found { double finish; RowPipe pp; } top[KEEP];
         for (Found& f : top) f.finish = std::numeric_limits<double>::infinity();
         bool fits = false;
         for (uint32_t depth = 2; depth <= 4; ++depth) {
             for (const uint32_t outDepth : {1u, 2u}) {
-                for (const uint32_t repChoice : {repMax, 1u}) {
-                    for (const bool lanes : {false, true}) {
-                        if (lanes && D > TMP_FLOATS) break;  // Lanes scale rows through the scratch chunk
-                        uint32_t cap = 0;  // The largest body tile the layout admits (binary search over row units)
-                        for (uint32_t lo = 1, hi = most / p; lo <= hi;) {
-                            const uint32_t mid = lo + (hi - lo) / 2, B = mid * p;
-                            if (RowLayout(B, D, s, std::min(repChoice, B), depth, outDepth, lanes).Total() <= hw.spmBytes) cap = B, lo = mid + 1;
-                            else hi = mid - 1;
-                        }
-                        if (cap) fits = true;
-                        for (uint32_t B = p; cap && B <= cap; B = B < 48 * p ? B + p : std::max(B + p, std::min(cap, B * 9 / 8 / p * p))) {
-                            const RowPipe pp{B, 0, 0, std::min(repChoice, B), depth, outDepth, false, false, lanes};
-                            const double f = RowTilesTimeline(rows, D, s, pp, hw, mem, std::min(bound, top[KEEP - 1].finish) * 1.05).finish;
-                            for (uint32_t i = 0; i < KEEP; ++i) {
-                                if (f < top[i].finish) {
-                                    for (uint32_t j = KEEP - 1; j > i; --j) top[j] = top[j - 1];
-                                    top[i] = {f, pp};
-                                    break;
-                                }
-                            }
-                            if (B == cap) break;
+                uint32_t cap = 0;  // The largest body tile the layout admits (binary search over rows)
+                for (uint32_t lo = 1, hi = most; lo <= hi;) {
+                    const uint32_t mid = lo + (hi - lo) / 2;
+                    if (RowLayout(mid, D, s, depth, outDepth).Total() <= hw.spmBytes) cap = mid, lo = mid + 1;
+                    else hi = mid - 1;
+                }
+                if (cap) fits = true;
+                for (uint32_t B = 1; cap && B <= cap; B = B < 48 ? B + 1 : std::max(B + 1, std::min(cap, B * 9 / 8))) {
+                    const RowPipe pp{B, 0, 0, depth, outDepth, false, false};
+                    const double f = RowTilesTimeline(rows, D, s, pp, hw, mem, std::min(bound, top[KEEP - 1].finish) * 1.05).finish;
+                    for (uint32_t i = 0; i < KEEP; ++i) {
+                        if (f < top[i].finish) {
+                            for (uint32_t j = KEEP - 1; j > i; --j) top[j] = top[j - 1];
+                            top[i] = {f, pp};
+                            break;
                         }
                     }
-                    if (repMax == 1) break;  // One replication choice only
+                    if (B == cap) break;
                 }
             }
         }
-        if (!fits && !directFits) return false;  // Not even one row unit fits: column tiles
+        if (!fits) return false;  // Not even one row fits: column tiles
         // Stage 2: head and tail tiles and issue order around the best few
         RowPipe best{};
         double bestTime = bound;
         for (const Found& f : top) {
             if (!std::isfinite(f.finish)) continue;
-            for (const uint32_t head : {0u, p, 2 * p, 4 * p, 8 * p}) {
+            for (const uint32_t head : {0u, 1u, 2u, 4u, 8u}) {
                 if (head && (head >= f.pp.B || head >= rows)) continue;
-                for (const uint32_t tail : {0u, p, 2 * p, 4 * p, 8 * p}) {
+                for (const uint32_t tail : {0u, 1u, 2u, 4u, 8u}) {
                     if (tail && (tail >= f.pp.B || tail >= rows)) continue;
                     for (const bool first : {false, true}) {
                         for (const bool early : {false, true}) {
@@ -1394,15 +1341,13 @@ private:
         for (int step : {-1, 1}) {
             if (!best.B) break;
             RowPipe pp = best;
-            pp.B = static_cast<uint32_t>(static_cast<int>(best.B) + step * static_cast<int>(p));
-            pp.rep = std::min(best.rep, pp.B);
-            if (!pp.B || pp.head >= pp.B || pp.tail >= pp.B || RowLayout(pp.B, D, s, pp.rep, pp.depth, pp.outDepth, pp.lanes).Total() > hw.spmBytes) continue;
+            pp.B = static_cast<uint32_t>(static_cast<int>(best.B) + step);
+            if (!pp.B || pp.head >= pp.B || pp.tail >= pp.B || RowLayout(pp.B, D, s, pp.depth, pp.outDepth).Total() > hw.spmBytes) continue;
             const double t = RowTilesTimeline(rows, D, s, pp, hw, mem, bestTime).finish;
             if (t < bestTime) bestTime = t, best = pp;
         }
-        if (!best.B) {  // No row tiles beat the bound: the direct kernel, if it beat the caller's
-            if (directFits && direct.modelFinish < outer) cfg = direct;
-            else cfg.modelNs = std::numeric_limits<double>::infinity();
+        if (!best.B) {  // No row tiles beat the bound
+            cfg.modelNs = std::numeric_limits<double>::infinity();
             return true;
         }
         ApplyRowPipe(cfg, M, D, s, hw, best);
@@ -1422,31 +1367,29 @@ private:
             const CoreRange r = Range(cfg, M, D, t, cfg.blocks);
             if (r.rowZ > r.rowA) widest = std::max(widest, BandEnd(r, q) - BandBegin(r, q));
         }
-        if (widest == 0 || widest > TMP_FLOATS) return;
+        if (widest == 0 || !StridedRows(widest)) return;  // Band rows take the strided form's column passes
         const uint32_t R = RecordFloats(cfg, M);
         const uint32_t misc = Align32(uint64_t(cfg.blocks) * R * 4), rec = Align32(uint64_t(R) * 4);  // Gathered; published
-        if (BandLayout(1, widest, M, s, 1, misc, rec).Total() > hw.spmBytes) return;
+        const uint32_t k0 = std::min(M, 8u);
+        if (BandLayout(k0, widest, M, s, misc, rec).Total() > hw.spmBytes) return;
         cfg.pitch = widest;
         cfg.zResident = M * widest;
-        cfg.layout = BandLayout(1, widest, M, s, 1, misc, rec);
-        // The band tile whose modeled timeline (BandTimeline) finishes first: k rows per tile
-        // (every count up to 16, then steps of ~12%), replicated parameter rows, tiles in
-        // flight, egress buffers
-        BandPipe best{1, 1, 2, 1};
+        cfg.layout = BandLayout(k0, widest, M, s, misc, rec);
+        // The band tile whose modeled timeline (BandTimeline) finishes first: k rows per tile, a
+        // multiple of 8 (a tile's packed row sums fill whole blocks of the record) or every row,
+        // tiles in flight, egress buffers
+        BandPipe best{k0, 2, 1};
         double bestTime = bound;
         for (uint32_t depth = 2; depth <= 4; ++depth) {
             for (const uint32_t outDepth : {1u, 2u}) {
-                for (uint32_t k = 1; k <= M; k = k < 16 ? k + 1 : std::max(k + 1, k * 9 / 8)) {
-                    const uint32_t repMax = std::max(1u, std::min(k, REP_FLOATS / widest));
-                    for (uint32_t rep = 1;; rep = std::min(repMax, rep * 2)) {
-                        if (BandLayout(k, widest, M, s, rep, misc, rec, depth, outDepth).Total() <= hw.spmBytes) {
-                            const double t = BandTimeline(cfg, M, D, s, widest, {k, rep, depth, outDepth}, hw, bestTime).finish;
-                            if (t < bestTime) bestTime = t, best = {k, rep, depth, outDepth};
-                        }
-                        if (rep == repMax) break;
+                for (uint32_t k = k0;;) {
+                    if (BandLayout(k, widest, M, s, misc, rec, depth, outDepth).Total() <= hw.spmBytes) {
+                        const double t = BandTimeline(cfg, M, D, s, widest, {k, depth, outDepth}, hw, bestTime).finish;
+                        if (t < bestTime) bestTime = t, best = {k, depth, outDepth};
                     }
                     if (k == M) break;
-                    if (k >= 16 && k * 9 / 8 > M && k < M) k = M - 1;  // Always try one tile of every row
+                    const uint32_t next = k < 128 ? k + 8 : (k * 9 / 8 + 7) / 8 * 8;
+                    k = next >= M ? M : next;  // Always try one tile of every row
                 }
             }
         }
@@ -1461,17 +1404,19 @@ private:
         const bool split = cfg.mode == TilingMode::SPLIT_D;
         const uint64_t L = MaxLoad(total, cfg.unitElems, cfg.blocks);
         const uint32_t q = QuantumElems(s, hw);
-        // Split-D records: every core's two 32-byte records gathered (VECCALC), this core's published (VECOUT)
-        const uint32_t misc = split ? Align32(16ull * cfg.blocks * 4) : 0u, rec = split ? 64u : 0u;
+        // Split-D records: every core's two 32-byte records gathered (VECCALC), with room to pad a row's
+        // run of them to whole 64-lane repeats; this core's published (VECOUT)
+        const uint32_t misc = split ? Align32(uint64_t(LanePad(16ull * cfg.blocks)) * 4) : 0u, rec = split ? 64u : 0u;
         cfg.tileRows = 0;
         cfg.pitch = D;
-        cfg.repRows = 0;
         // The tile (and resident Z) whose modeled timeline (ColumnTimeline) finishes first;
         // largest tiles first, so the best time so far cuts the others short
         TilingConfig best = cfg;
         RowTimeline bestTime{bound, 0.0, 0.0};
         const uint64_t longest = (std::min<uint64_t>(D, split ? L : D) + q - 1) / q * q;
-        for (const uint64_t resident : {split ? std::min<uint64_t>(L, 3ull * D) : uint64_t(D), uint64_t(0)}) {
+        // Resident Z: the segments of a core (split: two fragments and a row), with their alignment slack
+        const uint64_t most = split ? std::min<uint64_t>(L, 3ull * D) + uint64_t(3) * q : uint64_t(D) + q;
+        for (const uint64_t resident : {most, uint64_t(0)}) {
             uint64_t cap = 0;
             for (uint64_t lo = 1, hi = longest / q; lo <= hi;) {
                 const uint64_t mid = lo + (hi - lo) / 2;

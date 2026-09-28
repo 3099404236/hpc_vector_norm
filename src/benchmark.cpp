@@ -207,7 +207,7 @@ int main(int argc, char** argv) {
         else if (!fp.tileRows && fp.zResident) tile += " +Z";
         std::ostringstream row;
         row << std::left << std::setw(18) << tc.name
-            << std::setw(7) << (fp.direct ? "direct" : rows ? "rows" : fp.mode == hpc::TilingMode::SPLIT_D ? "split" : "band")
+            << std::setw(7) << (rows ? "rows" : fp.mode == hpc::TilingMode::SPLIT_D ? "split" : "band")
             << std::setw(6) << fp.blocks
             << std::setw(8) << (rows ? std::to_string(fp.unitElems / tc.D) + " row" : std::to_string(fp.unitElems * eb) + " B")
             << std::setw(22) << (std::to_string(busiest) + " (min " + std::to_string(std::min(busiest, lightest)) + ")")

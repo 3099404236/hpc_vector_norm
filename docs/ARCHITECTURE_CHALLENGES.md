@@ -11,6 +11,15 @@ Each challenge below has two solutions:
 
 Both come from the same planning equations in `src/adaptive_tiler.hpp`; only the machine constants differ (see [Cost Model & Methodology](#-cost-model--methodology)).
 
+> **Current state of the target solutions** (the README's implementation section has the details). The runtime now refuses the
+> API forms the target does not have ([`TARGET_API_SHAPE.md`](TARGET_API_SHAPE.md)) and models the target's semantics
+> ([`TARGET_MEASUREMENTS.md`](TARGET_MEASUREMENTS.md), section 6), and the DAE kernel was rewritten to both:
+>
+> - Global memory through `GlobalTensor` + `SetGlobalBuffer` only; `Cast` with a rounding mode; `half` / `bfloat16_t` device types; every buffer a `TBuf`.
+> - No `VectorReduceSum` and no `VectorInvRms`: row sums come from column-wise adds and two `BlockReduceSum` folds (7-argument form) into packed sums, the inverse RMS from `Rsqrt` and Newton-Raphson in lanes, spread by one `Brcb` per 8 rows (block broadcast) and applied by strided `Mul`s with `src1BlkStride` 0. `ReduceSum` is used only where lane 0 alone is read.
+> - The direct kernel (`DirectCore`, `LocalMemAllocator`), replicated γ/β (`rep`) and the lane option (`laneRms`) are gone: a share that fits one tile runs the row-tile kernel with one tile, and rows sit at a 32-byte `RowPitch` loaded by one multi-row `DataCopyPad` descriptor, so row units are one row for any width.
+> - Numbers below that name the original profiles P01–P15, the 1.5 GHz clock, the 800 ns DMA latency or those mechanisms describe the kernel of their time. The target benchmark is C1–C15, on the measured constants.
+
 ---
 
 ## 🎯 Challenge 1: Asymmetric 40-Thread Split-D Solver (Generalized Beyond Powers of 2)
@@ -182,6 +191,7 @@ Refactor the reduction tree and normalization pass to ensure:
 2. 100% vector instruction saturation (FMA instructions without branch jumps).
 
 ### ✅ 40-Core Target Implementation (DAE)
+- **Now** (target API shape): nothing reaches the scalar unit at all. A row group's squares are added column-wise to one 64-lane repeat (one strided `Add` per column for all rows of an 8 KB chunk; rows of whole repeats and at least 512 lanes fold 8 → 1 first), folded by `BlockReduceSum` into 8 partials per row and packed by a second fold; the group's inverse RMS runs in lanes, one `Brcb` per 8 rows spreads it, and one strided `Mul` per 64-lane column scales every row. The rest of this section describes the earlier kernel.
 - **No V→S stalls.** The scalar unit never reads the scratchpad (`GetValue`, 500 cycles). Row sums reach it through `VectorReduceSum`, and Split-D partials are combined by vector adds. Every executed plan in the tests has zero stalls.
 - **Few, long instructions.**
   - Every row costs three instructions: `VectorReduceSum`, `VectorInvRms` and `Muls`.
@@ -423,6 +433,7 @@ Empower the DAE execution framework to fully respect physical microarchitectural
 6. Adopt native `ToFloat` / `FromFloat` and `DataCopyExtParams` descriptors across all execution kernels.
 
 ### ✅ 40-Core Target Implementation (DAE)
+- **Since the target API shape** the direct kernel below is gone: `LocalMemAllocator` does not exist on the target, and a share that fits one tile runs the row-tile kernel, pipelined, with one tile. Its static buffer rings, scoreboard flags, flat launch and `DataCopyExtParams` descriptors remain; its reductions and broadcasts follow the target's semantics (see the note at the top).
 - **Direct kernel for single-tile shares (Objective 1).**
   - **Why.** A row tile took ten `TQue` lifecycle steps: `AllocTensor`, `EnQue`, `DeQue` and `FreeTensor` for each of X1 and X2, and `AllocTensor` and `FreeTensor` for its egress buffer. At 625 sequencer cycles each, that is 6,250 cycles. A share that fits one tile has no other tile to hide them behind. (The row tiles now take no step either: see the static buffer rings below.)
   - **Rule** (`AdaptiveTiler::DirectFits`, physical properties only). The busiest core's rows must take at most 1,024 B per tensor, and their squares, each row zero-padded to whole 64-lane repeats, must fit 1,024 floats. The tests plan all 8,026 tensors of at most 1,024 bytes, FP32 and 16-bit, and every one fits: none has more than 16 rows on a core or more than 1,024 padded squares. So does a larger tensor whose share per core is that small: 40 × 64 FP16 gives each core one 128-byte row, and P02 (7 × 200 FP32) one 800-byte row.

@@ -16,6 +16,11 @@ open, including designs nobody has tried here.
 
 ## What this changes for you right now
 
+> **Status:** resolved on this branch. The DAE kernel was rewritten to the target's
+> forms and compiles against this header; `ctest -R target_api_shape` compiles each
+> refused form below and requires its `static_assert`. The table records the state
+> before the rewrite.
+
 The current kernel sources will not compile against this header any more. That is
 the point: every error marks a place that was silently non-translatable. Measured
 on `src/kernel_unified.hpp` + `src/adaptive_tiler.hpp` before this change:

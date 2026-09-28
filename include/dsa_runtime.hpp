@@ -30,6 +30,8 @@
 #include <string>
 #include <stdexcept>
 #include <limits>
+#include <type_traits>
+#include <algorithm>
 #include <iostream>
 #include <iomanip>
 #include <omp.h>
@@ -58,29 +60,36 @@ namespace dsa {
 struct half {
     uint16_t data = 0;
     half() = default;
+    // Rounded to nearest-even, subnormals kept, past 65504 infinity: the target's CAST_RINT
     half(float f) {
         uint32_t x;
         std::memcpy(&x, &f, 4);
-        uint32_t sign = (x >> 16) & 0x8000;
-        int32_t exp = ((x >> 23) & 0xff) - 127 + 15;
-        uint32_t mant = (x >> 13) & 0x3ff;
-        if (exp <= 0) {
-            data = static_cast<uint16_t>(sign);
-        } else if (exp >= 31) {
-            data = static_cast<uint16_t>(sign | 0x7c00);
+        const uint32_t sign = (x >> 16) & 0x8000u, ax = x & 0x7FFFFFFFu;
+        if (ax >= 0x7F800000u) {  // Infinity, NaN
+            data = static_cast<uint16_t>(sign | (ax > 0x7F800000u ? 0x7E00u : 0x7C00u));
+        } else if (ax >= 0x477FF000u) {  // Rounds past the largest finite value
+            data = static_cast<uint16_t>(sign | 0x7C00u);
+        } else if (ax < 0x38800000u) {  // Subnormal: |f| / 2^-24, rounded to nearest-even
+            float a;
+            std::memcpy(&a, &ax, 4);
+            data = static_cast<uint16_t>(sign | static_cast<uint32_t>(std::nearbyint(a * 16777216.0f)));
         } else {
-            data = static_cast<uint16_t>(sign | (exp << 10) | mant);
+            const uint32_t mant = ax & 0x7FFFFFu, rem = mant & 0x1FFFu;
+            uint32_t h = (((ax >> 23) - 127 + 15) << 10) | (mant >> 13);
+            if (rem > 0x1000u || (rem == 0x1000u && (h & 1u))) ++h;  // A carry rolls into the exponent
+            data = static_cast<uint16_t>(sign | h);
         }
     }
     operator float() const {
         uint32_t sign = (data & 0x8000) << 16;
         int32_t exp = (data >> 10) & 0x1f;
         uint32_t mant = (data & 0x3ff) << 13;
-        if (exp == 0) {
+        if (exp == 0) {  // Subnormal: normalized, then rebiased like any other value
             if (mant == 0) return (sign ? -0.0f : 0.0f);
             exp = 1;
             while (!(mant & 0x00800000)) { mant <<= 1; exp--; }
             mant &= 0x007fffff;
+            exp = exp - 15 + 127;
         } else if (exp == 31) {
             exp = 255;
         } else {
@@ -166,6 +175,7 @@ static constexpr size_t   SCRATCHPAD_SAFE_WATERLINE = 195584; // 191 KB safe lim
 static constexpr uint32_t DMA_ALIGN_BYTES           = 32;     // 32-byte hardware block
 static constexpr uint32_t SIMD_REPEAT_BYTES         = 256;    // 256-byte vector repeat width
 static constexpr uint32_t MAX_HARDWARE_CORES        = 40;     // 40 physical streaming vector cores
+static constexpr uint8_t  SCRATCHPAD_POISON         = 0xFF;   // What a new scratchpad buffer reads as (NaN)
 
 // -----------------------------------------------------------------------------
 // Virtual Hardware Performance Cost Accounting
@@ -350,6 +360,7 @@ public:
         nRegions = nextBlock = nBarriers = syncs = nRecent = 0;
         loadsDone = storesDone = loadBusy = floorLoads = floorStores = floorStoreFree = 0;
         for (uint32_t u = 0; u < UNITS; ++u) unitFree[u] = busy[u] = first[u] = last[u] = floorFree[u] = 0, used[u] = false;
+        vecEpoch = scalarEpoch = vsFence = svFence = 0;
     }
 
     // A scratchpad buffer the pipe has carved: blocks are numbered in claim order
@@ -358,7 +369,7 @@ public:
         if (nRegions == MAX_REGIONS || nextBlock + n > BLOCKS) return;  // Untracked: no ordering
         const uintptr_t a = reinterpret_cast<uintptr_t>(base);
         regions[nRegions++] = {a, a + bytes, nextBlock};
-        for (uint32_t b = nextBlock; b < nextBlock + n; ++b) ready[b] = lastRead[b] = floorReady[b] = 0;
+        for (uint32_t b = nextBlock; b < nextBlock + n; ++b) ready[b] = lastRead[b] = floorReady[b] = 0, vecWrote[b] = scalarWrote[b] = 0;
         nextBlock += n;
     }
 
@@ -374,17 +385,32 @@ public:
         return {};
     }
 
-    // A vector instruction writing `w` and reading `r0`, `r1`
+    // A vector instruction writing `w` and reading `r0`, `r1`. It sees the scalar unit's stores only
+    // after an S->V fence [6.5].
     void Vector(double cycles, Span w, Span r0 = {}, Span r1 = {}) {
-        const double s = Start(VECTOR, w, r0, r1), e = s + cycles;
-        Occupy(VECTOR, s, cycles);
-        Read(r0, e);
-        Read(r1, e);
-        Write(w, e);
-        const double fe = FloorStart(VECTOR, r0, r1) + cycles;
-        floorFree[VECTOR] = fe;
-        FloorWrite(w, fe);
+        CheckVisible(r0, scalarWrote, svFence, "a vector instruction reads a block the scalar unit wrote after the last S->V fence");
+        CheckVisible(r1, scalarWrote, svFence, "a vector instruction reads a block the scalar unit wrote after the last S->V fence");
+        ++vecEpoch;
+        for (uint32_t b = w.b0; b < w.b1; ++b) vecWrote[b] = vecEpoch;
+        InPipe(cycles, w, r0, r1);
     }
+    // The scalar unit reads `r` (GetValue): in the vector pipe's order, for `cycles`, and only what a
+    // V->S fence made visible [6.5]
+    void ScalarRead(double cycles, Span r) {
+        CheckVisible(r, vecWrote, vsFence, "GetValue reads a block the vector unit wrote after the last V->S fence "
+                                           "(CrossPipe<V_S> or PipeBarrier<PIPE_ALL>; PipeBarrier<PIPE_V> is not one)");
+        InPipe(cycles, {}, r, {});
+    }
+    // The scalar unit writes `w` (SetValue), in the vector pipe's order; the vector unit sees it after
+    // an S->V fence
+    void ScalarWrite(Span w) {
+        ++scalarEpoch;
+        for (uint32_t b = w.b0; b < w.b1; ++b) scalarWrote[b] = scalarEpoch;
+        InPipe(0, w, {}, {});
+    }
+    // Fences: everything the vector unit (scalar unit) wrote so far is visible to the other one
+    void FenceVS() { vsFence = vecEpoch; }
+    void FenceSV() { svFence = scalarEpoch; }
     // System memory -> scratchpad
     void Load(double bytes, Span w) {
         const double s = Start(DMA, w, {}, {}), occupied = g_memory.Cycles(bytes);
@@ -486,6 +512,23 @@ public:
 private:
     struct Region { uintptr_t base, end; uint32_t block0; };
 
+    // A vector-pipe operation: timing only
+    void InPipe(double cycles, Span w, Span r0, Span r1) {
+        const double s = Start(VECTOR, w, r0, r1), e = s + cycles;
+        Occupy(VECTOR, s, cycles);
+        Read(r0, e);
+        Read(r1, e);
+        Write(w, e);
+        const double fe = FloorStart(VECTOR, r0, r1) + cycles;
+        floorFree[VECTOR] = fe;
+        FloorWrite(w, fe);
+    }
+    static void CheckVisible(Span r, const uint32_t* wrote, uint32_t fence, const char* what) {
+        for (uint32_t b = r.b0; b < r.b1; ++b) {
+            if (wrote[b] > fence) throw std::runtime_error(std::string("[Sanitizer Trap - PIPE VISIBILITY]: ") + what);
+        }
+    }
+
     // The floor's replay: the unit and the operands' data only
     double FloorStart(Unit u, Span r0, Span r1) const {
         double t = floorFree[u];
@@ -545,6 +588,10 @@ private:
     static constexpr uint32_t RECENT = 16;
     double recentFrom[RECENT] = {}, recentTo[RECENT] = {};
     uint32_t nRecent = 0;
+    // Scalar <-> vector visibility [6.5]: per block, the vector (scalar) write that last touched it;
+    // a fence makes every write up to its epoch visible to the other unit
+    uint32_t vecWrote[BLOCKS] = {}, scalarWrote[BLOCKS] = {};
+    uint32_t vecEpoch = 0, scalarEpoch = 0, vsFence = 0, svFence = 0;
 };
 
 inline thread_local CoreTimeline g_timeline;
@@ -582,8 +629,9 @@ enum PipeType {
     PIPE_S = 4
 };
 
-// PIPE_ALL drains every pipe of the core, DMA included, then costs PIPE_ALL_NS [1]; a barrier on
-// one pipe costs <= 0.19 ns on the target [6.5], nothing on this timeline
+// PIPE_ALL drains every pipe of the core, DMA included, then costs PIPE_ALL_NS [1], and makes each
+// unit's writes visible to the others. A barrier on one pipe costs <= 0.19 ns on the target [6.5],
+// nothing on this timeline, and makes nothing visible: PipeBarrier<PIPE_V> is not a V->S fence.
 template <PipeType pipe>
 inline void PipeBarrier() {
     #if defined(__GNUC__) || defined(__clang__)
@@ -592,6 +640,8 @@ inline void PipeBarrier() {
     if (pipe == PIPE_ALL) {
         g_cycleTracker.barrierCycles += PIPE_ALL_CYCLES;
         g_timeline.DrainAll(PIPE_ALL_CYCLES);
+        g_timeline.FenceVS();
+        g_timeline.FenceSV();
     }
 }
 
@@ -650,12 +700,16 @@ inline void SetFlag(uint8_t eventId = EVENT_ID0) {
     #endif
 }
 
+// Waiting on V_S (S_V) is the fence that makes the vector (scalar) unit's writes visible to the
+// scalar (vector) unit [6.5]
 template <HardEvent E>
 inline void WaitFlag(uint8_t eventId = EVENT_ID0) {
     (void)eventId;
     #if defined(__GNUC__) || defined(__clang__)
     __asm__ __volatile__("" ::: "memory");
     #endif
+    if constexpr (E == HardEvent::V_S) g_timeline.FenceVS();
+    if constexpr (E == HardEvent::S_V) g_timeline.FenceSV();
 }
 
 template <HardEvent E>
@@ -726,19 +780,22 @@ constexpr const T& Max(const T& a, const T& b) {
 }
 
 // -----------------------------------------------------------------------------
-// LocalTensor<T> Implementation for Core-Local Scratchpad
+// LocalTensor<T> Implementation for Core-Local Scratchpad. Its position is set by the buffer that
+// hands it out (TBuf<POS>, TQue<POS>) and read with GetPosition(): the target's LocalTensor has no
+// public `pos` member [6.4].
 // -----------------------------------------------------------------------------
 template <typename T>
 class LocalTensor {
+    QuePosition pos = QuePosition::TOTAL_POSITIONS;
+
 public:
     T* data = nullptr;
     uint32_t count = 0;
     uint32_t capacityBytes = 0;
-    QuePosition pos = QuePosition::TOTAL_POSITIONS;
 
     LocalTensor() = default;
     LocalTensor(T* ptr, uint32_t numElems, uint32_t capBytes, QuePosition p = QuePosition::TOTAL_POSITIONS)
-        : data(ptr), count(numElems), capacityBytes(capBytes), pos(p) {}
+        : pos(p), data(ptr), count(numElems), capacityBytes(capBytes) {}
 
     // Sub-tensor slicing operator: tensor[offset] returns sliced sub-tensor view
     inline LocalTensor<T> operator[](uint32_t offset) const {
@@ -752,17 +809,19 @@ public:
     }
 
     // Scalar read [1]: GET_VALUE_NS once the value's producer has finished (the scalar unit issues
-    // in order, so what follows waits too), with V->S telemetry
+    // in order, so what follows waits too), with V->S telemetry. The value must have been made
+    // visible by a V->S fence [6.5].
     inline T GetValue(uint32_t index) const {
         g_cycleTracker.scalarStallCycles += GET_VALUE_CYCLES;
         g_cycleTracker.scalarStallCount++;
-        g_timeline.Vector(GET_VALUE_CYCLES, {}, SpanOf(data + index, 1));
+        g_timeline.ScalarRead(GET_VALUE_CYCLES, SpanOf(data + index, 1));
         return data[index];
     }
 
-    // The scalar unit writes in the vector pipe's order (timeline: no cost)
+    // The scalar unit writes in the vector pipe's order (timeline: no cost); the vector unit sees it
+    // after an S->V fence [6.5]
     inline void SetValue(uint32_t index, T val) {
-        g_timeline.Vector(0, SpanOf(data + index, 1));
+        g_timeline.ScalarWrite(SpanOf(data + index, 1));
         data[index] = val;
     }
 
@@ -788,9 +847,11 @@ public:
     std::vector<uint8_t> bufferPool;
     size_t elementBytes = 0;
 
+    // Scratchpad holds whatever it held before: a new buffer reads as NaN (0xFF bytes) until written,
+    // so a kernel that consumes what it never wrote (a reduction slot's stale lanes) fails here too
     void Configure(size_t tensorBytes) {
         elementBytes = tensorBytes;
-        bufferPool.assign(tensorBytes + 64, 0);
+        bufferPool.assign(tensorBytes + 64, SCRATCHPAD_POISON);
         g_timeline.Register(Get<uint8_t>().GetData(), tensorBytes);
     }
 
@@ -830,7 +891,7 @@ public:
         numBuffers = buffers;
         for (uint32_t d = 0; d < depth; ++d) {
             // Ensure 64-byte alignment for SIMD
-            bufferPool[d].assign(d < buffers ? tensorBytes + 64 : 0, 0);
+            bufferPool[d].assign(d < buffers ? tensorBytes + 64 : 0, SCRATCHPAD_POISON);  // Unwritten: NaN
             state[d] = FREE;
             if (d < buffers) g_timeline.Register(Base(d), tensorBytes);
         }
@@ -965,8 +1026,7 @@ public:
 };
 
 // -----------------------------------------------------------------------------
-// DAE v1.5 Zero-Queue Direct Scratchpad Memory Allocator (LocalMemAllocator)
-// Allows direct static local tensor allocation without FIFO queue sequencer tax.
+// Scratchpad allocation [6.4]
 // -----------------------------------------------------------------------------
 namespace Hardware {
     struct Scratchpad {};
@@ -995,24 +1055,6 @@ inline void CheckDmaAddress(const void* systemMem, const void* local) {
         throw std::runtime_error("[Hardware Fault - DMA UNALIGNED]: Transfer address is not 32-byte aligned!");
     }
 }
-
-template <typename T>
-// [NOT ON THE TARGET] the target has no raw-pointer form of DataCopy; a device function cannot cast a global-memory pointer to a typed pointer.
-// Use instead: SetGlobalBuffer on a GlobalTensor<T>, then DataCopy(LocalTensor, GlobalTensor, count).
-inline void DataCopy(LocalTensor<T> dst, const T* src, uint32_t count) {
-    static_assert(sizeof(T) == 0,
-                  "the target has no raw-pointer form of DataCopy; a device function cannot cast a global-memory pointer to a typed pointer.  SetGlobalBuffer on a GlobalTensor<T>, then DataCopy(LocalTensor, GlobalTensor, count).");
-}
-
-
-template <typename T>
-// [NOT ON THE TARGET] the target has no raw-pointer form of DataCopy.
-// Use instead: DataCopy(GlobalTensor, LocalTensor, count).
-inline void DataCopy(T* dst, LocalTensor<T> src, uint32_t count) {
-    static_assert(sizeof(T) == 0,
-                  "the target has no raw-pointer form of DataCopy.  DataCopy(GlobalTensor, LocalTensor, count).");
-}
-
 
 // -----------------------------------------------------------------------------
 // Strided & Padded DMA Parameter Descriptors
@@ -1049,121 +1091,215 @@ enum class RoundMode {
 };
 
 // -----------------------------------------------------------------------------
-// Padded DMA for transfers that are not whole 32-byte blocks (row tails, tensor ends).
-// System memory may be at any address and length; the scratchpad side stays block
-// aligned. Loads zero-fill the rest of the last block; stores write only `count`
-// elements. The engine still moves whole blocks, so the traffic is rounded up.
+// The simulator's copy engine, on the system-memory address a GlobalTensor holds. Kernels reach it
+// only through the GlobalTensor forms below: the target has no raw-pointer DMA.
+//
+// Padded DMA (DataCopyPad): transfers that are not whole 32-byte blocks, such as row tails and rows
+// whose width is off the 32-byte grid. System memory may be at any address and length; the
+// scratchpad side is block aligned [6.6]: each of a descriptor's `blockCount` rows occupies whole
+// 32-byte blocks there, the next row starting `dstStride` (load) / `srcStride` (store) blocks after
+// the previous row's last block. In system memory the rows are `blockLen` bytes long and follow each
+// other after `srcStride` (load) / `dstStride` (store) bytes. A load fills the rest of each row's last
+// block with paddingValue when isPad is set and leaves it as it was otherwise (undefined on the
+// target); a store writes the rows' bytes only. The engine moves whole blocks, so the traffic is
+// rounded up, and one descriptor is one transfer.
 // -----------------------------------------------------------------------------
+namespace detail {
 template <typename T>
-// [NOT ON THE TARGET] the target has no raw-pointer form of DataCopyPad, and no 3-argument form either.
-// Use instead: DataCopyPad(LocalTensor, GlobalTensor, DataCopyExtParams, DataCopyPadExtParams).
-inline void DataCopyPad(LocalTensor<T> dst, const T* src, uint32_t count) {
-    static_assert(sizeof(T) == 0,
-                  "the target has no raw-pointer form of DataCopyPad, and no 3-argument form either.  DataCopyPad(LocalTensor, GlobalTensor, DataCopyExtParams, DataCopyPadExtParams).");
+inline void BlockLoad(LocalTensor<T> dst, const T* src, uint32_t count) {
+    const size_t copyBytes = size_t(count) * sizeof(T);
+    if (copyBytes % DMA_ALIGN_BYTES != 0) {
+        throw std::runtime_error("[Hardware Fault - DMA UNALIGNED]: Transfer size (" + std::to_string(copyBytes) +
+                                 " bytes) is not a multiple of 32 bytes!");
+    }
+    CheckDmaAddress(src, dst.GetData());
+    if (copyBytes > dst.capacityBytes) throw std::runtime_error("[Hardware Fault - DMA OVERRUN]: DataCopy runs past its scratchpad buffer!");
+    std::memcpy(dst.GetData(), src, copyBytes);
+    g_cycleTracker.dmaBytesMoved += copyBytes;
+    g_cycleTracker.dmaTransfers++;
+    g_timeline.Load(static_cast<double>(copyBytes), SpanOf(dst.GetData(), count));
 }
 
-
 template <typename T>
-// [NOT ON THE TARGET] the target has no raw-pointer form of DataCopyPad, and no 3-argument form either.
-// Use instead: DataCopyPad(GlobalTensor, LocalTensor, DataCopyExtParams).
-inline void DataCopyPad(T* dst, LocalTensor<T> src, uint32_t count) {
-    static_assert(sizeof(T) == 0,
-                  "the target has no raw-pointer form of DataCopyPad, and no 3-argument form either.  DataCopyPad(GlobalTensor, LocalTensor, DataCopyExtParams).");
+inline void BlockStore(T* dst, LocalTensor<T> src, uint32_t count) {
+    const size_t copyBytes = size_t(count) * sizeof(T);
+    if (copyBytes % DMA_ALIGN_BYTES != 0) {
+        throw std::runtime_error("[Hardware Fault - DMA UNALIGNED]: Transfer size (" + std::to_string(copyBytes) +
+                                 " bytes) is not a multiple of 32 bytes!");
+    }
+    CheckDmaAddress(dst, src.GetData());
+    // Egress routes VECOUT -> system memory only (PIPE_DMA_OUT): egress from VECIN deadlocks the crossbar
+    if (src.GetPosition() == QuePosition::VECIN) {
+        throw std::runtime_error("[Hardware Fault - INVALID DMA EGRESS CHANNEL]: "
+                                 "DataCopy egress to system memory attempted from QuePosition::VECIN! "
+                                 "The stream processor features asymmetric DMA routing: Ingress streams "
+                                 "system memory -> VECIN (PIPE_DMA_IN), while Egress strictly routes "
+                                 "VECOUT -> system memory (PIPE_DMA_OUT). Egress via VECIN causes "
+                                 "crossbar interconnect deadlock and pipeline timeout (Trap #401).");
+    }
+    std::memcpy(dst, src.GetData(), copyBytes);
+    g_cycleTracker.dmaBytesMoved += copyBytes;
+    g_cycleTracker.dmaTransfers++;
+    g_timeline.Store(static_cast<double>(copyBytes), SpanOf(src.GetData(), count));
 }
 
+template <typename T>
+inline void PadLoad(LocalTensor<T> dst, const T* src, DataCopyExtParams cp, DataCopyPadExtParams<T> pad) {
+    const size_t row = (size_t(cp.blockLen) + DMA_ALIGN_BYTES - 1) / DMA_ALIGN_BYTES * DMA_ALIGN_BYTES;
+    const size_t pitch = row + size_t(cp.dstStride) * DMA_ALIGN_BYTES, extent = cp.blockCount ? (cp.blockCount - 1) * pitch + row : 0;
+    if (reinterpret_cast<uintptr_t>(dst.GetData()) % DMA_ALIGN_BYTES != 0 || extent > dst.capacityBytes) {
+        throw std::runtime_error("[Hardware Fault - DMA UNALIGNED]: DataCopyPad scratchpad side must be 32-byte aligned and in bounds!");
+    }
+    uint8_t* d = reinterpret_cast<uint8_t*>(dst.GetData());
+    const uint8_t* s = reinterpret_cast<const uint8_t*>(src);
+    for (uint32_t b = 0; b < cp.blockCount; ++b) {
+        std::memcpy(d + b * pitch, s + size_t(b) * (cp.blockLen + cp.srcStride), cp.blockLen);
+        if (!pad.isPad) continue;
+        for (size_t o = cp.blockLen; o + sizeof(T) <= row; o += sizeof(T)) std::memcpy(d + b * pitch + o, &pad.paddingValue, sizeof(T));
+    }
+    g_cycleTracker.dmaBytesMoved += cp.blockCount * row;
+    g_cycleTracker.dmaTransfers++;
+    g_cycleTracker.padTransfers++;
+    g_timeline.Load(static_cast<double>(cp.blockCount * row), g_timeline.SpanOf(dst.GetData(), extent));
+}
 
+template <typename T>
+inline void PadStore(T* dst, LocalTensor<T> src, DataCopyExtParams cp) {
+    const size_t row = (size_t(cp.blockLen) + DMA_ALIGN_BYTES - 1) / DMA_ALIGN_BYTES * DMA_ALIGN_BYTES;
+    const size_t pitch = row + size_t(cp.srcStride) * DMA_ALIGN_BYTES, extent = cp.blockCount ? (cp.blockCount - 1) * pitch + row : 0;
+    if (reinterpret_cast<uintptr_t>(src.GetData()) % DMA_ALIGN_BYTES != 0 || extent > src.capacityBytes) {
+        throw std::runtime_error("[Hardware Fault - DMA UNALIGNED]: DataCopyPad scratchpad side must be 32-byte aligned and in bounds!");
+    }
+    if (src.GetPosition() == QuePosition::VECIN) {
+        throw std::runtime_error("[Hardware Fault - INVALID DMA EGRESS CHANNEL]: "
+                                 "DataCopyPad egress to system memory attempted from QuePosition::VECIN! "
+                                 "Egress transfers strictly require QuePosition::VECOUT (Trap #401).");
+    }
+    uint8_t* d = reinterpret_cast<uint8_t*>(dst);
+    const uint8_t* s = reinterpret_cast<const uint8_t*>(src.GetData());
+    for (uint32_t b = 0; b < cp.blockCount; ++b) std::memcpy(d + size_t(b) * (cp.blockLen + cp.dstStride), s + b * pitch, cp.blockLen);
+    g_cycleTracker.dmaBytesMoved += cp.blockCount * row;
+    g_cycleTracker.dmaTransfers++;
+    g_cycleTracker.padTransfers++;
+    g_timeline.Store(static_cast<double>(cp.blockCount * row), g_timeline.SpanOf(src.GetData(), extent));
+}
+}  // namespace detail
+
+// ---- The target's forms: system memory through a GlobalTensor -----------------------------------
 template <typename T>
 inline void DataCopy(LocalTensor<T> dst, GlobalTensor<T> src, uint32_t count) {
-    DataCopy(dst, src.GetData(), count);
+    detail::BlockLoad(dst, src.GetData(), count);
 }
 
 template <typename T>
 inline void DataCopy(GlobalTensor<T> dst, LocalTensor<T> src, uint32_t count) {
-    DataCopy(dst.GetData(), src, count);
-}
-
-template <typename T>
-// [NOT ON THE TARGET] the target's DataCopyPad always takes a DataCopyExtParams describing blockCount / blockLen / strides; there is no count-only form.
-// Use instead: DataCopyPad(LocalTensor, GlobalTensor, DataCopyExtParams, DataCopyPadExtParams).
-inline void DataCopyPad(LocalTensor<T> dst, GlobalTensor<T> src, uint32_t count) {
-    static_assert(sizeof(T) == 0,
-                  "the target's DataCopyPad always takes a DataCopyExtParams describing blockCount / blockLen / strides; there is no count-only form.  DataCopyPad(LocalTensor, GlobalTensor, DataCopyExtParams, DataCopyPadExtParams).");
-}
-
-
-template <typename T>
-// [NOT ON THE TARGET] the target's DataCopyPad always takes a DataCopyExtParams describing blockCount / blockLen / strides; there is no count-only form.
-// Use instead: DataCopyPad(GlobalTensor, LocalTensor, DataCopyExtParams).
-inline void DataCopyPad(GlobalTensor<T> dst, LocalTensor<T> src, uint32_t count) {
-    static_assert(sizeof(T) == 0,
-                  "the target's DataCopyPad always takes a DataCopyExtParams describing blockCount / blockLen / strides; there is no count-only form.  DataCopyPad(GlobalTensor, LocalTensor, DataCopyExtParams).");
-}
-
-
-template <typename T>
-// [NOT ON THE TARGET] the target has no raw-pointer form of DataCopyPad.
-// Use instead: DataCopyPad(LocalTensor, GlobalTensor, DataCopyExtParams, DataCopyPadExtParams).
-inline void DataCopyPad(LocalTensor<T> dst, const T* src, DataCopyExtParams cp, DataCopyPadExtParams<T> pad = {
-    static_assert(sizeof(T) == 0,
-                  "the target has no raw-pointer form of DataCopyPad.  DataCopyPad(LocalTensor, GlobalTensor, DataCopyExtParams, DataCopyPadExtParams).");
-}
-) {
-    (void)pad;
-    uint32_t count = (sizeof(T) > 0) ? (cp.blockLen / sizeof(T)) : 0;
-    DataCopyPad(dst, src, count);
+    detail::BlockStore(dst.GetData(), src, count);
 }
 
 template <typename T>
 inline void DataCopyPad(LocalTensor<T> dst, GlobalTensor<T> src, DataCopyExtParams cp, DataCopyPadExtParams<T> pad = {}) {
-    DataCopyPad(dst, src.GetData(), cp, pad);
+    detail::PadLoad(dst, src.GetData(), cp, pad);
 }
 
 template <typename T>
+inline void DataCopyPad(GlobalTensor<T> dst, LocalTensor<T> src, DataCopyExtParams cp) {
+    detail::PadStore(dst.GetData(), src, cp);
+}
+
+// One row of `count` elements: a load zero-fills the rest of its last block (hardware zero-fill)
+template <typename T>
+inline void LoadPad(LocalTensor<T> dst, GlobalTensor<T> src, uint32_t count) {
+    detail::PadLoad(dst, src.GetData(), DataCopyExtParams{1, static_cast<uint32_t>(count * sizeof(T)), 0, 0, 0},
+                    DataCopyPadExtParams<T>{true, 0, 0, T(0)});
+}
+
+template <typename T>
+inline void StorePad(GlobalTensor<T> dst, LocalTensor<T> src, uint32_t count) {
+    detail::PadStore(dst.GetData(), src, DataCopyExtParams{1, static_cast<uint32_t>(count * sizeof(T)), 0, 0, 0});
+}
+
+// ---- Refused: the forms the target does not have (docs/TARGET_API_SHAPE.md) ----------------------
+// [NOT ON THE TARGET] the target has no raw-pointer form of DataCopy; a device function cannot cast a global-memory pointer to a typed pointer.
+// Use instead: SetGlobalBuffer on a GlobalTensor<T>, then DataCopy(LocalTensor, GlobalTensor, count).
+template <typename T>
+inline void DataCopy(LocalTensor<T>, const T*, uint32_t) {
+    static_assert(sizeof(T) == 0,
+                  "the target has no raw-pointer form of DataCopy; a device function cannot cast a global-memory pointer to a typed pointer.  SetGlobalBuffer on a GlobalTensor<T>, then DataCopy(LocalTensor, GlobalTensor, count).");
+}
+
+// [NOT ON THE TARGET] the target has no raw-pointer form of DataCopy.
+// Use instead: DataCopy(GlobalTensor, LocalTensor, count).
+template <typename T>
+inline void DataCopy(T*, LocalTensor<T>, uint32_t) {
+    static_assert(sizeof(T) == 0,
+                  "the target has no raw-pointer form of DataCopy.  DataCopy(GlobalTensor, LocalTensor, count).");
+}
+
+// [NOT ON THE TARGET] the target has no raw-pointer form of DataCopyPad, and no 3-argument form either.
+// Use instead: DataCopyPad(LocalTensor, GlobalTensor, DataCopyExtParams, DataCopyPadExtParams).
+template <typename T>
+inline void DataCopyPad(LocalTensor<T>, const T*, uint32_t) {
+    static_assert(sizeof(T) == 0,
+                  "the target has no raw-pointer form of DataCopyPad, and no 3-argument form either.  DataCopyPad(LocalTensor, GlobalTensor, DataCopyExtParams, DataCopyPadExtParams).");
+}
+
+// [NOT ON THE TARGET] the target has no raw-pointer form of DataCopyPad, and no 3-argument form either.
+// Use instead: DataCopyPad(GlobalTensor, LocalTensor, DataCopyExtParams).
+template <typename T>
+inline void DataCopyPad(T*, LocalTensor<T>, uint32_t) {
+    static_assert(sizeof(T) == 0,
+                  "the target has no raw-pointer form of DataCopyPad, and no 3-argument form either.  DataCopyPad(GlobalTensor, LocalTensor, DataCopyExtParams).");
+}
+
+// [NOT ON THE TARGET] the target's DataCopyPad always takes a DataCopyExtParams describing blockCount / blockLen / strides; there is no count-only form.
+// Use instead: DataCopyPad(LocalTensor, GlobalTensor, DataCopyExtParams, DataCopyPadExtParams).
+template <typename T>
+inline void DataCopyPad(LocalTensor<T>, GlobalTensor<T>, uint32_t) {
+    static_assert(sizeof(T) == 0,
+                  "the target's DataCopyPad always takes a DataCopyExtParams describing blockCount / blockLen / strides; there is no count-only form.  DataCopyPad(LocalTensor, GlobalTensor, DataCopyExtParams, DataCopyPadExtParams).");
+}
+
+// [NOT ON THE TARGET] the target's DataCopyPad always takes a DataCopyExtParams describing blockCount / blockLen / strides; there is no count-only form.
+// Use instead: DataCopyPad(GlobalTensor, LocalTensor, DataCopyExtParams).
+template <typename T>
+inline void DataCopyPad(GlobalTensor<T>, LocalTensor<T>, uint32_t) {
+    static_assert(sizeof(T) == 0,
+                  "the target's DataCopyPad always takes a DataCopyExtParams describing blockCount / blockLen / strides; there is no count-only form.  DataCopyPad(GlobalTensor, LocalTensor, DataCopyExtParams).");
+}
+
+// [NOT ON THE TARGET] the target has no raw-pointer form of DataCopyPad.
+// Use instead: DataCopyPad(LocalTensor, GlobalTensor, DataCopyExtParams, DataCopyPadExtParams).
+template <typename T>
+inline void DataCopyPad(LocalTensor<T>, const T*, DataCopyExtParams, DataCopyPadExtParams<T> = {}) {
+    static_assert(sizeof(T) == 0,
+                  "the target has no raw-pointer form of DataCopyPad.  DataCopyPad(LocalTensor, GlobalTensor, DataCopyExtParams, DataCopyPadExtParams).");
+}
+
 // [NOT ON THE TARGET] the target has no raw-pointer form of DataCopyPad.
 // Use instead: DataCopyPad(GlobalTensor, LocalTensor, DataCopyExtParams).
-inline void DataCopyPad(T* dst, LocalTensor<T> src, DataCopyExtParams cp) {
+template <typename T>
+inline void DataCopyPad(T*, LocalTensor<T>, DataCopyExtParams) {
     static_assert(sizeof(T) == 0,
                   "the target has no raw-pointer form of DataCopyPad.  DataCopyPad(GlobalTensor, LocalTensor, DataCopyExtParams).");
 }
 
-
-template <typename T>
-inline void DataCopyPad(GlobalTensor<T> dst, LocalTensor<T> src, DataCopyExtParams cp) {
-    DataCopyPad(dst.GetData(), src, cp);
-}
-
-// -----------------------------------------------------------------------------
-// Direct Byte-Precise Padded Transfer Shorthands (LoadPad / StorePad)
-// Tolerates non-32B aligned element counts with hardware zero-fill.
-// -----------------------------------------------------------------------------
-template <typename T>
 // [NOT ON THE TARGET] the target has no raw-pointer form.
 // Use instead: LoadPad(LocalTensor, GlobalTensor, count).
-inline void LoadPad(LocalTensor<T> dst, const T* src, uint32_t count) {
+template <typename T>
+inline void LoadPad(LocalTensor<T>, const T*, uint32_t) {
     static_assert(sizeof(T) == 0,
                   "the target has no raw-pointer form.  LoadPad(LocalTensor, GlobalTensor, count).");
 }
 
-
-template <typename T>
-inline void LoadPad(LocalTensor<T> dst, GlobalTensor<T> src, uint32_t count) {
-    DataCopyPad(dst, src.GetData(), count);
-}
-
-template <typename T>
 // [NOT ON THE TARGET] the target has no raw-pointer form.
 // Use instead: StorePad(GlobalTensor, LocalTensor, count).
-inline void StorePad(T* dst, LocalTensor<T> src, uint32_t count) {
+template <typename T>
+inline void StorePad(T*, LocalTensor<T>, uint32_t) {
     static_assert(sizeof(T) == 0,
                   "the target has no raw-pointer form.  StorePad(GlobalTensor, LocalTensor, count).");
 }
 
-
-template <typename T>
-inline void StorePad(GlobalTensor<T> dst, LocalTensor<T> src, uint32_t count) {
-    DataCopyPad(dst.GetData(), src, count);
-}
-
+// Scratchpad -> scratchpad (the local copy unit)
 template <typename T>
 inline void DataCopy(LocalTensor<T> dst, LocalTensor<T> src, uint32_t count) {
     size_t copyBytes = count * sizeof(T);
@@ -1224,35 +1360,116 @@ inline void Adds(LocalTensor<T> dst, LocalTensor<T> src, float scalar, uint32_t 
     g_timeline.Vector(2 * repeats + 13, SpanOf(dst.data, count), SpanOf(src.data, count));
 }
 
-// Element-wise format conversion (e.g. FP16/BF16 <-> FP32).
-template <typename D, typename S, typename Convert>
-// [NOT ON THE TARGET] the target's Cast takes a rounding mode, not a converter function, and the mode comes before the count.
-// Use instead: Cast(dst, src, RoundMode::CAST_NONE, count).
-inline void Cast(LocalTensor<D> dst, LocalTensor<S> src, uint32_t count, Convert convert) {
-    static_assert(sizeof(S) == 0,
-                  "the target's Cast takes a rounding mode, not a converter function, and the mode comes before the count.  Cast(dst, src, RoundMode::CAST_NONE, count).");
+// -----------------------------------------------------------------------------
+// Cast: element-wise format conversion (FP32 <-> FP16 / BF16) under a rounding mode. Widening is
+// exact; narrowing rounds as `mode` says, CAST_NONE rounding to nearest-even as CAST_RINT does
+// wherever precision is lost. FP16 keeps subnormals and overflows to infinity.
+// -----------------------------------------------------------------------------
+namespace detail {
+inline float AsFloat(float v) { return v; }
+inline float AsFloat(half v) { return static_cast<float>(v); }
+inline float AsFloat(bfloat16_t v) { return static_cast<float>(v); }
+
+inline uint32_t FloatBits(float f) {
+    uint32_t b;
+    std::memcpy(&b, &f, sizeof b);
+    return b;
 }
 
+// Round x to the grid of `ulp`-spaced values the narrow format can hold near it, in `mode`
+inline float RoundToGrid(float x, float ulp, RoundMode mode) {
+    const double q = static_cast<double>(x) / ulp;
+    double r;
+    switch (mode) {
+        case RoundMode::CAST_FLOOR: r = std::floor(q); break;
+        case RoundMode::CAST_CEIL: r = std::ceil(q); break;
+        case RoundMode::CAST_TRUNC: r = std::trunc(q); break;
+        default: r = std::nearbyint(q); break;  // Nearest, ties to even (the default FP environment)
+    }
+    return static_cast<float>(r * ulp);
+}
+
+inline half ToHalf(float x, RoundMode mode) {
+    half h;
+    const uint32_t b = FloatBits(x);
+    const uint16_t sign = static_cast<uint16_t>((b >> 16) & 0x8000u);
+    if (std::isnan(x)) { h.data = static_cast<uint16_t>(sign | 0x7E00u); return h; }
+    const float a = std::fabs(x);
+    // The spacing of FP16 values near |x|: 2^-24 below 2^-14 (subnormals), else 2^(e - 10)
+    int e = 0;
+    std::frexp(a, &e);  // a = m * 2^e, m in [0.5, 1)
+    const float ulp = a < 6.103515625e-05f ? 5.9604644775390625e-08f : std::ldexp(1.0f, e - 11);
+    const float r = std::fabs(RoundToGrid(x, ulp, mode));
+    if (r >= 65520.0f || (r > 65504.0f)) {  // Past the largest finite value: infinity, or 65504 when rounding toward it
+        const bool toward = mode == RoundMode::CAST_TRUNC || (mode == RoundMode::CAST_FLOOR && !sign) || (mode == RoundMode::CAST_CEIL && sign);
+        h.data = static_cast<uint16_t>(sign | (toward ? 0x7BFFu : 0x7C00u));
+        return h;
+    }
+    if (r < 6.103515625e-05f) {  // Subnormal (or zero): r / 2^-24 counts the ulps
+        h.data = static_cast<uint16_t>(sign | static_cast<uint16_t>(r / 5.9604644775390625e-08f));
+        return h;
+    }
+    const uint32_t rb = FloatBits(r);
+    const int32_t exp = static_cast<int32_t>((rb >> 23) & 0xFFu) - 127 + 15;
+    h.data = static_cast<uint16_t>(sign | (exp << 10) | ((rb >> 13) & 0x3FFu));
+    return h;
+}
+
+inline bfloat16_t ToBF16(float x, RoundMode mode) {
+    bfloat16_t h;
+    const uint32_t b = FloatBits(x);
+    if (std::isnan(x)) { h.data = static_cast<uint16_t>((b >> 16) | 0x0040u); return h; }
+    if (std::isinf(x) || x == 0.0f) { h.data = static_cast<uint16_t>(b >> 16); return h; }
+    const float a = std::fabs(x);
+    int e = 0;
+    std::frexp(a, &e);
+    const float ulp = std::ldexp(1.0f, std::max(e - 8, -133));  // 8 significant bits (subnormals below 2^-126)
+    const float r = RoundToGrid(x, ulp, mode);
+    h.data = static_cast<uint16_t>(FloatBits(r) >> 16);
+    return h;
+}
 
 template <typename D, typename S>
-// [NOT ON THE TARGET] the target's Cast takes a rounding mode, not a converter function, and the mode comes before the count.
-// Use instead: Cast(dst, src, RoundMode::CAST_NONE, count).
-inline void Cast(LocalTensor<D> dst, LocalTensor<S> src, uint32_t count) {
-    static_assert(sizeof(S) == 0,
-                  "the target's Cast takes a rounding mode, not a converter function, and the mode comes before the count.  Cast(dst, src, RoundMode::CAST_NONE, count).");
+inline D Convert(S x, RoundMode mode) {
+    const float f = AsFloat(x);
+    if constexpr (std::is_same<D, float>::value) { (void)mode; return f; }
+    else if constexpr (std::is_same<D, half>::value) return ToHalf(f, mode);
+    else if constexpr (std::is_same<D, bfloat16_t>::value) return ToBF16(f, mode);
+    else { static_assert(sizeof(D) == 0, "Cast converts between float, half and bfloat16_t"); return D(); }
 }
-
+}  // namespace detail
 
 template <typename D, typename S>
 inline void Cast(LocalTensor<D> dst, LocalTensor<S> src, RoundMode mode, uint32_t count) {
-    (void)mode;
-    Cast(dst, src, count, [](S x) { return static_cast<D>(x); });
+    for (uint32_t i = 0; i < count; ++i) {
+        dst.data[i] = detail::Convert<D>(src.data[i], mode);
+    }
+    const size_t widest = sizeof(D) > sizeof(S) ? sizeof(D) : sizeof(S);
+    uint32_t repeats = static_cast<uint32_t>((count * widest + SIMD_REPEAT_BYTES - 1) / SIMD_REPEAT_BYTES);
+    g_cycleTracker.vCastCycles += 2 * repeats + 13;
+    g_timeline.Vector(2 * repeats + 13, SpanOf(dst.data, count), SpanOf(src.data, count));
 }
 
 template <typename D, typename S>
 inline void Cast(LocalTensor<D> dst, LocalTensor<S> src, RoundMode mode, uint64_t count, uint8_t rep, UnaryRepeatParams params) {
-    (void)mode; (void)rep; (void)params;
-    Cast(dst, src, static_cast<uint32_t>(count), [](S x) { return static_cast<D>(x); });
+    (void)rep; (void)params;
+    Cast(dst, src, mode, static_cast<uint32_t>(count));
+}
+
+// [NOT ON THE TARGET] the target's Cast takes a rounding mode, not a converter function, and the mode comes before the count.
+// Use instead: Cast(dst, src, RoundMode::CAST_NONE, count).
+template <typename D, typename S, typename Convert>
+inline void Cast(LocalTensor<D>, LocalTensor<S>, uint32_t, Convert) {
+    static_assert(sizeof(S) == 0,
+                  "the target's Cast takes a rounding mode, not a converter function, and the mode comes before the count.  Cast(dst, src, RoundMode::CAST_NONE, count).");
+}
+
+// [NOT ON THE TARGET] the target's Cast takes a rounding mode, not a converter function, and the mode comes before the count.
+// Use instead: Cast(dst, src, RoundMode::CAST_NONE, count).
+template <typename D, typename S>
+inline void Cast(LocalTensor<D>, LocalTensor<S>, uint32_t) {
+    static_assert(sizeof(S) == 0,
+                  "the target's Cast takes a rounding mode, not a converter function, and the mode comes before the count.  Cast(dst, src, RoundMode::CAST_NONE, count).");
 }
 
 template <typename T>
@@ -1283,10 +1500,22 @@ inline void Duplicate(LocalTensor<T> dst, T scalar, uint32_t count) {
     g_timeline.Vector(repeats + 18, SpanOf(dst.data, count));
 }
 
+// Rsqrt [6.3]: a low-precision table lookup, not a reciprocal square root to the last bit. Its result
+// keeps RSQRT_TABLE_BITS fraction bits (the rest truncated), so a kernel refines it by Newton-Raphson.
+// There is no scalar VectorInvRms on the target.
+static constexpr uint32_t RSQRT_TABLE_BITS = 11;
+
 template <typename T>
 inline void Rsqrt(LocalTensor<T> dst, LocalTensor<T> src, uint32_t count) {
     for (uint32_t i = 0; i < count; ++i) {
-        dst.data[i] = static_cast<T>(1.0f / std::sqrt(static_cast<float>(src.data[i])));
+        float r = 1.0f / std::sqrt(static_cast<float>(src.data[i]));
+        if (std::isfinite(r)) {
+            uint32_t bits;
+            std::memcpy(&bits, &r, sizeof bits);
+            bits &= ~((1u << (23 - RSQRT_TABLE_BITS)) - 1u);
+            std::memcpy(&r, &bits, sizeof bits);
+        }
+        dst.data[i] = static_cast<T>(r);
     }
     uint32_t repeats = (count * sizeof(T) + SIMD_REPEAT_BYTES - 1) / SIMD_REPEAT_BYTES;
     g_cycleTracker.vRsqrtCycles += 2 * repeats + 14;
@@ -1294,85 +1523,138 @@ inline void Rsqrt(LocalTensor<T> dst, LocalTensor<T> src, uint32_t count) {
 }
 
 // -----------------------------------------------------------------------------
-// High-Efficiency Block Reduction (BlockReduceSum)
-// Folds every 8 elements into 1 (1 cycle per repeat).
+// BlockReduceSum: every 32-byte block of a repeat folds into one value (1 cycle per repeat).
+// BlockReduceSum(dst, src, repeatTimes, mask, dstRepStride, srcBlkStride, srcRepStride): repeat r
+// reads the 8 blocks of src at (r * srcRepStride + b * srcBlkStride) blocks, b = 0..7, of which the
+// first `mask` elements take part (1 to one repeat's lanes); block b's sum is element b of the
+// repeat's 8 results, which land at dst + r * dstRepStride * 8 elements (dstRepStride counts one
+// repeat's results). A block without a participating element yields no defined result: it reads NaN
+// here. The destination starts a block and never overlaps the source (Trap #402).
 // -----------------------------------------------------------------------------
 template <typename T>
+inline void BlockReduceSum(LocalTensor<T> dst, LocalTensor<T> src, uint8_t repeatTimes, uint64_t mask, uint8_t dstRepStride,
+                           uint8_t srcBlkStride, uint8_t srcRepStride) {
+    constexpr uint32_t blockElems = DMA_ALIGN_BYTES / sizeof(T), lanes = SIMD_REPEAT_BYTES / sizeof(T);
+    if (mask == 0 || mask > lanes) {
+        throw std::runtime_error("[Hardware Fault - REPEAT MASK]: BlockReduceSum's mask is the element count of one repeat (1 to " +
+                                 std::to_string(lanes) + "): got " + std::to_string(mask));
+    }
+    if (reinterpret_cast<uintptr_t>(dst.GetData()) % DMA_ALIGN_BYTES != 0) {
+        throw std::runtime_error("[Hardware Fault - OPERAND UNALIGNED]: BlockReduceSum's destination must start a 32-byte block");
+    }
+    const size_t srcExtent = repeatTimes ? (size_t(repeatTimes - 1) * srcRepStride + size_t((mask - 1) / blockElems) * srcBlkStride) * blockElems +
+                                               (mask - 1) % blockElems + 1
+                                         : 0;
+    const size_t dstExtent = repeatTimes ? size_t(repeatTimes - 1) * dstRepStride * 8 + 8 : 0;
+    if (srcExtent * sizeof(T) > src.capacityBytes || dstExtent * sizeof(T) > dst.capacityBytes) {
+        throw std::runtime_error("[Hardware Fault - BUFFER OVERRUN]: a BlockReduceSum operand runs past its buffer");
+    }
+    const T* s = src.data;
+    T* d = dst.data;
+    const uintptr_t d0 = reinterpret_cast<uintptr_t>(d), d1 = d0 + dstExtent * sizeof(T);
+    const uintptr_t s0 = reinterpret_cast<uintptr_t>(s), s1 = s0 + srcExtent * sizeof(T);
+    if (repeatTimes && d0 < s1 && s0 < d1) {
+        throw std::runtime_error("[Hardware Fault - VECTOR ALU OPERAND ALIASING]: BlockReduceSum destination overlaps its source! "
+                                 "Intra-row folding must ping-pong across disjoint buffers (Trap #402).");
+    }
+    for (uint32_t r = 0; r < repeatTimes; ++r) {
+        for (uint32_t b = 0; b < 8; ++b) {
+            const uint64_t first = uint64_t(b) * blockElems;
+            T sum = T(0);
+            if (first >= mask) {
+                sum = static_cast<T>(std::numeric_limits<double>::quiet_NaN());
+            } else {
+                const size_t base = (size_t(r) * srcRepStride + size_t(b) * srcBlkStride) * blockElems;
+                for (uint64_t e = first; e < mask && e < first + blockElems; ++e) sum += s[base + (e - first)];
+            }
+            d[size_t(r) * dstRepStride * 8 + b] = sum;
+        }
+    }
+    g_cycleTracker.vBlockReduceCycles += 1u * repeatTimes + 14;
+    g_timeline.Vector(1u * repeatTimes + 14, SpanOf(d, dstExtent), SpanOf(s, srcExtent));
+}
+
 // [NOT ON THE TARGET] the target's BlockReduceSum takes seven arguments: (dst, src, repeatTimes, mask, dstRepStride, srcBlkStride, srcRepStride). A count-only form hides the repeat structure, which is exactly what has to be chosen deliberately on the hardware.
 // Use instead: BlockReduceSum(dst, src, repeatTimes, mask, 1, 1, 8) for whole 64-lane repeats of 4-byte elements.
-inline void BlockReduceSum(LocalTensor<T> dst, LocalTensor<T> src, uint32_t count) {
+template <typename T>
+inline void BlockReduceSum(LocalTensor<T>, LocalTensor<T>, uint32_t) {
     static_assert(sizeof(T) == 0,
                   "the target's BlockReduceSum takes seven arguments: (dst, src, repeatTimes, mask, dstRepStride, srcBlkStride, srcRepStride). A count-only form hides the repeat structure, which is exactly what has to be chosen deliberately on the hardware.  BlockReduceSum(dst, src, repeatTimes, mask, 1, 1, 8) for whole 64-lane repeats of 4-byte elements.");
 }
 
-
-// -----------------------------------------------------------------------------
-// Pure Vector Binary Reduction Tree (VectorReduceSum)
-// Folds local vector elements into 1 scalar without scalar loop bubbles
-// -----------------------------------------------------------------------------
-template <typename T>
 // [NOT ON THE TARGET] no reduction on the target returns a value. ReduceSum returns void, writes only lane 0 of a 32-byte slot, and needs a work tensor; reading the scalar back requires a vector->scalar fence, which inside a per-row loop is one pipeline fence per row.
 // Use instead: ReduceSum(dst, src, work, count), then a fence, then dst.GetValue(0) - and offset multi-row destinations by dst[i * 8] for 4-byte elements.
-inline float VectorReduceSum(LocalTensor<T> src, uint32_t count) {
+template <typename T>
+inline float VectorReduceSum(LocalTensor<T>, uint32_t) {
     static_assert(sizeof(T) == 0,
                   "no reduction on the target returns a value. ReduceSum returns void, writes only lane 0 of a 32-byte slot, and needs a work tensor; reading the scalar back requires a vector->scalar fence, which inside a per-row loop is one pipeline fence per row.  ReduceSum(dst, src, work, count), then a fence, then dst.GetValue(0) - and offset multi-row destinations by dst[i * 8] for 4-byte elements.");
+    return 0.0f;
 }
 
-
-// -----------------------------------------------------------------------------
-// Pure Vector InvRms with Coordinator-Precomputed Invariant Scale (invD)
-// -----------------------------------------------------------------------------
 // [NOT ON THE TARGET] there is no VectorInvRms instruction.
 // Use instead: Rsqrt on a tensor (a low-precision table lookup) followed by
 // Newton-Raphson refinement. Skipping the refinement loses accuracy.
-inline float VectorInvRms(float sumSq, float invD, float eps) {
-    static_assert(false,
+template <typename F = float>
+inline float VectorInvRms(F, float, float) {
+    static_assert(sizeof(F) == 0,
                   "[NOT ON THE TARGET] no VectorInvRms instruction. Use Rsqrt on a tensor (low-precision table lookup) plus Newton-Raphson refinement.");
     return 0.0f;
 }
 
-
-// Deprecated overload: Worker core performing scalar integer-to-float conversion
-[[deprecated("Worker core lacks scalar integer-to-float conversion unit. Pass precomputed invD from Coordinator.")]]
-// [NOT ON THE TARGET] there is no VectorInvRms instruction.
-// Use instead: Rsqrt on a tensor (a low-precision table lookup) followed by
-// Newton-Raphson refinement. Skipping the refinement loses accuracy.
-inline float VectorInvRms(float sumSq, uint32_t D, float eps) {
-    static_assert(false,
+// [NOT ON THE TARGET] there is no VectorInvRms instruction (and the worker has no scalar
+// integer-to-float unit either: pass 1 / D from the coordinator).
+template <typename F = float>
+inline float VectorInvRms(F, uint32_t, float) {
+    static_assert(sizeof(F) == 0,
                   "[NOT ON THE TARGET] no VectorInvRms instruction. Use Rsqrt on a tensor (low-precision table lookup) plus Newton-Raphson refinement.");
     return 0.0f;
 }
 
-
 // -----------------------------------------------------------------------------
-// Whole Block Reduction (WholeReduceSum)
-// ⚠️ Expensive: 14 cycles per repeat in hardware!
+// WholeReduceSum(dst, src, mask, repeatTimes, dstRepStride, srcBlkStride, srcRepStride): each repeat
+// sums its first `mask` elements (its blocks at (r * srcRepStride + b * srcBlkStride) blocks) into one
+// value, which lands at dst + r * dstRepStride elements. Expensive: 14 cycles per repeat.
 // -----------------------------------------------------------------------------
 template <typename T>
+inline void WholeReduceSum(LocalTensor<T> dst, LocalTensor<T> src, uint64_t mask, uint8_t repeatTimes, uint8_t dstRepStride,
+                           uint8_t srcBlkStride, uint8_t srcRepStride) {
+    constexpr uint32_t blockElems = DMA_ALIGN_BYTES / sizeof(T), lanes = SIMD_REPEAT_BYTES / sizeof(T);
+    if (mask == 0 || mask > lanes) {
+        throw std::runtime_error("[Hardware Fault - REPEAT MASK]: WholeReduceSum's mask is the element count of one repeat (1 to " +
+                                 std::to_string(lanes) + "): got " + std::to_string(mask));
+    }
+    const size_t srcExtent = repeatTimes ? (size_t(repeatTimes - 1) * srcRepStride + size_t((mask - 1) / blockElems) * srcBlkStride) * blockElems +
+                                               (mask - 1) % blockElems + 1
+                                         : 0;
+    const size_t dstExtent = repeatTimes ? size_t(repeatTimes - 1) * dstRepStride + 1 : 0;
+    if (srcExtent * sizeof(T) > src.capacityBytes || dstExtent * sizeof(T) > dst.capacityBytes) {
+        throw std::runtime_error("[Hardware Fault - BUFFER OVERRUN]: a WholeReduceSum operand runs past its buffer");
+    }
+    for (uint32_t r = 0; r < repeatTimes; ++r) {
+        T sum = T(0);
+        for (uint64_t e = 0; e < mask; ++e) {
+            sum += src.data[(size_t(r) * srcRepStride + size_t(e / blockElems) * srcBlkStride) * blockElems + e % blockElems];
+        }
+        dst.data[size_t(r) * dstRepStride] = sum;
+    }
+    g_cycleTracker.vWholeReduceCycles += 14u * repeatTimes + 14;
+    g_timeline.Vector(14u * repeatTimes + 14, SpanOf(dst.data, dstExtent), SpanOf(src.data, srcExtent));
+}
+
 // [NOT ON THE TARGET] the target's WholeReduceSum also takes the repeat structure explicitly.
 // Use instead: WholeReduceSum(dst, src, mask, repeatTimes, dstRepStride, srcBlkStride, srcRepStride).
-inline void WholeReduceSum(LocalTensor<T> dst, LocalTensor<T> src, uint32_t count) {
+template <typename T>
+inline void WholeReduceSum(LocalTensor<T>, LocalTensor<T>, uint32_t) {
     static_assert(sizeof(T) == 0,
                   "the target's WholeReduceSum also takes the repeat structure explicitly.  WholeReduceSum(dst, src, mask, repeatTimes, dstRepStride, srcBlkStride, srcRepStride).");
 }
 
-
-// Whole block reduction overload matching native hardware strides
-template <typename T>
-inline void WholeReduceSum(LocalTensor<T> dst, LocalTensor<T> src, uint64_t mask, uint8_t repeatTimes,
-                           uint8_t srcRepStride, uint8_t dstRepStride, uint8_t dstBlkStride) {
-    (void)mask; (void)repeatTimes; (void)srcRepStride; (void)dstRepStride; (void)dstBlkStride;
-    T sum = 0;
-    for (uint32_t i = 0; i < 64; ++i) {
-        sum += src.data[i];
-    }
-    dst.data[0] = sum;
-    g_cycleTracker.vWholeReduceCycles += 14;
-    g_timeline.Vector(14, SpanOf(dst.data, 1), SpanOf(src.data, 64));
-}
-
 // -----------------------------------------------------------------------------
-// DAE v1.5 Vector Reduction with 64-Lane SIMD Geometry & Aliasing Guard
+// ReduceSum [6.2]: void. The sum of `count` elements (whole 64-lane repeats) lands in lane 0 of the
+// 32-byte block at dst. The target leaves lanes 1..7 holding whatever was there; this runtime fills
+// them with NaN, so a kernel that consumes the whole slot fails here instead of silently losing
+// accuracy on the hardware. dst must start a block: the slot of row i is dst[i * 8] (4-byte
+// elements), never dst[i], which would put rows into one block's lane 0.
 // -----------------------------------------------------------------------------
 template <typename T>
 inline void ReduceSum(LocalTensor<T> dst, LocalTensor<T> src, LocalTensor<T> work, uint32_t count) {
@@ -1380,6 +1662,10 @@ inline void ReduceSum(LocalTensor<T> dst, LocalTensor<T> src, LocalTensor<T> wor
         throw std::runtime_error("[Hardware Fault - VECTOR ALU OPERAND ALIASING (Trap #402)]: "
                                  "ReduceSum destination, source, and scratch workpad buffers must be strictly disjoint! "
                                  "The SIMD reduction datapath forbids workspace aliasing.");
+    }
+    if (reinterpret_cast<uintptr_t>(dst.GetData()) % DMA_ALIGN_BYTES != 0) {
+        throw std::runtime_error("[Hardware Fault - REDUCTION SLOT UNALIGNED]: ReduceSum writes lane 0 of a 32-byte block: "
+                                 "its destination must start one (row i's slot is dst[i * 8], not dst[i])");
     }
     if (count % 64 != 0) {
         throw std::runtime_error("[Hardware Fault - UNALIGNED SIMD LANE FAULT (Trap #408)]: "
@@ -1393,116 +1679,103 @@ inline void ReduceSum(LocalTensor<T> dst, LocalTensor<T> src, LocalTensor<T> wor
         sum += src.data[i];
     }
     dst.data[0] = sum;
-    // The target writes lane 0 only; the rest of the 32-byte slot keeps whatever
-    // was there. Poisoning them makes a kernel that consumes the whole slot fail
-    // here instead of silently losing accuracy on the hardware.
-    if (dst.capacityBytes >= DMA_ALIGN_BYTES) {
-        const uint32_t lanes = DMA_ALIGN_BYTES / sizeof(T);
-        for (uint32_t i = 1; i < lanes; ++i) {
-            dst.data[i] = static_cast<T>(std::numeric_limits<double>::quiet_NaN());
-        }
+    const uint32_t lanes = DMA_ALIGN_BYTES / sizeof(T);
+    const uint32_t slot = dst.capacityBytes >= DMA_ALIGN_BYTES ? lanes : 1;
+    for (uint32_t i = 1; i < slot; ++i) {
+        dst.data[i] = static_cast<T>(std::numeric_limits<double>::quiet_NaN());
     }
     uint32_t repeats = (count * sizeof(T) + SIMD_REPEAT_BYTES - 1) / SIMD_REPEAT_BYTES;
     g_cycleTracker.vBlockReduceCycles += 2 * repeats + 15;
-    g_timeline.Vector(2 * repeats + 15, SpanOf(dst.data, 1), SpanOf(src.data, count));
+    g_timeline.Vector(2 * repeats + 15, SpanOf(dst.data, slot), SpanOf(src.data, count));
 }
 
 // -----------------------------------------------------------------------------
-// DAE v1.5 Cross-Lane Hardware Broadcast Primitive (Brcb)
-// Single-cycle broadcast from scalar into 64-lane SIMD vector buffer.
+// Brcb [6.1]: a block broadcast, not a scalar one. Each repeat reads 8 consecutive values of src and
+// fills 8 32-byte blocks of dst, block j with value j: repeat r writes value src[8r + j] over the
+// block at (r * dstRepStride + j * dstBlkStride) blocks. So one Brcb repeat spreads the values of 8
+// rows, one block each; a row's value across the row is a strided operation with src1BlkStride = 0.
 // -----------------------------------------------------------------------------
 struct BrcbRepeatParams {
-    uint8_t dstRepStride = 1;
-    uint8_t srcRepStride = 8;
+    uint16_t dstBlkStride = 1;  // Blocks between the 8 blocks of a repeat
+    uint16_t dstRepStride = 8;  // Blocks between repeats
 };
 
 template <typename T>
-inline void Brcb(LocalTensor<T> dst, LocalTensor<T> src, uint32_t repeatCount = 1, BrcbRepeatParams params = {
-    // [TARGET SEMANTICS] Each repeat reads EIGHT CONSECUTIVE values from src and
-    // fills the j-th 32-byte block of that repeat with the j-th value. It does not
-    // read src[0] and flood the destination with it.
-    //
-    // This matters: code written against the old behaviour - broadcasting one row's
-    // inverse RMS across its repeats with Brcb(bc, inv[i], padded / 64, {1, 8}) -
-    // splices the values of rows i..i+7 into a single row on the hardware, and
-    // accuracy collapses. A correct pure-vector broadcast is either one Brcb per
-    // group of eight rows, or a strided binary op with src1BlkStride and
-    // src1RepStride both zero so every lane reads the same 32-byte block.
-    const uint32_t lanes = DMA_ALIGN_BYTES / sizeof(T);
-    const uint32_t needSrc = repeatCount * 8;
-    if (src.capacityBytes < needSrc * sizeof(T)) {
-        fprintf(stderr, "[Hardware Fault - Brcb] source holds fewer than 8 x repeatCount values; each repeat broadcasts eight CONSECUTIVE source values, one per 32-byte block.");
-        throw std::runtime_error("[Hardware Fault - Brcb] source too small: each repeat reads eight consecutive values.");
+inline void Brcb(LocalTensor<T> dst, LocalTensor<T> src, uint32_t repeatTimes, BrcbRepeatParams params = {}) {
+    constexpr uint32_t blockElems = DMA_ALIGN_BYTES / sizeof(T);
+    const size_t lastBlock = repeatTimes ? size_t(repeatTimes - 1) * params.dstRepStride + 7u * params.dstBlkStride : 0;
+    const size_t extent = repeatTimes ? (lastBlock + 1) * blockElems : 0;  // Elements up to the end of the last block
+    if (repeatTimes > 255 || size_t(dst.capacityBytes) < extent * sizeof(T) || size_t(src.capacityBytes) < 8u * repeatTimes * sizeof(T) ||
+        reinterpret_cast<uintptr_t>(dst.GetData()) % DMA_ALIGN_BYTES != 0) {
+        throw std::runtime_error("[Hardware Fault - BUFFER OVERRUN (Trap #410)]: Brcb reads 8 values per repeat and writes 8 whole "
+                                 "32-byte blocks: its destination must start a block and hold every block it writes, its source 8 values "
+                                 "per repeat (at most 255 repeats)");
     }
-    const uint32_t needDst = repeatCount * params.dstRepStride * lanes;
-    if (dst.capacityBytes < needDst * sizeof(T)) {
-        throw std::runtime_error("[Hardware Fault - Brcb] destination too small for repeatCount x dstRepStride blocks.");
-    }
-    for (uint32_t r = 0; r < repeatCount; ++r) {
-        for (uint32_t b = 0; b < 8; ++b) {
-            const T v = src.data[r * 8 + b];
-            for (uint32_t e = 0; e < lanes; ++e) {
-                dst.data[r * params.dstRepStride * lanes + b * lanes + e] = v;
-            }
+    for (uint32_t r = 0; r < repeatTimes; ++r) {
+        for (uint32_t j = 0; j < 8; ++j) {
+            const T v = src.data[8 * r + j];
+            T* block = dst.data + (size_t(r) * params.dstRepStride + size_t(j) * params.dstBlkStride) * blockElems;
+            for (uint32_t t = 0; t < blockElems; ++t) block[t] = v;
         }
     }
-    g_cycleTracker.vCastCycles += repeatCount + 8;
-    g_timeline.Vector(repeatCount + 8, SpanOf(dst.data, repeatCount * 8 * lanes),
-                      SpanOf(src.data, repeatCount * 8));
-}) {
-    (void)params;
-    const size_t minCapacity = 64 * repeatCount;
-    if (dst.capacityBytes < minCapacity * sizeof(T)) {
-        throw std::runtime_error("[Hardware Fault - BUFFER OVERRUN (Trap #410)]: "
-                                 "Brcb destination buffer capacity (" + std::to_string(dst.capacityBytes) +
-                                 " bytes) is smaller than required 256-byte hardware burst (64 elements / " +
-                                 std::to_string(minCapacity * sizeof(T)) + " bytes)! "
-                                 "Brcb operates via 8 x 32-byte SIMD lane bursts; underallocated buffers cause memory corruption.");
-    }
-    T val = src.data[0];
-    for (uint32_t i = 0; i < minCapacity; ++i) {
-        dst.data[i] = val;
-    }
-    g_cycleTracker.vCastCycles += 1 * repeatCount + 8;
-    g_timeline.Vector(1 * repeatCount + 8, SpanOf(dst.data, minCapacity), SpanOf(src.data, 1));
+    g_cycleTracker.vCastCycles += 1 * repeatTimes + 8;
+    g_timeline.Vector(1 * repeatTimes + 8, SpanOf(dst.data, extent), SpanOf(src.data, 8u * repeatTimes));
 }
 
 // -----------------------------------------------------------------------------
-// DAE v1.5 Strided Multi-Row Vector Operators & 8-Bit Stride Guard
+// Strided binary form [6.8]: Mul/Add(dst, src0, src1, mask, repeatTimes, params). `mask` is the
+// element count of every repeat (at most one repeat's lanes: 64 at 4 bytes), not a total, and
+// `repeatTimes` (at most 255) the number of repeats. Repeat r processes its elements in 32-byte
+// blocks: element e of operand X lives at (r * XRepStride + (e / blockElems) * XBlkStride) blocks,
+// plus e % blockElems. A block stride of 0 makes every block of a repeat read the same block; a
+// repeat stride of 0 makes every repeat read the same repeat.
 // -----------------------------------------------------------------------------
 struct BinaryRepeatParams {
-    uint8_t dstRepStride = 1;
-    uint8_t src0RepStride = 1;
-    uint8_t src1RepStride = 1;
-    uint8_t dstBlkStride = 8;
-    uint8_t src0BlkStride = 8;
-    uint8_t src1BlkStride = 0;
+    uint8_t dstBlkStride = 1;
+    uint8_t src0BlkStride = 1;
+    uint8_t src1BlkStride = 1;
+    uint8_t dstRepStride = 8;
+    uint8_t src0RepStride = 8;
+    uint8_t src1RepStride = 8;
 };
 
-template <typename T>
-inline void Mul(LocalTensor<T> dst, LocalTensor<T> src0, LocalTensor<T> src1, uint64_t count, uint8_t rows, BinaryRepeatParams rep) {
-    (void)rep;
-    for (uint8_t r = 0; r < rows; ++r) {
-        for (uint64_t i = 0; i < count; ++i) {
-            dst.data[r * count + i] = src0.data[r * count + i] * src1.data[i];
+namespace detail {
+template <typename T, typename Op>
+inline void StridedBinary(LocalTensor<T> dst, LocalTensor<T> src0, LocalTensor<T> src1, uint64_t mask, uint8_t repeatTimes,
+                          const BinaryRepeatParams& p, Op op, uint64_t& cycles) {
+    constexpr uint32_t blockElems = DMA_ALIGN_BYTES / sizeof(T), lanes = SIMD_REPEAT_BYTES / sizeof(T);
+    if (mask == 0 || mask > lanes) {
+        throw std::runtime_error("[Hardware Fault - REPEAT MASK]: the strided form's mask is the element count of one repeat (1 to " +
+                                 std::to_string(lanes) + "), not a row width: got " + std::to_string(mask));
+    }
+    auto at = [&](uint32_t r, uint64_t e, uint8_t rep, uint8_t blk) {
+        return (size_t(r) * rep + size_t(e / blockElems) * blk) * blockElems + e % blockElems;
+    };
+    auto extent = [&](uint8_t rep, uint8_t blk) { return repeatTimes ? at(repeatTimes - 1, mask - 1, rep, blk) + 1 : 0; };
+    const size_t nd = extent(p.dstRepStride, p.dstBlkStride), n0 = extent(p.src0RepStride, p.src0BlkStride),
+                 n1 = extent(p.src1RepStride, p.src1BlkStride);
+    if (nd * sizeof(T) > dst.capacityBytes || n0 * sizeof(T) > src0.capacityBytes || n1 * sizeof(T) > src1.capacityBytes) {
+        throw std::runtime_error("[Hardware Fault - BUFFER OVERRUN]: a strided operand runs past its buffer");
+    }
+    for (uint32_t r = 0; r < repeatTimes; ++r) {
+        for (uint64_t e = 0; e < mask; ++e) {
+            dst.data[at(r, e, p.dstRepStride, p.dstBlkStride)] =
+                op(src0.data[at(r, e, p.src0RepStride, p.src0BlkStride)], src1.data[at(r, e, p.src1RepStride, p.src1BlkStride)]);
         }
     }
-    uint32_t repeats = static_cast<uint32_t>((count * rows * sizeof(T) + SIMD_REPEAT_BYTES - 1) / SIMD_REPEAT_BYTES);
-    g_cycleTracker.vMulCycles += 2 * repeats + 13;
-    g_timeline.Vector(2 * repeats + 13, SpanOf(dst.data, count * rows), SpanOf(src0.data, count * rows), SpanOf(src1.data, count));
+    cycles += 2u * repeatTimes + 13;
+    g_timeline.Vector(2u * repeatTimes + 13, SpanOf(dst.data, nd), SpanOf(src0.data, n0), SpanOf(src1.data, n1));
+}
+}  // namespace detail
+
+template <typename T>
+inline void Mul(LocalTensor<T> dst, LocalTensor<T> src0, LocalTensor<T> src1, uint64_t mask, uint8_t repeatTimes, const BinaryRepeatParams& p) {
+    detail::StridedBinary(dst, src0, src1, mask, repeatTimes, p, [](T a, T b) { return a * b; }, g_cycleTracker.vMulCycles);
 }
 
 template <typename T>
-inline void Add(LocalTensor<T> dst, LocalTensor<T> src0, LocalTensor<T> src1, uint64_t count, uint8_t rows, BinaryRepeatParams rep) {
-    (void)rep;
-    for (uint8_t r = 0; r < rows; ++r) {
-        for (uint64_t i = 0; i < count; ++i) {
-            dst.data[r * count + i] = src0.data[r * count + i] + src1.data[i];
-        }
-    }
-    uint32_t repeats = static_cast<uint32_t>((count * rows * sizeof(T) + SIMD_REPEAT_BYTES - 1) / SIMD_REPEAT_BYTES);
-    g_cycleTracker.vAddCycles += 2 * repeats + 13;
-    g_timeline.Vector(2 * repeats + 13, SpanOf(dst.data, count * rows), SpanOf(src0.data, count * rows), SpanOf(src1.data, count));
+inline void Add(LocalTensor<T> dst, LocalTensor<T> src0, LocalTensor<T> src1, uint64_t mask, uint8_t repeatTimes, const BinaryRepeatParams& p) {
+    detail::StridedBinary(dst, src0, src1, mask, repeatTimes, p, [](T a, T b) { return a + b; }, g_cycleTracker.vAddCycles);
 }
 
 // -----------------------------------------------------------------------------
@@ -1530,16 +1803,23 @@ inline void ValidateLaunchArgs(const ArgsStruct&) {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Accessors that exist here but NOT on the target.
 //
 //   LocalTensor<T>::GetData()   - the target's LocalTensor exposes no raw
-//                                 pointer. Used below only by this runtime's own
-//                                 aliasing traps; a kernel that calls it will not
+//                                 pointer. Used only by this runtime's own
+//                                 checks; a kernel that calls it will not
 //                                 translate.
-//   LocalTensor<T>::pos         - no such field on the target; assigning it
-//                                 (t.pos = ...) does not compile there.
+//   LocalTensor<T>::pos         - no such field on the target. Here it is
+//                                 private: a buffer's position is set by the
+//                                 TBuf / TQue that hands it out and read with
+//                                 GetPosition(), and t.pos = ... does not
+//                                 compile, as on the target.
+//   GlobalTensor<T>::GetData(),
+//   its conversions to T* and
+//   operator+                   - the simulator's view of the address a
+//                                 GlobalTensor holds; the DMA forms above use
+//                                 it. A kernel indexes with operator[] instead.
 //   GetCoreIdx / GetCoreNum /
 //   GetThreadIdx / GetThreadNum - not target APIs. Use GetBlockIdx /
 //                                 GetBlockNum.

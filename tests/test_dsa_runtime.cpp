@@ -22,6 +22,14 @@ struct AlignedAllocator {
 };
 template <typename T> using AlignedVector = std::vector<T, AlignedAllocator<T>>;
 
+// System memory as the target reaches it: a GlobalTensor over the buffer (docs/TARGET_API_SHAPE.md)
+template <typename T>
+GlobalTensor<T> Gm(T* p) {
+    GlobalTensor<T> g;
+    g.SetGlobalBuffer(p);
+    return g;
+}
+
 template <typename F>
 bool ExpectTrap(const char* what, F body) {
     try {
@@ -43,7 +51,7 @@ public:
     TQue<QuePosition::VECIN, 2> inQueue;
     TQue<QuePosition::VECOUT, 2> outQueue;
 
-    void Process(const float* src, float* dst, uint32_t totalElems) {
+    void Process(GlobalTensor<float> src, GlobalTensor<float> dst, uint32_t totalElems) {
         // Tile size: 512 floats = 2048 bytes (strictly 32-byte aligned)
         uint32_t tileBytes = 512 * sizeof(float);
 
@@ -59,7 +67,7 @@ public:
         for (uint32_t t = 0; t < tiles; ++t) {
             // Stage 1: DMA Inbound
             LocalTensor<float> inTensor = inQueue.AllocTensor<float>();
-            DataCopy(inTensor, src + t * 512, 512);
+            DataCopy(inTensor, src[t * 512], 512);
             inQueue.EnQue(inTensor);
 
             // Stage 2: SIMD Vector Compute
@@ -73,7 +81,7 @@ public:
 
             // Stage 3: DMA Outbound
             LocalTensor<float> writeTensor = outQueue.DeQue<float>();
-            DataCopy(dst + t * 512, writeTensor, 512);
+            DataCopy(dst[t * 512], writeTensor, 512);
             outQueue.FreeTensor(writeTensor);
         }
     }
@@ -89,7 +97,7 @@ int main() {
     AlignedVector<float> output(ELEMS, 0.0f);
 
     SampleDaePipelineKernel kernel;
-    kernel.Process(input.data(), output.data(), ELEMS);
+    kernel.Process(Gm(input.data()), Gm(output.data()), ELEMS);
 
     // Verify numerical correctness
     for (uint32_t i = 0; i < ELEMS; ++i) {
@@ -126,7 +134,7 @@ int main() {
         TQue<QuePosition::VECIN, 1> q;
         alignPipe.InitBuffer(q, 1, 1024);
         LocalTensor<float> t = q.AllocTensor<float>();
-        DataCopy(t, input.data(), 5); // 5 floats = 20 bytes (not 32-byte multiple!)
+        DataCopy(t, Gm(input.data()), 5); // 5 floats = 20 bytes (not 32-byte multiple!)
         std::cerr << "FAIL: Sanitizer did not catch DMA misalignment!\n";
         return 1;
     } catch (const std::exception& e) {
@@ -144,10 +152,10 @@ int main() {
         TQue<QuePosition::VECIN, 2> dq;
         dbPipe.InitBuffer(dq, 2, 8 * sizeof(float));
         LocalTensor<float> t0 = dq.AllocTensor<float>();
-        DataCopy(t0, a.data(), 8);
+        DataCopy(t0, Gm(a.data()), 8);
         dq.EnQue(t0);
         LocalTensor<float> t1 = dq.AllocTensor<float>();  // prefetch into the second buffer
-        DataCopy(t1, b.data(), 8);
+        DataCopy(t1, Gm(b.data()), 8);
         dq.EnQue(t1);
         LocalTensor<float> c0 = dq.DeQue<float>();
         LocalTensor<float> c1 = dq.DeQue<float>();
@@ -186,7 +194,7 @@ int main() {
         TQue<QuePosition::VECIN, 1> q1;
         p.InitBuffer(q1, 1, 256);
         LocalTensor<float> t = q1.AllocTensor<float>();
-        DataCopy(t, input.data() + 1, 8);
+        DataCopy(t, Gm(input.data())[1], 8);
     });
 
     // -------------------------------------------------------------------------
@@ -199,7 +207,7 @@ int main() {
         p.InitBuffer(q1, 1, 64);
         LocalTensor<float> t = q1.AllocTensor<float>();
         const uint64_t pads = g_cycleTracker.padTransfers;
-        DataCopyPad(t, input.data() + 3, 5);
+        DataCopyPad(t, Gm(input.data())[3], DataCopyExtParams{1, 5 * sizeof(float), 0, 0, 0}, DataCopyPadExtParams<float>{true, 0, 0, 0.0f});
         if (t.GetValue(4) != 2.0f || t.GetValue(5) != 0.0f || t.GetValue(7) != 0.0f || g_cycleTracker.padTransfers != pads + 1) {
             std::cerr << "FAIL: DataCopyPad did not move/pad the tail\n";
             return 1;
@@ -234,9 +242,9 @@ int main() {
             p.InitBuffer(qOut, 1, 1024 * sizeof(float));
             LocalTensor<float> tIn = qIn.AllocTensor<float>();
             LocalTensor<float> tOut = qOut.AllocTensor<float>();
-            DataCopy(tIn, src.data(), 1024);  // 4 KB
+            DataCopy(tIn, Gm(src.data()), 1024);  // 4 KB
             Add(tOut, tIn, tIn, 1024);        // 16 repeats: 45 cycles
-            DataCopy(dst.data(), tOut, 1024);
+            DataCopy(Gm(dst.data()), tOut, 1024);
             const TimelineSummary s = g_timeline.Summary();
             const double load = 4096 / bw, add = 2 * 16 + 13, expect = load + L + add + load + L;
             ok &= near(s.finish, expect) && near(s.vectorBusy, add) && near(s.dmaBusy, 2 * load) && near(s.loadBusy, load);
@@ -252,8 +260,8 @@ int main() {
             TQue<QuePosition::VECIN, 2> q;
             p.InitBuffer(q, 2, 1024 * sizeof(float));
             LocalTensor<float> a = q.AllocTensor<float>(), b = q.AllocTensor<float>();
-            DataCopy(a, src.data(), 1024);
-            DataCopy(b, src.data(), 1024);  // Streams while tile a computes
+            DataCopy(a, Gm(src.data()), 1024);
+            DataCopy(b, Gm(src.data()), 1024);  // Streams while tile a computes
             Add(a, a, a, 1024);
             Add(b, b, b, 1024);
             const TimelineSummary s = g_timeline.Summary();
@@ -300,14 +308,14 @@ int main() {
         TQue<QuePosition::VECIN, 1> q;
         p.InitBuffer(q, 1, 256);
         LocalTensor<float> t = q.AllocTensor<float>();
-        DataCopy(output.data(), t, 64);
+        DataCopy(Gm(output.data()), t, 64);
     });
     ok &= ExpectTrap("BlockReduceSum in-place buffer aliasing (dst == src)", [&] {
         TPipe p;
         TBuf<QuePosition::VECCALC> b;
         p.InitBuffer(b, 256);
         LocalTensor<float> t = b.Get<float>();
-        BlockReduceSum(t, t, 64);
+        BlockReduceSum(t, t, 1, 64, 1, 1, 8);
     });
 
     // -------------------------------------------------------------------------
@@ -334,14 +342,14 @@ int main() {
         ReduceSum(bDst.Get<float>(), bSrc.Get<float>(), bDst.Get<float>(), 64);
     });
 
-    // Trap #410: Brcb buffer overrun (capacity < 64 floats)
+    // Trap #410: Brcb buffer overrun (one repeat writes 8 blocks: 64 floats)
     ok &= ExpectTrap("Brcb destination buffer undersized (capacity < 64 floats, Trap #410)", [&] {
         TPipe p;
         TBuf<QuePosition::VECCALC> bDst, bSrc;
         p.InitBuffer(bDst, 32); // only 8 floats
         p.InitBuffer(bSrc, 32);
         bSrc.Get<float>().data[0] = 3.14f;
-        Brcb(bDst.Get<float>(), bSrc.Get<float>());
+        Brcb(bDst.Get<float>(), bSrc.Get<float>(), 1);
     });
 
     // Trap #409: Host-to-Device argument frame overflow (> 32 bytes)
@@ -352,21 +360,22 @@ int main() {
         ValidateLaunchArgs(s);
     });
 
-    // Brcb valid broadcast verification & LocalMemAllocator
+    // Brcb [6.1]: each repeat spreads 8 consecutive source values over 8 32-byte blocks, value j over
+    // block j (not one value over the whole destination)
     {
-        LocalMemAllocator<Hardware::UB> mem;
-        auto scalar = mem.Alloc<float, 8>();
-        auto bcast = mem.Alloc<float, 64>();
-        scalar.data[0] = 42.0f;
-        Brcb(bcast, scalar);
+        TPipe p;
+        TBuf<QuePosition::VECCALC> bSrc, bDst;
+        p.InitBuffer(bSrc, 16 * sizeof(float));
+        p.InitBuffer(bDst, 128 * sizeof(float));
+        LocalTensor<float> src = bSrc.Get<float>(), dst = bDst.Get<float>();
+        for (uint32_t i = 0; i < 16; ++i) src.data[i] = 1.0f + i;
+        Brcb(dst, src, 2, BrcbRepeatParams{1, 8});
         bool brcbOk = true;
-        for (uint32_t i = 0; i < 64; ++i) {
-            if (bcast.data[i] != 42.0f) brcbOk = false;
-        }
+        for (uint32_t i = 0; i < 128; ++i) brcbOk &= dst.data[i] == 1.0f + i / 8;
         if (brcbOk) {
-            std::cout << "PASS: Brcb broadcasts scalar across all 64 SIMD lanes\n";
+            std::cout << "PASS: Brcb fills block j of each repeat with that repeat's value j\n";
         } else {
-            std::cerr << "FAIL: Brcb did not broadcast correctly\n";
+            std::cerr << "FAIL: Brcb does not follow the target's block broadcast\n";
             ok = false;
         }
     }
@@ -377,10 +386,14 @@ int main() {
     // -------------------------------------------------------------------------
     {
         std::cout << "\n[Testing Extended Microarchitectural Primitives]...\n";
-        LocalMemAllocator<Hardware::UB> mem;
-        auto vecF = mem.Alloc<float, 64>();
-        auto vecH = mem.Alloc<half, 64>();
-        auto auxF = mem.Alloc<float, 64>();
+        TPipe mem;  // The target claims scratchpad through TPipe and TBuf only [6.4]
+        TBuf<QuePosition::VECCALC> bF, bH, bAux;
+        mem.InitBuffer(bF, 64 * sizeof(float));
+        mem.InitBuffer(bH, 64 * sizeof(half));
+        mem.InitBuffer(bAux, 64 * sizeof(float));
+        auto vecF = bF.Get<float>();
+        auto vecH = bH.Get<half>();
+        auto auxF = bAux.Get<float>();
 
         // ReinterpretCast
         auto reF = vecF.ReinterpretCast<float>();
@@ -462,6 +475,173 @@ int main() {
         if (mem) std::cout << "PASS: size ceilings, working-set regime, saturation at 27 cores, measured constants\n";
         else std::cerr << "FAIL: memory system does not follow the measured rules\n";
     }
+
+    // -------------------------------------------------------------------------
+    // Test 12: the target's semantics (docs/TARGET_MEASUREMENTS.md, section 6), each a way code passed
+    // the old runtime and failed on the target
+    // -------------------------------------------------------------------------
+    std::cout << "\n[Testing Target Semantics (section 6)]...\n";
+    {
+        TPipe p;
+        TBuf<QuePosition::VECCALC> bA, bB, bC, bW;
+        p.InitBuffer(bA, 256 * sizeof(float));
+        p.InitBuffer(bB, 256 * sizeof(float));
+        p.InitBuffer(bC, 256 * sizeof(float));
+        p.InitBuffer(bW, 256 * sizeof(float));
+        LocalTensor<float> a = bA.Get<float>(), b = bB.Get<float>(), c = bC.Get<float>(), w = bW.Get<float>();
+        bool sem = std::isnan(a.data[0]) && std::isnan(a.data[255]);  // Unwritten scratchpad reads as NaN
+        // 6.2: ReduceSum defines lane 0 of its slot block only: the target leaves lanes 1..7 as they were,
+        // this runtime fills them with NaN so that nothing can consume them; the blocks around stay
+        Duplicate(a, 1.0f, 128);
+        Duplicate(b, 7.0f, 24);
+        ReduceSum(b[8], a, w, 128);
+        sem &= b.data[8] == 128.0f && std::isnan(b.data[9]) && std::isnan(b.data[15]) && b.data[0] == 7.0f && b.data[16] == 7.0f;
+        // 6.8: the strided form's mask is per repeat. Row r of 3 rows of 128 floats times the one
+        // 32-byte block c[8r] (src1 block stride 0): the row's multiplier over every lane, in two
+        // instructions of 64 lanes, one repeat per row
+        for (uint32_t i = 0; i < 24; ++i) c.data[i] = 1.0f + i / 8;
+        Duplicate(a, 2.0f, 256);
+        for (uint32_t h = 0; h < 2; ++h) Mul(b[h * 64], a[h * 64], c, 64, 2, BinaryRepeatParams{1, 1, 0, 16, 16, 1});
+        for (uint32_t i = 0; i < 256; ++i) sem &= b.data[i] == 2.0f * (1.0f + i / 128);
+        // 6.3: Rsqrt is a table of RSQRT_TABLE_BITS bits, not exact; one Newton-Raphson step refines it
+        Duplicate(a, 3.0f, 64);
+        Rsqrt(b, a, 64);
+        const double exact = 1.0 / std::sqrt(3.0), table = b.data[0];
+        const double refined = table * (1.5 - 0.5 * 3.0 * table * table);
+        sem &= std::fabs(table - exact) / exact > 1e-6 && std::fabs(table - exact) / exact < 1.0 / (1 << RSQRT_TABLE_BITS) &&
+               std::fabs(refined - exact) / exact < 1e-6;
+        // 6.5: the scalar unit reads a vector result after a V->S fence, and the vector unit a scalar
+        // store after an S->V fence
+        Adds(a, a, 1.0f, 8);
+        CrossPipe<HardEvent::V_S>(EVENT_ID0);
+        sem &= a.GetValue(0) == 4.0f;
+        a.SetValue(1, 5.0f);
+        CrossPipe<HardEvent::S_V>(EVENT_ID0);
+        Muls(b, a, 2.0f, 8);
+        CrossPipe<HardEvent::V_S>(EVENT_ID0);
+        sem &= b.GetValue(1) == 10.0f;
+        ok &= sem;
+        if (sem) std::cout << "PASS: poisoned scratchpad, ReduceSum lane 0, per-repeat masks, table Rsqrt, fenced scalar reads\n";
+        else std::cerr << "FAIL: a target semantic is not modeled\n";
+    }
+    auto withBuffers = [](auto body) {
+        TPipe p;
+        TBuf<QuePosition::VECCALC> bA, bB, bW;
+        p.InitBuffer(bA, 256 * sizeof(float));
+        p.InitBuffer(bB, 256 * sizeof(float));
+        p.InitBuffer(bW, 256 * sizeof(float));
+        body(bA.Get<float>(), bB.Get<float>(), bW.Get<float>());
+    };
+    ok &= ExpectTrap("ReduceSum into dst[i] instead of the block dst[i * 8] (6.2)", [&] {
+        withBuffers([](LocalTensor<float> a, LocalTensor<float> b, LocalTensor<float> w) {
+            Duplicate(a, 1.0f, 64);
+            ReduceSum(b[1], a, w, 64);
+        });
+    });
+    ok &= ExpectTrap("a strided Mul given a whole row width as its mask (6.8)", [&] {
+        withBuffers([](LocalTensor<float> a, LocalTensor<float> b, LocalTensor<float>) { Mul(b, a, a, 128, 1, BinaryRepeatParams{}); });
+    });
+    ok &= ExpectTrap("GetValue of a vector result behind PipeBarrier<PIPE_V> only (6.5)", [&] {
+        withBuffers([](LocalTensor<float> a, LocalTensor<float>, LocalTensor<float>) {
+            Duplicate(a, 1.0f, 8);
+            PipeBarrier<PIPE_V>();
+            (void)a.GetValue(0);
+        });
+    });
+    ok &= ExpectTrap("a vector read of a scalar store without an S->V fence (6.5)", [&] {
+        withBuffers([](LocalTensor<float> a, LocalTensor<float> b, LocalTensor<float>) {
+            a.SetValue(0, 1.0f);
+            Muls(b, a, 2.0f, 8);
+        });
+    });
+    {
+        // DataCopyPad: rows off the 32-byte grid land one per block in the scratchpad (padded with the
+        // pad value) and leave it for system memory without the padding
+        AlignedVector<float> rows(3 * 5), back(3 * 5, -1.0f);
+        for (uint32_t i = 0; i < 15; ++i) rows[i] = float(i);
+        TPipe p;
+        TBuf<QuePosition::VECOUT> bRows;
+        p.InitBuffer(bRows, 3 * 32);
+        LocalTensor<float> t = bRows.Get<float>();
+        DataCopyPad(t, Gm(rows.data()), DataCopyExtParams{3, 5 * sizeof(float), 0, 0, 0}, DataCopyPadExtParams<float>{true, 0, 3, 0.0f});
+        bool pad = true;
+        for (uint32_t r = 0; r < 3; ++r) {
+            for (uint32_t j = 0; j < 8; ++j) pad &= t.data[r * 8 + j] == (j < 5 ? float(r * 5 + j) : 0.0f);
+        }
+        DataCopyPad(Gm(back.data()), t, DataCopyExtParams{3, 5 * sizeof(float), 0, 0, 0});
+        for (uint32_t i = 0; i < 15; ++i) pad &= back[i] == float(i);
+        ok &= pad;
+        if (pad) std::cout << "PASS: DataCopyPad rows of 20 bytes, one per 32-byte block, round trip\n";
+        else std::cerr << "FAIL: DataCopyPad row layout\n";
+    }
+
+    // -------------------------------------------------------------------------
+    // Test 13: the target's 7-argument reductions and its rounding-mode Cast (docs/TARGET_API_SHAPE.md)
+    // -------------------------------------------------------------------------
+    std::cout << "\n[Testing Target Reductions and Cast]...\n";
+    {
+        TPipe p;
+        TBuf<QuePosition::VECCALC> bS, bP, bO;
+        p.InitBuffer(bS, 3 * 72 * sizeof(float));
+        p.InitBuffer(bP, 64 * sizeof(float));
+        p.InitBuffer(bO, 64 * sizeof(float));
+        LocalTensor<float> src = bS.Get<float>(), part = bP.Get<float>(), out = bO.Get<float>();
+        for (uint32_t i = 0; i < 3 * 72; ++i) src.data[i] = float(i % 72);
+        // Rows of 72 floats (9 blocks): repeat r folds the first 64 lanes of row r, block b into element b
+        BlockReduceSum(part, src, 3, 64, 1, 1, 9);
+        bool red = true;
+        for (uint32_t r = 0; r < 3; ++r) {
+            for (uint32_t b = 0; b < 8; ++b) red &= part.data[8 * r + b] == float(64 * b + 28);
+        }
+        // Packed: 3 rows' 8 partials into their sums; a block no lane takes part in has no result (NaN)
+        BlockReduceSum(out, part, 1, 24, 1, 1, 8);
+        for (uint32_t r = 0; r < 3; ++r) red &= out.data[r] == 2016.0f;
+        for (uint32_t b = 3; b < 8; ++b) red &= std::isnan(out.data[b]);
+        // WholeReduceSum: every repeat into one value, dstRepStride elements apart
+        WholeReduceSum(out, src, 64, 3, 2, 1, 9);
+        for (uint32_t r = 0; r < 3; ++r) red &= out.data[2 * r] == 2016.0f;
+        // Cast: FP32 -> FP16 rounds to nearest-even (CAST_RINT, and CAST_NONE where precision is lost),
+        // keeps subnormals and overflows to infinity; TRUNC / FLOOR / CEIL round as named; widening is
+        // exact for every one of the 65536 FP16 values
+        TBuf<QuePosition::VECCALC> bF, bH;
+        p.InitBuffer(bF, 8 * sizeof(float));
+        p.InitBuffer(bH, 8 * sizeof(half));
+        LocalTensor<float> f = bF.Get<float>();
+        LocalTensor<half> hv = bH.Get<half>();
+        const float in[8] = {1.0f + 1.0f / 2048, 1.0f + 3.0f / 2048, -1.0f - 1.0f / 2048, 70000.0f, 1e-7f, 65519.0f, -2.5e-8f, 0.1f};
+        const uint16_t rint[8] = {0x3C00, 0x3C02, 0xBC00, 0x7C00, 0x0002, 0x7BFF, 0x8000, 0x2E66};
+        for (uint32_t i = 0; i < 8; ++i) f.data[i] = in[i];
+        Cast(hv, f, RoundMode::CAST_RINT, 8);
+        for (uint32_t i = 0; i < 8; ++i) red &= hv.data[i].data == rint[i];
+        Cast(hv, f, RoundMode::CAST_NONE, 8);
+        for (uint32_t i = 0; i < 8; ++i) red &= hv.data[i].data == rint[i];
+        f.data[0] = 1.0f + 5.0f / 4096;  // Between 1 + 1/1024 and 1 + 2/1024
+        f.data[1] = -1.0f - 5.0f / 4096;
+        Cast(hv, f, RoundMode::CAST_TRUNC, 2);
+        red &= hv.data[0].data == 0x3C01 && hv.data[1].data == 0xBC01;
+        Cast(hv, f, RoundMode::CAST_FLOOR, 2);
+        red &= hv.data[0].data == 0x3C01 && hv.data[1].data == 0xBC02;
+        Cast(hv, f, RoundMode::CAST_CEIL, 2);
+        red &= hv.data[0].data == 0x3C02 && hv.data[1].data == 0xBC01;
+        for (uint32_t bits = 0; bits < 65536; bits += 8) {
+            for (uint32_t i = 0; i < 8; ++i) hv.data[i].data = static_cast<uint16_t>(bits + i);
+            Cast(f, hv, RoundMode::CAST_NONE, 8);
+            Cast(hv, f, RoundMode::CAST_RINT, 8);
+            for (uint32_t i = 0; i < 8; ++i) {
+                const bool nan = ((bits + i) & 0x7C00) == 0x7C00 && ((bits + i) & 0x3FF);
+                red &= nan ? std::isnan(f.data[i]) : hv.data[i].data == bits + i;
+            }
+        }
+        ok &= red;
+        if (red) std::cout << "PASS: BlockReduceSum / WholeReduceSum repeat structure, Cast rounding modes and FP16 round trip\n";
+        else std::cerr << "FAIL: a target reduction or Cast does not follow its definition\n";
+    }
+    ok &= ExpectTrap("BlockReduceSum given a row width as its mask", [&] {
+        withBuffers([](LocalTensor<float> a, LocalTensor<float> b, LocalTensor<float>) { BlockReduceSum(b, a, 1, 128, 1, 1, 8); });
+    });
+    ok &= ExpectTrap("BlockReduceSum into a destination off the 32-byte grid", [&] {
+        withBuffers([](LocalTensor<float> a, LocalTensor<float> b, LocalTensor<float>) { BlockReduceSum(b[1], a, 1, 64, 1, 1, 8); });
+    });
 
     if (!ok) return 1;
 
