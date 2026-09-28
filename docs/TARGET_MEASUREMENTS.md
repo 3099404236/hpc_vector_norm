@@ -9,7 +9,33 @@
 
 ---
 
-## 0. The single most important item: the kernel spec is wrong
+## Status on this branch
+
+Already applied here, so do not redo them:
+
+| Item | Where |
+| :--- | :--- |
+| The kernel spec (bias after normalize and gamma, never in the sum of squares) | `4b79e79` |
+| Launch 1.70 us, the same for any core count | `KERNEL_LAUNCH_NS` |
+| SyncAll 0.924 us | `SYNC_ALL_NS` |
+| `bw(P, b) = min(regime, size ceiling) * min(1, P / 27)`, both tables verbatim | `DMA_SIZE_CEILING`, `DMA_REGIME_CEILING`, `DMA_SATURATION_CORES` |
+
+Sections 1, 3, 4 and 5 below are therefore history: they record how those numbers were
+obtained, not work that is outstanding. `DMA_BYTES_PER_CYCLE` and `byteNs` appear there as
+the values that used to be in their place; both are gone now.
+
+Still open:
+
+| Item | Where |
+| :--- | :--- |
+| The API forms the target does not have | [`TARGET_API_SHAPE.md`](TARGET_API_SHAPE.md), and section 6 below |
+| The per-instruction issue constants (13 / 14 / 15) and the 1.5 GHz clock are **not measured** | section 10 |
+| No software pipelining across row chunks — the measured cost is +93.9% and +57.8% on two shapes | section 11 |
+| Two shapes the direct path cannot serve at all | section 11 |
+
+---
+
+## 0. The kernel spec (fixed on this branch by `4b79e79`)
 
 `include/hpc_vector_norm.hpp:19` and the README both state:
 

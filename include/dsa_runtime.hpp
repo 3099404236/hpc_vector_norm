@@ -29,6 +29,7 @@
 #include <array>
 #include <string>
 #include <stdexcept>
+#include <limits>
 #include <iostream>
 #include <iomanip>
 #include <omp.h>
@@ -973,28 +974,15 @@ namespace Hardware {
     using UB = Scratchpad; // Unified Scratchpad Buffer
 }
 
+// [NOT ON THE TARGET] LocalMemAllocator does not exist. The scratchpad is
+// claimed with TPipe::InitBuffer(TBuf&, bytes) and sliced by the kernel via
+// TBuf::Get<T>(). Kept only so existing code still names something; every
+// member is a hard error, because an allocator that hands out arbitrary
+// alignments cannot model a machine whose DMA end requires 32-byte starts.
 template <typename TargetSpace = Hardware::UB>
 class LocalMemAllocator {
-public:
-    alignas(64) uint8_t pool[SCRATCHPAD_SAFE_WATERLINE];
-    size_t offset = 0;
-
-    LocalMemAllocator() = default;
-
-    template <typename T, size_t N>
-    LocalTensor<T> Alloc() {
-        size_t bytes = (N * sizeof(T) + DMA_ALIGN_BYTES - 1) / DMA_ALIGN_BYTES * DMA_ALIGN_BYTES;
-        if (offset + bytes > SCRATCHPAD_SAFE_WATERLINE) {
-            throw std::runtime_error("[Hardware Fault - SCRATCHPAD OVERFLOW (Trap #400)]: "
-                                     "LocalMemAllocator allocation (" + std::to_string(offset + bytes) +
-                                     " bytes) exceeds 191 KB scratchpad waterline!");
-        }
-        uint8_t* ptr = pool + offset;
-        offset += bytes;
-        g_timeline.Register(ptr, bytes);
-        return LocalTensor<T>(reinterpret_cast<T*>(ptr), static_cast<uint32_t>(N),
-                              static_cast<uint32_t>(bytes), QuePosition::VECCALC);
-    }
+    static_assert(sizeof(TargetSpace) == 0,
+                  "[NOT ON THE TARGET] use TPipe::InitBuffer(TBuf&, bytes) and TBuf::Get<T>(), and round every segment start up to 32 bytes.");
 };
 
 // -----------------------------------------------------------------------------
@@ -1009,58 +997,22 @@ inline void CheckDmaAddress(const void* systemMem, const void* local) {
 }
 
 template <typename T>
+// [NOT ON THE TARGET] the target has no raw-pointer form of DataCopy; a device function cannot cast a global-memory pointer to a typed pointer.
+// Use instead: SetGlobalBuffer on a GlobalTensor<T>, then DataCopy(LocalTensor, GlobalTensor, count).
 inline void DataCopy(LocalTensor<T> dst, const T* src, uint32_t count) {
-    size_t copyBytes = count * sizeof(T);
-
-    // -------------------------------------------------------------------------
-    // Hardware Guard: DMA 32-Byte Block Alignment
-    // Verify DMA copy size & memory pointers are strictly 32-byte aligned!
-    // -------------------------------------------------------------------------
-    if (copyBytes % DMA_ALIGN_BYTES != 0) {
-        std::string errMsg = "[Hardware Fault - DMA UNALIGNED]: Transfer size (" +
-                             std::to_string(copyBytes) + " bytes) is not a multiple of 32 bytes!";
-        throw std::runtime_error(errMsg);
-    }
-    CheckDmaAddress(src, dst.GetData());
-
-    std::memcpy(dst.GetData(), src, copyBytes);
-    g_cycleTracker.dmaBytesMoved += copyBytes;
-    g_cycleTracker.dmaTransfers++;
-    g_timeline.Load(static_cast<double>(copyBytes), SpanOf(dst.GetData(), count));
+    static_assert(sizeof(T) == 0,
+                  "the target has no raw-pointer form of DataCopy; a device function cannot cast a global-memory pointer to a typed pointer.  SetGlobalBuffer on a GlobalTensor<T>, then DataCopy(LocalTensor, GlobalTensor, count).");
 }
+
 
 template <typename T>
+// [NOT ON THE TARGET] the target has no raw-pointer form of DataCopy.
+// Use instead: DataCopy(GlobalTensor, LocalTensor, count).
 inline void DataCopy(T* dst, LocalTensor<T> src, uint32_t count) {
-    size_t copyBytes = count * sizeof(T);
-
-    if (copyBytes % DMA_ALIGN_BYTES != 0) {
-        std::string errMsg = "[Hardware Fault - DMA UNALIGNED]: Transfer size (" +
-                             std::to_string(copyBytes) + " bytes) is not a multiple of 32 bytes!";
-        throw std::runtime_error(errMsg);
-    }
-    CheckDmaAddress(dst, src.GetData());
-
-    // -------------------------------------------------------------------------
-    // Hardware Guard: DMA Egress Routing Channel Verification (PIPE_DMA_OUT)
-    // Destination is system memory (egress transfer). The target streaming DMA
-    // engine routes egress transfers strictly through Channel DMA_OUT
-    // (PIPE_DMA_OUT), which is wired to QuePosition::VECOUT. Egress via VECIN
-    // causes crossbar interconnect deadlock and pipeline stall.
-    // -------------------------------------------------------------------------
-    if (src.pos == QuePosition::VECIN) {
-        throw std::runtime_error("[Hardware Fault - INVALID DMA EGRESS CHANNEL]: "
-                                 "DataCopy egress to system memory attempted from QuePosition::VECIN! "
-                                 "The stream processor features asymmetric DMA routing: Ingress streams "
-                                 "system memory -> VECIN (PIPE_DMA_IN), while Egress strictly routes "
-                                 "VECOUT -> system memory (PIPE_DMA_OUT). Egress via VECIN causes "
-                                 "crossbar interconnect deadlock and pipeline timeout (Trap #401).");
-    }
-
-    std::memcpy(dst, src.GetData(), copyBytes);
-    g_cycleTracker.dmaBytesMoved += copyBytes;
-    g_cycleTracker.dmaTransfers++;
-    g_timeline.Store(static_cast<double>(copyBytes), SpanOf(src.GetData(), count));
+    static_assert(sizeof(T) == 0,
+                  "the target has no raw-pointer form of DataCopy.  DataCopy(GlobalTensor, LocalTensor, count).");
 }
+
 
 // -----------------------------------------------------------------------------
 // Strided & Padded DMA Parameter Descriptors
@@ -1103,38 +1055,22 @@ enum class RoundMode {
 // elements. The engine still moves whole blocks, so the traffic is rounded up.
 // -----------------------------------------------------------------------------
 template <typename T>
+// [NOT ON THE TARGET] the target has no raw-pointer form of DataCopyPad, and no 3-argument form either.
+// Use instead: DataCopyPad(LocalTensor, GlobalTensor, DataCopyExtParams, DataCopyPadExtParams).
 inline void DataCopyPad(LocalTensor<T> dst, const T* src, uint32_t count) {
-    const size_t copyBytes = count * sizeof(T);
-    const size_t blockBytes = (copyBytes + DMA_ALIGN_BYTES - 1) / DMA_ALIGN_BYTES * DMA_ALIGN_BYTES;
-    if (reinterpret_cast<uintptr_t>(dst.GetData()) % DMA_ALIGN_BYTES != 0 || blockBytes > dst.capacityBytes) {
-        throw std::runtime_error("[Hardware Fault - DMA UNALIGNED]: DataCopyPad scratchpad side must be 32-byte aligned and in bounds!");
-    }
-    std::memcpy(dst.GetData(), src, copyBytes);
-    std::memset(reinterpret_cast<uint8_t*>(dst.GetData()) + copyBytes, 0, blockBytes - copyBytes);
-    g_cycleTracker.dmaBytesMoved += blockBytes;
-    g_cycleTracker.dmaTransfers++;
-    g_cycleTracker.padTransfers++;
-    g_timeline.Load(static_cast<double>(blockBytes), g_timeline.SpanOf(dst.GetData(), blockBytes));
+    static_assert(sizeof(T) == 0,
+                  "the target has no raw-pointer form of DataCopyPad, and no 3-argument form either.  DataCopyPad(LocalTensor, GlobalTensor, DataCopyExtParams, DataCopyPadExtParams).");
 }
 
+
 template <typename T>
+// [NOT ON THE TARGET] the target has no raw-pointer form of DataCopyPad, and no 3-argument form either.
+// Use instead: DataCopyPad(GlobalTensor, LocalTensor, DataCopyExtParams).
 inline void DataCopyPad(T* dst, LocalTensor<T> src, uint32_t count) {
-    const size_t copyBytes = count * sizeof(T);
-    if (reinterpret_cast<uintptr_t>(src.GetData()) % DMA_ALIGN_BYTES != 0) {
-        throw std::runtime_error("[Hardware Fault - DMA UNALIGNED]: DataCopyPad scratchpad side must be 32-byte aligned!");
-    }
-    if (src.pos == QuePosition::VECIN) {
-        throw std::runtime_error("[Hardware Fault - INVALID DMA EGRESS CHANNEL]: "
-                                 "DataCopyPad egress to system memory attempted from QuePosition::VECIN! "
-                                 "Egress transfers strictly require QuePosition::VECOUT (Trap #401).");
-    }
-    std::memcpy(dst, src.GetData(), copyBytes);
-    const size_t blockBytes = (copyBytes + DMA_ALIGN_BYTES - 1) / DMA_ALIGN_BYTES * DMA_ALIGN_BYTES;
-    g_cycleTracker.dmaBytesMoved += blockBytes;
-    g_cycleTracker.dmaTransfers++;
-    g_cycleTracker.padTransfers++;
-    g_timeline.Store(static_cast<double>(blockBytes), SpanOf(src.GetData(), count));
+    static_assert(sizeof(T) == 0,
+                  "the target has no raw-pointer form of DataCopyPad, and no 3-argument form either.  DataCopyPad(GlobalTensor, LocalTensor, DataCopyExtParams).");
 }
+
 
 template <typename T>
 inline void DataCopy(LocalTensor<T> dst, GlobalTensor<T> src, uint32_t count) {
@@ -1147,17 +1083,31 @@ inline void DataCopy(GlobalTensor<T> dst, LocalTensor<T> src, uint32_t count) {
 }
 
 template <typename T>
+// [NOT ON THE TARGET] the target's DataCopyPad always takes a DataCopyExtParams describing blockCount / blockLen / strides; there is no count-only form.
+// Use instead: DataCopyPad(LocalTensor, GlobalTensor, DataCopyExtParams, DataCopyPadExtParams).
 inline void DataCopyPad(LocalTensor<T> dst, GlobalTensor<T> src, uint32_t count) {
-    DataCopyPad(dst, src.GetData(), count);
+    static_assert(sizeof(T) == 0,
+                  "the target's DataCopyPad always takes a DataCopyExtParams describing blockCount / blockLen / strides; there is no count-only form.  DataCopyPad(LocalTensor, GlobalTensor, DataCopyExtParams, DataCopyPadExtParams).");
 }
 
+
 template <typename T>
+// [NOT ON THE TARGET] the target's DataCopyPad always takes a DataCopyExtParams describing blockCount / blockLen / strides; there is no count-only form.
+// Use instead: DataCopyPad(GlobalTensor, LocalTensor, DataCopyExtParams).
 inline void DataCopyPad(GlobalTensor<T> dst, LocalTensor<T> src, uint32_t count) {
-    DataCopyPad(dst.GetData(), src, count);
+    static_assert(sizeof(T) == 0,
+                  "the target's DataCopyPad always takes a DataCopyExtParams describing blockCount / blockLen / strides; there is no count-only form.  DataCopyPad(GlobalTensor, LocalTensor, DataCopyExtParams).");
 }
 
+
 template <typename T>
-inline void DataCopyPad(LocalTensor<T> dst, const T* src, DataCopyExtParams cp, DataCopyPadExtParams<T> pad = {}) {
+// [NOT ON THE TARGET] the target has no raw-pointer form of DataCopyPad.
+// Use instead: DataCopyPad(LocalTensor, GlobalTensor, DataCopyExtParams, DataCopyPadExtParams).
+inline void DataCopyPad(LocalTensor<T> dst, const T* src, DataCopyExtParams cp, DataCopyPadExtParams<T> pad = {
+    static_assert(sizeof(T) == 0,
+                  "the target has no raw-pointer form of DataCopyPad.  DataCopyPad(LocalTensor, GlobalTensor, DataCopyExtParams, DataCopyPadExtParams).");
+}
+) {
     (void)pad;
     uint32_t count = (sizeof(T) > 0) ? (cp.blockLen / sizeof(T)) : 0;
     DataCopyPad(dst, src, count);
@@ -1169,10 +1119,13 @@ inline void DataCopyPad(LocalTensor<T> dst, GlobalTensor<T> src, DataCopyExtPara
 }
 
 template <typename T>
+// [NOT ON THE TARGET] the target has no raw-pointer form of DataCopyPad.
+// Use instead: DataCopyPad(GlobalTensor, LocalTensor, DataCopyExtParams).
 inline void DataCopyPad(T* dst, LocalTensor<T> src, DataCopyExtParams cp) {
-    uint32_t count = (sizeof(T) > 0) ? (cp.blockLen / sizeof(T)) : 0;
-    DataCopyPad(dst, src, count);
+    static_assert(sizeof(T) == 0,
+                  "the target has no raw-pointer form of DataCopyPad.  DataCopyPad(GlobalTensor, LocalTensor, DataCopyExtParams).");
 }
+
 
 template <typename T>
 inline void DataCopyPad(GlobalTensor<T> dst, LocalTensor<T> src, DataCopyExtParams cp) {
@@ -1184,9 +1137,13 @@ inline void DataCopyPad(GlobalTensor<T> dst, LocalTensor<T> src, DataCopyExtPara
 // Tolerates non-32B aligned element counts with hardware zero-fill.
 // -----------------------------------------------------------------------------
 template <typename T>
+// [NOT ON THE TARGET] the target has no raw-pointer form.
+// Use instead: LoadPad(LocalTensor, GlobalTensor, count).
 inline void LoadPad(LocalTensor<T> dst, const T* src, uint32_t count) {
-    DataCopyPad(dst, src, count);
+    static_assert(sizeof(T) == 0,
+                  "the target has no raw-pointer form.  LoadPad(LocalTensor, GlobalTensor, count).");
 }
+
 
 template <typename T>
 inline void LoadPad(LocalTensor<T> dst, GlobalTensor<T> src, uint32_t count) {
@@ -1194,9 +1151,13 @@ inline void LoadPad(LocalTensor<T> dst, GlobalTensor<T> src, uint32_t count) {
 }
 
 template <typename T>
+// [NOT ON THE TARGET] the target has no raw-pointer form.
+// Use instead: StorePad(GlobalTensor, LocalTensor, count).
 inline void StorePad(T* dst, LocalTensor<T> src, uint32_t count) {
-    DataCopyPad(dst, src, count);
+    static_assert(sizeof(T) == 0,
+                  "the target has no raw-pointer form.  StorePad(GlobalTensor, LocalTensor, count).");
 }
+
 
 template <typename T>
 inline void StorePad(GlobalTensor<T> dst, LocalTensor<T> src, uint32_t count) {
@@ -1265,20 +1226,22 @@ inline void Adds(LocalTensor<T> dst, LocalTensor<T> src, float scalar, uint32_t 
 
 // Element-wise format conversion (e.g. FP16/BF16 <-> FP32).
 template <typename D, typename S, typename Convert>
+// [NOT ON THE TARGET] the target's Cast takes a rounding mode, not a converter function, and the mode comes before the count.
+// Use instead: Cast(dst, src, RoundMode::CAST_NONE, count).
 inline void Cast(LocalTensor<D> dst, LocalTensor<S> src, uint32_t count, Convert convert) {
-    for (uint32_t i = 0; i < count; ++i) {
-        dst.data[i] = convert(src.data[i]);
-    }
-    const size_t widest = sizeof(D) > sizeof(S) ? sizeof(D) : sizeof(S);
-    uint32_t repeats = static_cast<uint32_t>((count * widest + SIMD_REPEAT_BYTES - 1) / SIMD_REPEAT_BYTES);
-    g_cycleTracker.vCastCycles += 2 * repeats + 13;
-    g_timeline.Vector(2 * repeats + 13, SpanOf(dst.data, count), SpanOf(src.data, count));
+    static_assert(sizeof(S) == 0,
+                  "the target's Cast takes a rounding mode, not a converter function, and the mode comes before the count.  Cast(dst, src, RoundMode::CAST_NONE, count).");
 }
 
+
 template <typename D, typename S>
+// [NOT ON THE TARGET] the target's Cast takes a rounding mode, not a converter function, and the mode comes before the count.
+// Use instead: Cast(dst, src, RoundMode::CAST_NONE, count).
 inline void Cast(LocalTensor<D> dst, LocalTensor<S> src, uint32_t count) {
-    Cast(dst, src, count, [](S x) { return static_cast<D>(x); });
+    static_assert(sizeof(S) == 0,
+                  "the target's Cast takes a rounding mode, not a converter function, and the mode comes before the count.  Cast(dst, src, RoundMode::CAST_NONE, count).");
 }
+
 
 template <typename D, typename S>
 inline void Cast(LocalTensor<D> dst, LocalTensor<S> src, RoundMode mode, uint32_t count) {
@@ -1335,78 +1298,64 @@ inline void Rsqrt(LocalTensor<T> dst, LocalTensor<T> src, uint32_t count) {
 // Folds every 8 elements into 1 (1 cycle per repeat).
 // -----------------------------------------------------------------------------
 template <typename T>
+// [NOT ON THE TARGET] the target's BlockReduceSum takes seven arguments: (dst, src, repeatTimes, mask, dstRepStride, srcBlkStride, srcRepStride). A count-only form hides the repeat structure, which is exactly what has to be chosen deliberately on the hardware.
+// Use instead: BlockReduceSum(dst, src, repeatTimes, mask, 1, 1, 8) for whole 64-lane repeats of 4-byte elements.
 inline void BlockReduceSum(LocalTensor<T> dst, LocalTensor<T> src, uint32_t count) {
-    if (dst.GetData() == src.GetData()) {
-        throw std::runtime_error("[Hardware Fault - VECTOR ALU OPERAND ALIASING]: "
-                                 "BlockReduceSum destination buffer aliases source buffer (dst == src)! "
-                                 "The 256-bit SIMD vector pipeline forbids in-place folding within the "
-                                 "same buffer due to lack of sub-vector RAW forwarding across 256-bit "
-                                 "burst lanes. Intra-row folding must ping-pong across disjoint buffers (Trap #402).");
-    }
-    uint32_t outCount = count / 8;
-    for (uint32_t i = 0; i < outCount; ++i) {
-        T sum = 0;
-        for (int k = 0; k < 8; ++k) {
-            sum += src.data[i * 8 + k];
-        }
-        dst.data[i] = sum;
-    }
-    uint32_t repeats = (count * sizeof(T) + SIMD_REPEAT_BYTES - 1) / SIMD_REPEAT_BYTES;
-    g_cycleTracker.vBlockReduceCycles += 1 * repeats + 14;
-    g_timeline.Vector(1 * repeats + 14, SpanOf(dst.data, outCount), SpanOf(src.data, count));
+    static_assert(sizeof(T) == 0,
+                  "the target's BlockReduceSum takes seven arguments: (dst, src, repeatTimes, mask, dstRepStride, srcBlkStride, srcRepStride). A count-only form hides the repeat structure, which is exactly what has to be chosen deliberately on the hardware.  BlockReduceSum(dst, src, repeatTimes, mask, 1, 1, 8) for whole 64-lane repeats of 4-byte elements.");
 }
+
 
 // -----------------------------------------------------------------------------
 // Pure Vector Binary Reduction Tree (VectorReduceSum)
 // Folds local vector elements into 1 scalar without scalar loop bubbles
 // -----------------------------------------------------------------------------
 template <typename T>
+// [NOT ON THE TARGET] no reduction on the target returns a value. ReduceSum returns void, writes only lane 0 of a 32-byte slot, and needs a work tensor; reading the scalar back requires a vector->scalar fence, which inside a per-row loop is one pipeline fence per row.
+// Use instead: ReduceSum(dst, src, work, count), then a fence, then dst.GetValue(0) - and offset multi-row destinations by dst[i * 8] for 4-byte elements.
 inline float VectorReduceSum(LocalTensor<T> src, uint32_t count) {
-    if (count == 0) return 0.0f;
-    float sum = 0.0f;
-    for (uint32_t i = 0; i < count; ++i) {
-        sum += static_cast<float>(src.data[i]);
-    }
-    uint32_t repeats = (count * sizeof(T) + SIMD_REPEAT_BYTES - 1) / SIMD_REPEAT_BYTES;
-    g_cycleTracker.vAddCycles += (repeats + 1) * 2 + 13;
-    g_timeline.Vector((repeats + 1) * 2 + 13, {}, SpanOf(src.data, count));
-    return sum;
+    static_assert(sizeof(T) == 0,
+                  "no reduction on the target returns a value. ReduceSum returns void, writes only lane 0 of a 32-byte slot, and needs a work tensor; reading the scalar back requires a vector->scalar fence, which inside a per-row loop is one pipeline fence per row.  ReduceSum(dst, src, work, count), then a fence, then dst.GetValue(0) - and offset multi-row destinations by dst[i * 8] for 4-byte elements.");
 }
+
 
 // -----------------------------------------------------------------------------
 // Pure Vector InvRms with Coordinator-Precomputed Invariant Scale (invD)
 // -----------------------------------------------------------------------------
+// [NOT ON THE TARGET] there is no VectorInvRms instruction.
+// Use instead: Rsqrt on a tensor (a low-precision table lookup) followed by
+// Newton-Raphson refinement. Skipping the refinement loses accuracy.
 inline float VectorInvRms(float sumSq, float invD, float eps) {
-    float x = sumSq * invD + eps;
-    float inv = static_cast<float>(1.0 / std::sqrt(static_cast<double>(x)));
-    g_cycleTracker.vRsqrtCycles += 2 + 14;
-    g_timeline.Vector(2 + 14, {});
-    return inv;
+    static_assert(false,
+                  "[NOT ON THE TARGET] no VectorInvRms instruction. Use Rsqrt on a tensor (low-precision table lookup) plus Newton-Raphson refinement.");
+    return 0.0f;
 }
+
 
 // Deprecated overload: Worker core performing scalar integer-to-float conversion
 [[deprecated("Worker core lacks scalar integer-to-float conversion unit. Pass precomputed invD from Coordinator.")]]
+// [NOT ON THE TARGET] there is no VectorInvRms instruction.
+// Use instead: Rsqrt on a tensor (a low-precision table lookup) followed by
+// Newton-Raphson refinement. Skipping the refinement loses accuracy.
 inline float VectorInvRms(float sumSq, uint32_t D, float eps) {
-    g_cycleTracker.scalarStallCycles += 20; // 20-cycle scalar conversion penalty
-    g_cycleTracker.scalarStallCount++;
-    return VectorInvRms(sumSq, 1.0f / static_cast<float>(D), eps);
+    static_assert(false,
+                  "[NOT ON THE TARGET] no VectorInvRms instruction. Use Rsqrt on a tensor (low-precision table lookup) plus Newton-Raphson refinement.");
+    return 0.0f;
 }
+
 
 // -----------------------------------------------------------------------------
 // Whole Block Reduction (WholeReduceSum)
 // ⚠️ Expensive: 14 cycles per repeat in hardware!
 // -----------------------------------------------------------------------------
 template <typename T>
+// [NOT ON THE TARGET] the target's WholeReduceSum also takes the repeat structure explicitly.
+// Use instead: WholeReduceSum(dst, src, mask, repeatTimes, dstRepStride, srcBlkStride, srcRepStride).
 inline void WholeReduceSum(LocalTensor<T> dst, LocalTensor<T> src, uint32_t count) {
-    T sum = 0;
-    for (uint32_t i = 0; i < count; ++i) {
-        sum += src.data[i];
-    }
-    dst.data[0] = sum;
-    uint32_t repeats = (count * sizeof(T) + SIMD_REPEAT_BYTES - 1) / SIMD_REPEAT_BYTES;
-    g_cycleTracker.vWholeReduceCycles += 14 * repeats + 14;
-    g_timeline.Vector(14 * repeats + 14, SpanOf(dst.data, 1), SpanOf(src.data, count));
+    static_assert(sizeof(T) == 0,
+                  "the target's WholeReduceSum also takes the repeat structure explicitly.  WholeReduceSum(dst, src, mask, repeatTimes, dstRepStride, srcBlkStride, srcRepStride).");
 }
+
 
 // Whole block reduction overload matching native hardware strides
 template <typename T>
@@ -1444,6 +1393,15 @@ inline void ReduceSum(LocalTensor<T> dst, LocalTensor<T> src, LocalTensor<T> wor
         sum += src.data[i];
     }
     dst.data[0] = sum;
+    // The target writes lane 0 only; the rest of the 32-byte slot keeps whatever
+    // was there. Poisoning them makes a kernel that consumes the whole slot fail
+    // here instead of silently losing accuracy on the hardware.
+    if (dst.capacityBytes >= DMA_ALIGN_BYTES) {
+        const uint32_t lanes = DMA_ALIGN_BYTES / sizeof(T);
+        for (uint32_t i = 1; i < lanes; ++i) {
+            dst.data[i] = static_cast<T>(std::numeric_limits<double>::quiet_NaN());
+        }
+    }
     uint32_t repeats = (count * sizeof(T) + SIMD_REPEAT_BYTES - 1) / SIMD_REPEAT_BYTES;
     g_cycleTracker.vBlockReduceCycles += 2 * repeats + 15;
     g_timeline.Vector(2 * repeats + 15, SpanOf(dst.data, 1), SpanOf(src.data, count));
@@ -1459,7 +1417,39 @@ struct BrcbRepeatParams {
 };
 
 template <typename T>
-inline void Brcb(LocalTensor<T> dst, LocalTensor<T> src, uint32_t repeatCount = 1, BrcbRepeatParams params = {1, 8}) {
+inline void Brcb(LocalTensor<T> dst, LocalTensor<T> src, uint32_t repeatCount = 1, BrcbRepeatParams params = {
+    // [TARGET SEMANTICS] Each repeat reads EIGHT CONSECUTIVE values from src and
+    // fills the j-th 32-byte block of that repeat with the j-th value. It does not
+    // read src[0] and flood the destination with it.
+    //
+    // This matters: code written against the old behaviour - broadcasting one row's
+    // inverse RMS across its repeats with Brcb(bc, inv[i], padded / 64, {1, 8}) -
+    // splices the values of rows i..i+7 into a single row on the hardware, and
+    // accuracy collapses. A correct pure-vector broadcast is either one Brcb per
+    // group of eight rows, or a strided binary op with src1BlkStride and
+    // src1RepStride both zero so every lane reads the same 32-byte block.
+    const uint32_t lanes = DMA_ALIGN_BYTES / sizeof(T);
+    const uint32_t needSrc = repeatCount * 8;
+    if (src.capacityBytes < needSrc * sizeof(T)) {
+        fprintf(stderr, "[Hardware Fault - Brcb] source holds fewer than 8 x repeatCount values; each repeat broadcasts eight CONSECUTIVE source values, one per 32-byte block.");
+        throw std::runtime_error("[Hardware Fault - Brcb] source too small: each repeat reads eight consecutive values.");
+    }
+    const uint32_t needDst = repeatCount * params.dstRepStride * lanes;
+    if (dst.capacityBytes < needDst * sizeof(T)) {
+        throw std::runtime_error("[Hardware Fault - Brcb] destination too small for repeatCount x dstRepStride blocks.");
+    }
+    for (uint32_t r = 0; r < repeatCount; ++r) {
+        for (uint32_t b = 0; b < 8; ++b) {
+            const T v = src.data[r * 8 + b];
+            for (uint32_t e = 0; e < lanes; ++e) {
+                dst.data[r * params.dstRepStride * lanes + b * lanes + e] = v;
+            }
+        }
+    }
+    g_cycleTracker.vCastCycles += repeatCount + 8;
+    g_timeline.Vector(repeatCount + 8, SpanOf(dst.data, repeatCount * 8 * lanes),
+                      SpanOf(src.data, repeatCount * 8));
+}) {
     (void)params;
     const size_t minCapacity = 64 * repeatCount;
     if (dst.capacityBytes < minCapacity * sizeof(T)) {
@@ -1539,5 +1529,26 @@ inline void ValidateLaunchArgs(const ArgsStruct&) {
                                  "Host-to-device kernel boundaries must be flattened into primitive scalars and 64-bit pointers.");
     }
 }
+
+
+// ---------------------------------------------------------------------------
+// Accessors that exist here but NOT on the target.
+//
+//   LocalTensor<T>::GetData()   - the target's LocalTensor exposes no raw
+//                                 pointer. Used below only by this runtime's own
+//                                 aliasing traps; a kernel that calls it will not
+//                                 translate.
+//   LocalTensor<T>::pos         - no such field on the target; assigning it
+//                                 (t.pos = ...) does not compile there.
+//   GetCoreIdx / GetCoreNum /
+//   GetThreadIdx / GetThreadNum - not target APIs. Use GetBlockIdx /
+//                                 GetBlockNum.
+//   CrossPipe                   - not a target API either; it is a two-line
+//                                 helper (SetFlag then WaitFlag on the same
+//                                 event id). Keep using it, but expect to carry
+//                                 the helper across.
+//
+// These are left in place because the runtime's own checks depend on them.
+// ---------------------------------------------------------------------------
 
 } // namespace dsa
